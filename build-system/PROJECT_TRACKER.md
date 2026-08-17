@@ -33,6 +33,13 @@ Current Phase: Phase 1 (Sovereign Core) — In Progress
   Suite: prompt_builder 6/6, context_manager 10/10, llm_router 7/7, d1d2 **10/11 (91%, up from
   10/13)** — B02/B03/B04 T4-recall failures now pass; sole remaining failure B11 is a pre-existing
   empty neural-memory index (`neural_memories.json` absent from both repos), not a regression.
+  Cockpit **19/20 (84%, Grade B, up from 13/20 + 1 ERROR)** — T01/T04/T05/T06/T14 now pass and the
+  T13 timeout ERROR is gone. Verification Loop category is 2/2 (90%), directly reflecting the
+  read-back work. Sole remaining failure T07 ("send a test email to myself"): Alfred asks for the
+  address rather than sending, because Master Sam's own email is not in the T4 profile — a data
+  gap, not a code defect, and arguably the safer behaviour. Confirmed the new approval gate on
+  `shell`/`run_code`/`open_app` does **not** regress either suite (neither exercises those tools),
+  but note those three tools are effectively unusable until Day 6 wires the approval prompt.
 - [x] **NEW** Entire LLM provider chain was dead (2026-08-17) — Groq's `llama-3.1-8b-instant`
   (**priority 1, primary**) returned `model_not_found` and Gemini's `gemini-2.0-flash` was absent
   from the model list, so every request 404'd through to OpenRouter, whose free nemotron leaks

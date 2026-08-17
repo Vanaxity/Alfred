@@ -119,6 +119,27 @@ what existed and the requirements.
       against the pre-fix implementations.
 - [x] Added `__main__` demo block.
 
+**Suite results after this work:**
+
+| Suite | Before | After |
+|---|---|---|
+| test_prompt_builder | 6/6 | 6/6 |
+| test_context_manager | 10/10 | 10/10 |
+| test_llm_router | 7/7 | 7/7 |
+| test_tool_executor | *(did not exist)* | **33/33** |
+| phase1_d1d2 | 10/13 | **10/11 (91%)** |
+| phase1_cockpit | 13/20 + 1 ERROR | **19/20 (84%, Grade B)** |
+
+Remaining failures are both pre-existing data gaps, not code defects: d1d2 B11 needs a
+populated neural-memory index (`neural_memories.json` is absent from both the old and
+new repo), and cockpit T07 needs Master Sam's own email address in the T4 profile —
+Alfred currently asks for it rather than guessing, which is arguably correct.
+
+⚠️ `shell`, `run_code`, and `open_app` now require approval via
+`context["approved_tools"]`, and nothing grants it yet — so those three are effectively
+unusable until Day 6 wires the approval prompt. Neither test suite exercises them, so
+this is invisible to the suites but would be visible to a user.
+
 **Security fixes** (found while reading the code, scoped to the active v2 path only):
 - [x] `glob` had *zero* path-safety gating while its sibling file tools all had it —
       `C:/Windows/**/*` was enumerable. Now gated, with results filtered too (relative
