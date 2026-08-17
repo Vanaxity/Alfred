@@ -1,12 +1,48 @@
 # Alfred Project Tracker
 
-Last Updated: 2026-08-14
+Last Updated: 2026-08-17
 
 Current Phase: Phase 1 (Sovereign Core) — In Progress
 
-## Manifesto Coverage: 43/58 gaps closed (74%)
+## Manifesto Coverage: 46/58 gaps closed (79%)
+
+> **Note on this file's accuracy (2026-08-17):** several entries below were found to be
+> stale — describing bugs that no longer exist, or listing work as pending that was
+> already done. Verify any item against the current code before acting on it. Entries
+> confirmed false have been struck through rather than deleted, so the history of what
+> was believed is preserved.
 
 ## Done Recently
+
+- [x] **NEW** Day 4/5: ToolExecutor guardrails + self-correcting retry + verification (2026-08-17) —
+  `tool_executor.py` turned out to be an already-complete 976-line port (23 handlers, wired into
+  `conversation.py`), so the work was closing gaps rather than building. Closed: guardrails were
+  dead config (`require_approval`/`deny_patterns`/`allowed_patterns` defined but never enforced) →
+  now enforced via `check_guardrails()`, with `shell`/`run_code`/`open_app` requiring approval via
+  `context["approved_tools"]` plus a destructive-command deny-list that holds even when approved.
+  Retry replaced: same-params repeat → LLM re-derives params from the tool's error, up to 3
+  attempts, all recorded in `metadata["attempts"]`, corrected params re-checked against guardrails.
+  `VERIFY_MAP` completed 4→7 of 8 mutation tools (`run_code` explicitly `NO_READBACK`), plus a
+  `carry` mechanism so read-back targets what was written — which also fixed `remember`'s
+  verification silently never working (it called `memory_search` with no `query`, which that
+  handler rejects). Mutation detection made action-aware so `calendar`/`email` reads no longer
+  count as mutations. Exports added to `brain/v2/__init__.py`. Security: `glob` had zero
+  path-safety gating, `open_app` shell-injected unmapped names via `shell=True`, `_is_safe_path`
+  used a prefix check with no separator boundary (confirmed exploitable). Tests:
+  `build-system/test_tool_executor.py` **33/33**, verified non-vacuous against pre-fix code.
+  Suite: prompt_builder 6/6, context_manager 10/10, llm_router 7/7, d1d2 **10/11 (91%, up from
+  10/13)** — B02/B03/B04 T4-recall failures now pass; sole remaining failure B11 is a pre-existing
+  empty neural-memory index (`neural_memories.json` absent from both repos), not a regression.
+- [x] **NEW** Entire LLM provider chain was dead (2026-08-17) — Groq's `llama-3.1-8b-instant`
+  (**priority 1, primary**) returned `model_not_found` and Gemini's `gemini-2.0-flash` was absent
+  from the model list, so every request 404'd through to OpenRouter, whose free nemotron leaks
+  `<think>` reasoning into `content` and breaks Alfred's strict-JSON parse. Replaced with
+  `openai/gpt-oss-120b` + `reasoning_effort="low"` (load-bearing: without it the model spends its
+  whole budget reasoning and returns empty content, or attempts native tool-calling and 400s since
+  Alfred sends no `tools` array) and `gemini-2.5-flash`. Added `strip_reasoning()` on all provider
+  return paths. Benchmarked 0.65s avg / 10-of-10 correct on Alfred's JSON protocol. Also fixed a
+  latent breaker deadlock: `_probe_provider` used `max_tokens=1`, which always yields empty content
+  on a reasoning model, so once Groq's breaker opened it could never recover.
 
 - [x] **NEW** Day 3: ContextManager/ConversationHistory (2026-08-14) — module pre-existed and was wired into `conversation.py`, so per Master Sam's decision we kept the richer implementation (same-role merge, tool→user LLM conversion for provider compat, summary compression) and added the missing spec surface: `token_usage` property, `_maybe_compress()` hook (wired into all add paths), `Message`/`ConversationHistory` exports in `__init__.py`, `metadata["tool"]` key in `add_tool_result`, `__main__` demo, shared `count_tokens` import (removed duplicate `_count_tokens`). TDD: `build-system/test_context_manager.py` 10/10 (RED→GREEN). Compression preserves most-recent tool-call+result pair verified. `test_llm_router` 7/7, `test_prompt_builder` 6/6, `import brain_api.server` clean, ruff clean, py_compile clean. Session log: `sessions/2026-08-14-day3-context-manager.md`.
 - [x] **NEW** Day 2: PromptBuilder core (2026-08-14) — module pre-existed (wired into conversation.py) but was unfinished: no `__init__.py` exports, no demo, no tests. Closed gaps via TDD (`build-system/test_prompt_builder.py` 6/6 pass, RED→GREEN). Spec deviations fixed: `to_prompt_block()` → exact spec format, truncation marker → `…[truncated]`, `count_tokens` fallback → `len(text)//4` (empty→0), `__main__` demo added, unused `field` import removed. Day 2 exports added to `brain/v2/__init__.py` imports + `__all__`. Router tests 7/7, `import brain_api.server` clean, ruff clean. Session log: `sessions/2026-08-14-day2-prompt-builder.md`.
@@ -151,8 +187,21 @@ Day 10: Token‑budget tuning & final polish
 
 ## Known Bugs
 
-- [ ] Hardcoded API keys for Groq/Google/OpenRouter committed in project-alfred/brain_api/server.py:34-41
-- [ ] Calculator uses bare `eval()` — RCE vulnerability
+- [x] ~~Hardcoded API keys for Groq/Google/OpenRouter committed in brain_api/server.py:34-41~~ —
+  **VERIFIED FALSE (2026-08-17).** `server.py` loads keys from env only; a scan of all tracked
+  files for live key material (`gsk_`, `sk-or-`, `AIzaSy`, …) found matches solely in
+  `.env.example` placeholders. `.env` / `.env.source` are gitignored and untracked.
+- [x] ~~Calculator uses bare `eval()` — RCE vulnerability~~ — **VERIFIED FALSE (2026-08-17).**
+  Both `alfred.py` and `tool_executor.py` use `ast.parse(mode="eval")` with an operator allowlist
+  (Add/Sub/Mult/Div/Pow/USub/FloorDiv/Mod) and reject everything else. No `eval`/`exec` anywhere.
+- [x] **FIXED (2026-08-17)** `glob` tool had no path-safety check at all — could enumerate
+  `C:/Windows/**/*`. Now gated by `_is_safe_path` with result filtering.
+- [x] **FIXED (2026-08-17)** `open_app` shell-injection — `Popen([exe], shell=True)` with `exe`
+  falling back to the raw user string, so `"notepad & del *.*"` reached cmd.exe verbatim. Now
+  resolves via `shutil.which()` with `shell=False` and refuses metacharacters.
+- [x] **FIXED (2026-08-17)** `_is_safe_path` prefix-boundary bypass — `str.startswith()` with no
+  separator check let `C:\Users\<user>_evil\secret.txt` pass as inside the home dir. Confirmed
+  exploitable against the old implementation; now uses `Path.is_relative_to()`.
 - [ ] T2 skills generated but never matched — dead code
 - [x] CRITICAL: T3 episodic memory never injected into planner — broken feature
 - [x] CRITICAL: Goal inference permanently disabled
@@ -169,9 +218,16 @@ Day 10: Token‑budget tuning & final polish
 - [ ] HIGH: IntentClassifier "read " keyword matches "already read", "thread", "spreadsheet" — massive false positives
 - [ ] HIGH: IntentClassifier "today" and "open" keywords too broad — wrong routing on common phrases
 - [ ] HIGH: LLM classification path algorithmically unreachable — keyword confidence always >= 0.8 threshold
-- [ ] HIGH: Safe directories hardcoded to ruchi user — file tools unusable cross-platform
-- [ ] HIGH: reasoning=True passed to Groq models that don't support it — API error (alfred.py:1144)
-- [ ] HIGH: No verification loop after mutation tools — false success reported
+- [x] ~~HIGH: Safe directories hardcoded to ruchi user — file tools unusable cross-platform~~ —
+  **VERIFIED FALSE (2026-08-17).** `_is_safe_path` derives roots from `Path.home()`; the string
+  "ruchi" appears nowhere in the codebase.
+- [ ] HIGH: reasoning=True passed to Groq models that don't support it — API error (alfred.py:1144).
+  Legacy `alfred.py` only; the v2 path now sets `reasoning_effort` per-provider via
+  `Provider.extra_params` instead.
+- [x] **FIXED (2026-08-17)** HIGH: No verification loop after mutation tools — false success
+  reported. `VERIFY_MAP` now covers 7 of 8 mutation tools with `run_code` an explicit
+  `NO_READBACK` exception, and `carry` copies params so the read-back targets what was written.
+  Closes manifesto Sovereignty Gap #2 ("Blind Trust in Tools").
 - [ ] HIGH: Missing import re in skill_manager.py — NameError on generate_skill() with special characters
 - [ ] HIGH: Heartbeat has no cognitive processing — just fetches calendar/email
 - [ ] HIGH: WebSocket in cockpit never reconnects — permanent disconnect after server restart

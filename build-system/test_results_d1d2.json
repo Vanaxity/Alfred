@@ -1,16 +1,16 @@
 {
-  "timestamp": "2026-07-22T22:17:34.890824",
+  "timestamp": "2026-08-17T21:33:34.833703",
   "total": 11,
-  "passed": 11,
-  "failed": 0,
-  "score_pct": 100.0,
-  "grade": "A+",
+  "passed": 10,
+  "failed": 1,
+  "score_pct": 90.9,
+  "grade": "A",
   "tests": [
     {
       "id": "B01",
       "name": "Health check",
       "passed": true,
-      "detail": "status=ok, memories=53"
+      "detail": "status=ok, memories=0"
     },
     {
       "id": "B02",
@@ -22,25 +22,25 @@
       "id": "B03",
       "name": "Alfred knows career goals (AI/Finance)",
       "passed": true,
-      "detail": "response snippet: 'Your primary career goal is to achieve a senior leadership position in a sustainable technology company within 5 years....'"
+      "detail": "response snippet: 'Your career goals are to become an AI researcher, eventually founding your own AI\u2011focused startup. You\u2019re targeting expe...'"
     },
     {
       "id": "B04",
       "name": "Alfred knows age/education",
       "passed": true,
-      "detail": "response snippet: 'You are 15 years old and in 10th grade....'"
+      "detail": "response snippet: 'You\u2019re 15 years old and currently in 10th grade....'"
     },
     {
       "id": "B05",
       "name": "Tool command creates T3 episode",
       "passed": true,
-      "detail": "before=577, after=578"
+      "detail": "before=653, after=654"
     },
     {
       "id": "B06",
       "name": "Episode has proper format",
       "passed": true,
-      "detail": "file=Check-my-calendar-for-today-and-get-the-weather_20260722_221703.md, request=True, response=True, details=False"
+      "detail": "file=Check-my-calendar-for-today-and-get-the-weather_20260817_213302.md, request=True, response=True, details=False"
     },
     {
       "id": "B07-B10",
@@ -51,8 +51,8 @@
     {
       "id": "B11",
       "name": "Memory search returns biryani",
-      "passed": true,
-      "detail": "results=3, biryani_mentioned=False"
+      "passed": false,
+      "detail": "results=0, biryani_mentioned=False"
     },
     {
       "id": "B12",
