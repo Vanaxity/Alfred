@@ -398,6 +398,34 @@ def test_glob_filters_results_to_safe_paths():
             assert _is_safe_path(line), f"unsafe path leaked into results: {line!r}"
 
 
+def test_glob_blocks_escape_patterns():
+    """Absolute unsafe patterns are refused; relative traversals are filtered out.
+
+    The two layers matter independently: the up-front check only sees absolute
+    patterns, so a relative "../../.." escape reaches glob() and must be caught
+    by the result filter instead.
+    """
+    escapes = [
+        r"C:\Windows\win.ini",          # absolute, no wildcard at all
+        r"C:\Windows\**\*",             # absolute, wildcarded
+        r"C:\*",                        # drive root
+        r"..\..\..\Windows\*",          # relative traversal
+        r"../../../Windows/System32/*.ini",
+        r"\\\\localhost\\C$\\*",        # UNC
+    ]
+    for pattern in escapes:
+        r = run(handle_glob({"pattern": pattern}, {}))
+        if r.success:
+            # Allowed to run, but nothing unsafe may appear in the results.
+            for line in (r.output or "").splitlines():
+                if line.strip() and not line.startswith("["):
+                    assert _is_safe_path(line), (
+                        f"pattern {pattern!r} leaked unsafe path {line!r}"
+                    )
+        else:
+            assert "safe directories" in (r.error or ""), r.error
+
+
 def test_open_app_refuses_shell_metacharacters():
     r = run(handle_open_app({"app_name": "notepad & del *.*"}, {}))
     assert not r.success, "shell metacharacters must never be launched"
