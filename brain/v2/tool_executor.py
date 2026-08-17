@@ -22,6 +22,7 @@ import json
 import operator as op
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,7 +76,24 @@ MUTATION_TOOLS: Set[str] = {
     "delete_reminder", "write_file", "memory_save", "run_code",
 }
 
-# Mapping: mutation tool → read tool for verification
+# calendar and email dispatch both reads and writes through a single tool, so
+# membership in MUTATION_TOOLS alone over-reports. These tools only mutate when
+# their "action" parameter is one of the listed values; every other mutation
+# tool has no action sub-parameter and always mutates.
+ACTION_MUTATIONS: Dict[str, Set[str]] = {
+    "calendar": {"create", "update", "delete"},
+    "email": {"send"},
+}
+
+# run_code has no meaningful read-back: re-running it to verify would execute
+# the side effects a second time. Its ToolResult already carries the subprocess
+# exit status plus stdout/stderr, which is the verification signal.
+NO_READBACK: Set[str] = {"run_code"}
+
+# Mapping: mutation tool → read tool for verification.
+#   read_params — static params for the read tool
+#   carry       — {mutation_param: read_param} copied from the original call, so
+#                 the read-back targets what was actually written
 VERIFY_MAP: Dict[str, Dict[str, Any]] = {
     "calendar": {
         "read_tool": "calendar",
@@ -92,11 +110,63 @@ VERIFY_MAP: Dict[str, Dict[str, Any]] = {
         "read_params": {},
         "description": "list reminders",
     },
+    "delete_reminder": {
+        "read_tool": "list_reminders",
+        "read_params": {},
+        "description": "list reminders",
+    },
     "remember": {
         "read_tool": "memory_search",
         "read_params": {"tier": "t4"},
+        "carry": {"key": "query"},
         "description": "memory search T4",
     },
+    "write_file": {
+        "read_tool": "read_file",
+        "read_params": {"limit": 20},
+        "carry": {"path": "path"},
+        "description": "read back written file",
+    },
+    "memory_save": {
+        "read_tool": "memory_search",
+        "read_params": {},
+        "carry": {"tier": "tier", "title": "query"},
+        "description": "memory search saved tier",
+    },
+}
+
+# Total attempts for a mutating call: the first try plus LLM-corrected retries.
+MAX_TOOL_ATTEMPTS = 3
+
+# Commands that must never run, even once a human has approved the tool. This is
+# a backstop against a typo or a misread instruction destroying data, not a
+# security boundary — anything reaching `shell` can bypass a regex if it tries.
+_DESTRUCTIVE_PATTERNS: List[str] = [
+    r"\brm\s+-[a-z]*[rf]",           # rm -rf / rm -fr / rm -r
+    r"\bdel\s+/[sq]",                 # del /s, del /q
+    r"\bformat\s+[a-z]:",             # format c:
+    r"\bRemove-Item\b[^\"]*-Recurse", # PowerShell recursive delete
+    r"\bmkfs(\.\w+)?\b",
+    r"\bdd\s+if=",
+    r":\s*\(\s*\)\s*\{.*\};\s*:",     # shell fork bomb
+    r"\b(shutdown|Stop-Computer|Restart-Computer)\b",
+    r"\bReset-ComputerMachinePassword\b",
+    r">\s*/dev/sd[a-z]",
+]
+
+# Per-tool guardrails. Anything that can execute arbitrary code or launch a
+# process requires explicit approval; approval is granted by putting the tool
+# name in context["approved_tools"].
+TOOL_GUARDRAILS: Dict[str, Guardrails] = {
+    "shell": Guardrails(
+        require_approval=True,
+        deny_patterns=list(_DESTRUCTIVE_PATTERNS),
+    ),
+    "run_code": Guardrails(
+        require_approval=True,
+        deny_patterns=list(_DESTRUCTIVE_PATTERNS),
+    ),
+    "open_app": Guardrails(require_approval=True),
 }
 
 # Handler type: async function(params, context) -> ToolResult
@@ -159,6 +229,94 @@ class ToolExecutor:
     def schemas(self) -> Dict[str, Dict[str, Any]]:
         return dict(self._schemas)
 
+    def is_mutation(self, tool_name: str, params: Optional[Dict[str, Any]] = None) -> bool:
+        """Whether this specific call mutates external state.
+
+        calendar/email serve reads and writes through one entry point, so their
+        "action" parameter decides; all other mutation tools always mutate.
+        """
+        if tool_name not in MUTATION_TOOLS:
+            return False
+        mutating = ACTION_MUTATIONS.get(tool_name)
+        if mutating is None:
+            return True
+        action = str((params or {}).get("action", "")).strip().lower()
+        return action in mutating
+
+    def check_guardrails(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ToolResult]:
+        """Return a blocking ToolResult if guardrails reject this call, else None."""
+        gr = self._guardrails.get(tool_name)
+        if gr is None:
+            return None
+
+        if not gr.allowed:
+            return ToolResult(
+                success=False,
+                error=f"Tool '{tool_name}' is disabled by guardrails.",
+                tool_name=tool_name,
+            )
+
+        # Match patterns against the serialized params so a dangerous string is
+        # caught wherever it sits in the payload.
+        probe = json.dumps(params, default=str) if params else ""
+
+        for pattern in gr.deny_patterns:
+            try:
+                hit = re.search(pattern, probe, re.IGNORECASE)
+            except re.error:
+                continue
+            if hit:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"Blocked by guardrail: '{tool_name}' params matched "
+                        f"denied pattern {pattern!r}."
+                    ),
+                    tool_name=tool_name,
+                    metadata={"denied_by": pattern},
+                )
+
+        if gr.allowed_patterns:
+            allowed = False
+            for pattern in gr.allowed_patterns:
+                try:
+                    if re.search(pattern, probe, re.IGNORECASE):
+                        allowed = True
+                        break
+                except re.error:
+                    continue
+            if not allowed:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"Blocked by guardrail: '{tool_name}' params matched no "
+                        f"allowed pattern."
+                    ),
+                    tool_name=tool_name,
+                    metadata={"allowed_patterns": list(gr.allowed_patterns)},
+                )
+
+        if gr.require_approval:
+            approved = (context or {}).get("approved_tools") or ()
+            if tool_name not in approved:
+                return ToolResult(
+                    success=False,
+                    error=f"Tool '{tool_name}' requires explicit approval before running.",
+                    tool_name=tool_name,
+                    metadata={
+                        "awaiting_approval": True,
+                        "tool": tool_name,
+                        "params": params,
+                    },
+                )
+
+        return None
+
     async def execute(
         self,
         tool_name: str,
@@ -166,16 +324,19 @@ class ToolExecutor:
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         """
-        Execute a tool with guardrails and validation.
+        Execute a tool with guardrails, validation, and self-correcting retry.
 
-        1. Check guardrails.
-        2. Execute handler.
-        3. Validate result (custom validator or ToolResult.success).
-        4. If mutation failed, retry once.
+        1. Reject unknown tools.
+        2. Check guardrails (disabled / deny patterns / approval).
+        3. Execute handler and validate the result.
+        4. On a mutating call's failure, ask the LLM to correct the params from
+           the error text and retry, up to MAX_TOOL_ATTEMPTS total. Every
+           attempt is recorded in metadata["attempts"] so a final failure
+           reports what was actually tried rather than only the last error.
         """
         ctx = context or {}
+        call_params = dict(params or {})
 
-        # --- Unknown tool ---
         if tool_name not in self._handlers:
             return ToolResult(
                 success=False,
@@ -183,72 +344,165 @@ class ToolExecutor:
                 tool_name=tool_name,
             )
 
-        # --- Guardrail check ---
-        gr = self._guardrails.get(tool_name)
-        if gr and not gr.allowed:
-            return ToolResult(
-                success=False,
-                error=f"Tool '{tool_name}' is disabled by guardrails.",
-                tool_name=tool_name,
-            )
+        blocked = self.check_guardrails(tool_name, call_params, ctx)
+        if blocked is not None:
+            return blocked
 
-        # --- Execute ---
         handler = self._handlers[tool_name]
+        # Only mutating calls earn corrected retries — a failed read is not
+        # fixed by different params, and retrying costs an extra LLM round-trip.
+        max_attempts = MAX_TOOL_ATTEMPTS if self.is_mutation(tool_name, call_params) else 1
+
+        attempts: List[Dict[str, Any]] = []
+        result = ToolResult(success=False, error="Tool was never executed.", tool_name=tool_name)
+
+        for attempt in range(max_attempts):
+            result = await self._run_once(handler, tool_name, call_params, ctx)
+
+            if result.success:
+                if attempt:
+                    result.metadata["attempts"] = attempts
+                    result.metadata["recovered_after"] = attempt + 1
+                result.tool_name = tool_name
+                return result
+
+            attempts.append({"params": dict(call_params), "error": result.error})
+
+            if attempt == max_attempts - 1:
+                break
+
+            corrected = await self._correct_params(
+                tool_name, call_params, result.error or "", ctx
+            )
+            if corrected is None:
+                break
+
+            # Corrected params must clear the same guardrails — an LLM must not
+            # be able to talk its way past a deny pattern across a retry.
+            blocked = self.check_guardrails(tool_name, corrected, ctx)
+            if blocked is not None:
+                blocked.metadata["attempts"] = attempts
+                return blocked
+
+            call_params = corrected
+
+        result.tool_name = tool_name
+        result.metadata["attempts"] = attempts
+        if len(attempts) > 1:
+            detail = "; ".join(
+                f"attempt {i + 1}: {a['error']}" for i, a in enumerate(attempts)
+            )
+            result.error = f"Failed after {len(attempts)} attempts — {detail}"
+        return result
+
+    async def _run_once(
+        self,
+        handler: ToolHandler,
+        tool_name: str,
+        params: Dict[str, Any],
+        ctx: Dict[str, Any],
+    ) -> ToolResult:
+        """Invoke a handler once and normalize whatever comes back."""
         try:
             result = await handler(params, ctx)
         except Exception as e:
-            result = ToolResult(
+            return ToolResult(
                 success=False,
                 error=f"Tool error: {e}",
                 tool_name=tool_name,
             )
 
-        # --- Validate ---
+        if not isinstance(result, ToolResult):
+            return ToolResult(
+                success=False,
+                error=(
+                    f"Handler for '{tool_name}' returned "
+                    f"{type(result).__name__}, expected ToolResult."
+                ),
+                tool_name=tool_name,
+            )
+
         if not self._validate_result(tool_name, result):
             result.success = False
             if not result.error:
                 result.error = "Tool returned invalid/unsuccessful result."
-
-        # --- Retry on mutation failure ---
-        if not result.success and tool_name in MUTATION_TOOLS:
-            try:
-                result = await handler(params, ctx)
-                if not self._validate_result(tool_name, result):
-                    result.success = False
-                    if not result.error:
-                        result.error = "Tool failed on retry."
-            except Exception as e:
-                result = ToolResult(
-                    success=False,
-                    error=f"Tool error on retry: {e}",
-                    tool_name=tool_name,
-                )
-
-        result.tool_name = tool_name
         return result
+
+    async def _correct_params(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        error: str,
+        ctx: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the LLM for corrected params after a tool rejected these ones.
+
+        Returns None when no router is available, the reply is unusable, or the
+        proposal is identical to what already failed (retrying would be futile).
+        """
+        router = ctx.get("router")
+        if router is None:
+            return None
+
+        schema = self._schemas.get(tool_name) or {}
+        prompt = (
+            "A tool call failed. Produce corrected parameters.\n\n"
+            f"Tool: {tool_name}\n"
+            f"Schema: {json.dumps(schema, default=str)[:600]}\n"
+            f"Parameters tried: {json.dumps(params, default=str)[:400]}\n"
+            f"Error: {error[:300]}\n\n"
+            "Reply with ONLY a JSON object of corrected parameters. No prose. "
+            "If no parameter change could fix this error, reply {}."
+        )
+
+        try:
+            resp = await router.call(
+                system_prompt="You repair malformed tool-call parameters. Output only JSON.",
+                user_message=prompt,
+                messages=[],
+                max_tokens=300,
+                temperature=0.0,
+            )
+        except Exception:
+            return None
+
+        corrected = _extract_json_object((getattr(resp, "text", None) or "").strip())
+        if not isinstance(corrected, dict) or not corrected:
+            return None
+        if corrected == params:
+            return None
+        return corrected
 
     async def verify_mutation(
         self,
         tool_name: str,
         context: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Optional[ToolResult]:
         """
-        After a successful mutation, call the corresponding read tool
-        and return its result for LLM verification.
+        After a successful mutation, call the corresponding read tool and return
+        its result for verification.
+
+        `params` is the original mutation's parameters; VERIFY_MAP's "carry"
+        entries copy values across so the read-back targets what was written
+        (e.g. read_file reads the same path write_file just wrote).
         """
         if tool_name not in VERIFY_MAP:
             return None
 
         vinfo = VERIFY_MAP[tool_name]
         read_tool = vinfo["read_tool"]
-        read_params = dict(vinfo["read_params"])
-
         if read_tool not in self._handlers:
             return None
 
+        read_params = dict(vinfo["read_params"])
+        for src, dest in (vinfo.get("carry") or {}).items():
+            value = (params or {}).get(src)
+            if value not in (None, ""):
+                read_params[dest] = value
+
         try:
-            handler = self._handlers[read_tool]
-            return await handler(read_params, context or {})
+            return await self._handlers[read_tool](read_params, context or {})
         except Exception:
             return None
 
@@ -262,6 +516,26 @@ class ToolExecutor:
 # ---------------------------------------------------------------------------
 # Legacy adapter
 # ---------------------------------------------------------------------------
+
+def _extract_json_object(text: str) -> Optional[Any]:
+    """Pull the first balanced JSON object out of a possibly-chatty reply."""
+    if not text:
+        return None
+    depth, start = 0, -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    start = -1
+    return None
+
 
 def _legacy_dict_to_schema(name: str, tool_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Convert old-style tool dict to JSON-Schema-like format."""
@@ -660,11 +934,33 @@ async def handle_list_directory(params: Dict, ctx: Dict) -> ToolResult:
 
 
 async def handle_glob(params: Dict, ctx: Dict) -> ToolResult:
-    """Find files by glob pattern."""
+    """Find files by glob pattern, restricted to safe directories."""
     import glob as gl
     pattern = params.get("pattern", "**/*")
-    matches = gl.glob(pattern, recursive=True)
-    return ToolResult(success=True, output="\n".join(matches[:50]))
+
+    # An absolute pattern must start inside a safe root; the wildcard portion is
+    # stripped first because a glob metacharacter is not a real path component.
+    anchor = pattern
+    for i, ch in enumerate(pattern):
+        if ch in "*?[":
+            anchor = pattern[:i]
+            break
+    if os.path.isabs(pattern) and not _is_safe_path(anchor or pattern):
+        return ToolResult(success=False, error="Pattern not in safe directories")
+
+    try:
+        matches = gl.glob(pattern, recursive=True)
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+
+    # Relative patterns resolve against the cwd, and symlinks can escape either
+    # way, so filter the results too rather than trusting the pattern alone.
+    safe = [m for m in matches if _is_safe_path(m)]
+    dropped = len(matches) - len(safe)
+    out = "\n".join(safe[:50])
+    if dropped:
+        out += f"\n[{dropped} match(es) outside safe directories omitted]"
+    return ToolResult(success=True, output=out.strip())
 
 
 async def handle_screenshot(params: Dict, ctx: Dict) -> ToolResult:
@@ -684,8 +980,17 @@ async def handle_screenshot(params: Dict, ctx: Dict) -> ToolResult:
 
 
 async def handle_open_app(params: Dict, ctx: Dict) -> ToolResult:
-    """Open a desktop app."""
-    name = params.get("app_name", "").lower()
+    """Open a known desktop app.
+
+    Never passes the raw request to a shell: with shell=True an unmapped name
+    like "notepad & del *.*" would be executed verbatim by cmd.exe. Unmapped
+    names must resolve to a real executable on PATH, and launch goes out with
+    shell=False so metacharacters stay inert.
+    """
+    name = str(params.get("app_name", "")).strip().lower()
+    if not name:
+        return ToolResult(success=False, error="app_name required")
+
     am = {
         "calculator": "calc", "notepad": "notepad", "chrome": "chrome",
         "browser": "chrome", "explorer": "explorer",
@@ -693,9 +998,31 @@ async def handle_open_app(params: Dict, ctx: Dict) -> ToolResult:
         "powershell": "powershell", "cmd": "cmd",
         "task manager": "taskmgr", "paint": "mspaint",
     }
-    exe = am.get(name, name)
+
+    if name in am:
+        target = am[name]
+    else:
+        if any(c in name for c in ';&|<>$`\n"\''):
+            return ToolResult(
+                success=False,
+                error=f"Refusing to open '{name}': unsupported characters in app name.",
+            )
+        resolved = shutil.which(name)
+        if not resolved:
+            known = ", ".join(sorted(am))
+            return ToolResult(
+                success=False,
+                error=f"Unknown app '{name}'. Known apps: {known}.",
+            )
+        target = resolved
+
     try:
-        subprocess.Popen([exe], shell=True)
+        if target.endswith(":"):
+            # A URI handler (ms-settings:) is not an executable; it needs the
+            # OS shell resolver. Only reachable for fixed values in the map.
+            os.startfile(target)
+        else:
+            subprocess.Popen([target], shell=False)
         return ToolResult(success=True, output=f"Opened {name}")
     except Exception as e:
         return ToolResult(success=False, error=str(e))
@@ -915,19 +1242,50 @@ except Exception as e:
 # Path safety
 # ---------------------------------------------------------------------------
 
+def _safe_roots() -> List[Path]:
+    """Directories the file tools are allowed to touch."""
+    home = Path.home()
+    roots = [home / d for d in ("Coding", "Documents", "Downloads", "Desktop")]
+    roots.append(home)
+    roots.append(Path(r"C:\Coding"))
+    resolved: List[Path] = []
+    for r in roots:
+        try:
+            rp = r.resolve()
+        except Exception:
+            continue
+        if rp.exists() and rp not in resolved:
+            resolved.append(rp)
+    return resolved
+
+
 def _is_safe_path(path: str) -> bool:
-    """Check if a file path is within allowed directories."""
+    """Check whether a path resolves inside an allowed directory.
+
+    Uses path-component containment rather than a string prefix: a raw
+    startswith() check would let "C:\\Coding-evil" pass as "C:\\Coding".
+    """
+    if not path:
+        return False
     try:
-        ap = os.path.realpath(path)
+        target = Path(path).resolve()
     except Exception:
         return False
-    home = str(Path.home())
-    safe = [os.path.join(home, d) for d in ["Coding", "Documents", "Downloads", "Desktop"]]
-    safe.append(home)
-    coding_raw = os.path.realpath(r"C:\Coding")
-    if coding_raw not in safe:
-        safe.append(coding_raw)
-    return any(ap.startswith(d) for d in safe if os.path.exists(d))
+    for root in _safe_roots():
+        if target == root:
+            return True
+        try:
+            if target.is_relative_to(root):
+                return True
+        except AttributeError:  # Python < 3.9
+            try:
+                target.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        except ValueError:
+            continue
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -970,6 +1328,34 @@ def create_tool_executor() -> ToolExecutor:
     }
 
     for name, handler in builtin_tools.items():
-        executor.register(name, handler)
+        executor.register(name, handler, guardrails=TOOL_GUARDRAILS.get(name))
 
     return executor
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    async def _demo() -> None:
+        ex = create_tool_executor()
+        print(f"Registered {len(ex.tool_names)} tools\n")
+
+        r = await ex.execute("time", {}, {})
+        print(f"time            -> success={r.success} output={str(r.output)[:48]!r}")
+
+        r = await ex.execute("calculator", {"expression": "17*23"}, {})
+        print(f"calculator      -> success={r.success} output={r.output!r}")
+
+        r = await ex.execute("nope", {}, {})
+        print(f"unknown tool    -> success={r.success} error={r.error!r}")
+
+        r = await ex.execute("shell", {"command": "echo hi"}, {})
+        print(f"shell (no appr) -> success={r.success} awaiting={r.metadata.get('awaiting_approval')}")
+
+        r = await ex.execute("shell", {"command": "rm -rf /"}, {"approved_tools": {"shell"}})
+        print(f"shell (denied)  -> success={r.success} error={str(r.error)[:60]!r}")
+
+        print(f"\ncalendar agenda is mutation? {ex.is_mutation('calendar', {'action': 'agenda'})}")
+        print(f"calendar create is mutation? {ex.is_mutation('calendar', {'action': 'create'})}")
+
+    asyncio.run(_demo())
