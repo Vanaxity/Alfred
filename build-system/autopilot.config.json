@@ -1,0 +1,16 @@
+{
+  "blueprint": "build-system/PROJECT_TRACKER.md",
+  "verification": {
+    "phase_1": "python build-system/alfred_test_suite.py --phase 1",
+    "phase_2": "python build-system/alfred_test_suite.py --phase 2",
+    "phase_3": "python build-system/alfred_test_suite.py --phase 3",
+    "phase_4": "python build-system/alfred_test_suite.py --phase 4",
+    "phase_5": "python build-system/alfred_test_suite.py --phase 5"
+  },
+  "context_files": [
+    "ALFRED_MANIFESTO_V5.md",
+    "build-system/PROJECT_TRACKER.md"
+  ],
+  "auto_advance_phase": true
+
+}

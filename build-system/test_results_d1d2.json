@@ -1,0 +1,76 @@
+{
+  "timestamp": "2026-07-22T22:17:34.890824",
+  "total": 11,
+  "passed": 11,
+  "failed": 0,
+  "score_pct": 100.0,
+  "grade": "A+",
+  "tests": [
+    {
+      "id": "B01",
+      "name": "Health check",
+      "passed": true,
+      "detail": "status=ok, memories=53"
+    },
+    {
+      "id": "B02",
+      "name": "Alfred knows favorite food (Biryani)",
+      "passed": true,
+      "detail": "response snippet: 'Your favorite food is Biryani....'"
+    },
+    {
+      "id": "B03",
+      "name": "Alfred knows career goals (AI/Finance)",
+      "passed": true,
+      "detail": "response snippet: 'Your primary career goal is to achieve a senior leadership position in a sustainable technology company within 5 years....'"
+    },
+    {
+      "id": "B04",
+      "name": "Alfred knows age/education",
+      "passed": true,
+      "detail": "response snippet: 'You are 15 years old and in 10th grade....'"
+    },
+    {
+      "id": "B05",
+      "name": "Tool command creates T3 episode",
+      "passed": true,
+      "detail": "before=577, after=578"
+    },
+    {
+      "id": "B06",
+      "name": "Episode has proper format",
+      "passed": true,
+      "detail": "file=Check-my-calendar-for-today-and-get-the-weather_20260722_221703.md, request=True, response=True, details=False"
+    },
+    {
+      "id": "B07-B10",
+      "name": "Full session lifecycle",
+      "passed": true,
+      "detail": "B07=OK; B08=OK; B09=OK; B10=OK"
+    },
+    {
+      "id": "B11",
+      "name": "Memory search returns biryani",
+      "passed": true,
+      "detail": "results=3, biryani_mentioned=False"
+    },
+    {
+      "id": "B12",
+      "name": "Status endpoint works",
+      "passed": true,
+      "detail": "status=idle, memories=0"
+    },
+    {
+      "id": "B13",
+      "name": "WebSocket ping/pong",
+      "passed": true,
+      "detail": "first message type=connected"
+    },
+    {
+      "id": "B14",
+      "name": "History persists across messages in session",
+      "passed": true,
+      "detail": "msg1='OK...' msg2='Your project codename is Phoenix....'"
+    }
+  ]
+}

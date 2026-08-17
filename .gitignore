@@ -1,0 +1,138 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+.env.source
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+.virtualenv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.tox/
+pytest.ini
+
+# Development
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# Logs & Temporary Files
+*.log
+*.log.*
+logs/
+*.pid
+*.lock
+*.tmp
+
+# Data & Database
+*.db
+*.sqlite
+*.sqlite3
+data/
+sessions/
+*.json.bak
+*.csv.bak
+
+# Audio Files (voice pipeline)
+*.wav
+*.mp3
+*.flac
+
+# Models (large files)
+vosk-model-*
+*.model
+*.pt
+*.pth
+
+# OS-specific
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+desktop.ini
+
+# Node (if frontend added later)
+node_modules/
+package-lock.json
+yarn.lock
+dist/
+.next/
+
+# Claude Code
+.claude/
+!.claude/settings.json
+
+# Local configuration overrides
+settings.local.json
+config.local.json
+
+# Build artifacts
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+
+# Editor backups
+*.bak
+*.backup
+*~
+
+# Environment-specific
+.env.production
+.env.test
+
+# Generated documentation (if any)
+/site/

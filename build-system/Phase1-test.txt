@@ -1,0 +1,207 @@
+Memory-Driven Intelligence (Questions 1–20)
+What's my favorite food?
+
+Remind me what my main goals are right now.
+
+You remember I told you about my Monday exam, right? What did I say?
+
+What was the last thing I asked you to add to my calendar?
+
+I mentioned a friend's name earlier. Who was it?
+
+What's my dad's email address?
+
+Do I prefer dark mode or light mode for coding?
+
+What's my MIT application deadline?
+
+You saved a fact about my business goal earlier. What was it?
+
+I told you my birthday a while ago. When is it?
+
+What subjects am I weakest in, according to my profile?
+
+Do I have any allergies you know about?
+
+What's the last web search I asked you to do?
+
+I mentioned a book I wanted to read. What was it?
+
+What's my daily study schedule look like?
+
+Have I set any recurring reminders for myself?
+
+What did I say about my father's business?
+
+What's my favorite color?
+
+I think I told you about a mentor. What's their name?
+
+Search your memory for anything about "Sovereign OS."
+
+🔧 Calendar & Email Tool Execution (21–40)
+Show my calendar for today.
+
+Add a study block for Physics tomorrow at 4pm.
+
+Move my dinner with dad to 9pm tonight.
+
+Do I have any meetings on Friday?
+
+Create a recurring event: Team Standup every weekday at 9am.
+
+Check my email for anything from TKS.
+
+Send an email to alex@business.com with subject "Project Update" and body "Almost done."
+
+Read my last email from Dad.
+
+How many unread emails do I have?
+
+Reply to the latest email from my mentor saying "I'll send the draft tonight."
+
+Delete the spam email from offers.com.
+
+Forward the email from school to my dad.
+
+Add the exam schedule from my latest email to my calendar.
+
+Check if the client payment email from Alex is urgent.
+
+Reschedule my morning meeting to after lunch.
+
+Cancel my 3pm appointment tomorrow.
+
+Find any emails about "MIT application" and summarize them.
+
+Send a meeting invite to my study group for Saturday 2pm.
+
+What's the subject of the email from no-reply@school.edu?
+
+Mark all emails from spam@offers.com as read and archive them.
+
+🔍 Web Search, Weather, Time, Calculator (41–50)
+What time is it in New York right now?
+
+What's the weather in Delhi today?
+
+Search for CBSE class 12 physics syllabus and summarize it.
+
+Find me a tutorial on integration by parts.
+
+What's 1547 divided by 19?
+
+Calculate the square root of 256.
+
+How many days until June 30th?
+
+What's the top news in AI this week?
+
+Fetch the article about AI regulations in India and give me 3 key points.
+
+Convert 100 USD to INR.
+
+🛡️ Self-Verification & Honesty (51–55)
+Did you actually add that event to my calendar? Double-check.
+
+Confirm that the email to Alex was sent.
+
+I don't think the reminder you set is there. Can you verify?
+
+Did you save my preference for dark mode? Show me my profile.
+
+You said you added the study block. Check my calendar for tomorrow.
+
+💬 Natural Interaction & Typo Tolerance (56–70)
+Hi!
+
+Yo what's up?
+
+Wat is my calender tomorow?
+
+Heya how r u?
+
+Remeber that I have a test every monday.
+
+What's teh weather in Mumbi?
+
+I am feeling very stressed abuot board exams.
+
+Can u halp me with my homework?
+
+I waste so much time on Insta reels man.
+
+Tell me a joke.
+
+What do you think about AI taking over jobs?
+
+I'm bored. Give me something to do.
+
+Thnx for adding that event.
+
+Why does life suck?
+
+I just spent an hour scrolling YouTube shorts.
+
+🎯 Goal-Aware & Emotional Responses (71–80)
+I feel like I'm not making progress toward MIT.
+
+I'm so tired of studying. What should I do?
+
+Is my business on track for $30k this month?
+
+I want to give up on everything.
+
+What's one thing I can do right now to get closer to my goals?
+
+I just aced my math test!
+
+Why am I even working this hard?
+
+I haven't studied in 3 days. Am I failing?
+
+I feel guilty watching Netflix. What do I do?
+
+Tell me something motivating but don't give me empty words.
+
+⏰ Proactive Behavior & Reminders (81–90)
+Remind me to call Dad at 7pm.
+
+Set a reminder: "Submit MIT essay" for November 1st at 9am.
+
+What reminders do I have today?
+
+Delete the reminder about watering plants.
+
+Give me a morning briefing: weather, schedule, emails.
+
+What's on my plate for tomorrow?
+
+Remind me every 45 minutes to take a study break.
+
+What's my next reminder?
+
+Clear all reminders for today.
+
+Set a daily reminder to check my email at 6pm.
+
+🏗️ Self-Improvement & Error Recovery (91–100)
+That didn't work — try another way to add the event.
+
+The email bounced. Can you fix the address and resend?
+
+Why did you call the wrong tool for that?
+
+I asked you to set a reminder, not search the web. Try again.
+
+You generated a broken skill last time. Check if it's fixed.
+
+The calendar tool failed. What error did you get?
+
+How many skills have you generated from our conversations?
+
+Show me the last skill you created.
+
+If the weather API is down, what fallback do you use?
+
+Tell me honestly: what's one thing you failed at today and how did you recover?

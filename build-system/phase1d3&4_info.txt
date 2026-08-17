@@ -1,0 +1,123 @@
+# PHASE 1 — DAY 3 & 4: Session Complete Summary
+## Date: 2026-07-21
+## Status: Completed (architectural decision made — rebuild core loop)
+
+## ============================================================
+## DAY 3: GWS OAUTH RE-AUTHENTICATION — COMPLETED
+## ============================================================
+
+### 3a: OAuth Re-auth — ✅ DONE
+- Master Sam ran `python -m brain.tools.gws_client --auth`
+- Token refreshed, all 5 scopes granted (calendar, calendar.events, gmail.readonly, gmail.send, drive.file)
+
+### 3b: GWS Health Check — ✅ PASSED
+- `python -m brain.tools.gws_client --test` returned:
+  `GWS Health: Calendar: OK, Gmail: OK, Drive: OK`
+
+### 3c: Calendar Test via /api/command — ⚠️ BUG FOUND
+- "Check my calendar for today" → works (lists events or says empty)
+- "Add a study block for Physics tomorrow at 4pm" → LLM says success but:
+  - Calendar create DOES work when called directly via GWSClient.create_event()
+  - Calendar create FAILS when called through /api/command
+  - Bug discovered: LLM sends wrong start_time (e.g. '2026-07-22 02:00:00' for 4pm — treats it as 2am)
+  - LLM puts time info in summary string instead of separate params
+  - Another bug: fallback planner regex produces hour=60 from "60-minute" in expanded goal
+
+### 3d: Email Test via /api/command — ⚠️ BUG FOUND
+- "Check my unread emails" → works (returns 10 real emails from Gmail)
+- "Send test email" → LLM says success but:
+  - T3 episode metadata shows "success": false
+  - No email actually sent
+  - Bug discovered: LLM reports success when tool actually failed
+
+### 3e: Calendar Verify — ❌ BROKEN
+- Created "Test Event" directly via GWSClient.create_event() → verified it appeared
+- Created "Physics study block" via /api/command → LLM said success, calendar was empty
+- Debunked: the verification loop checked agenda was accessible but NOT that specific event existed
+
+### 3f: Email Verify — ❌ BROKEN
+- triage_emails() works directly → 10 real emails returned
+- send_email() works directly → confirmed
+- But when LLM said "email sent" via /api/command → no email actually sent
+
+### 3g: GWS Bugs Found (Inferred from Sessions)
+- NONE in the actual GWSClient — it works perfectly when called directly
+- All bugs are in the execution loop (alfred.py) and planner logic
+
+## ============================================================
+## DAY 4: PHASE 1 TEST SUITE — ABORTED (did not complete)
+## ============================================================
+
+### 4a: Install Missing Dependencies — ✅ DONE
+- All deps already installed: sentence-transformers, faiss-cpu, websocket-client, croniter, requests
+- Added to requirements.txt: sentence-transformers, faiss-cpu, websocket-client, croniter
+
+### 4b: Start server — ✅ DONE
+- Server starts clean at localhost:8001
+- Sentence-transformers model loads (future warning about get_sentence_embedding_dimension rename)
+
+### 4c: Run 20-test suite — ❌ ABORTED ON T02
+- T01 (Goals): FAIL — response mentioned "project reporting" instead of AI/Finance/Startup keywords
+- T02 (Food): ABORTED before result
+- Aborted because B02 in D1D2 suite had same issue (LLM providers unavailable)
+
+### 4d: Triage — ⚠️ NOT FULLY COMPLETED (suite didn't finish)
+
+### 4e: Quick Wins Fixes — ⚠️ ATTEMPTED BUT NEVER VERIFIED
+- Fixed: Added calendar create example to planner prompt (line ~1242)
+- Fixed: Added time parsing to fallback plan (lines ~1409-1451)
+- Fixed: Verification loop now forces tool output on failure (lines ~976-990)
+- Fixed: verification default from True to False (line ~2168)
+- Fixed: Calendar verification checks specific summary keywords (lines ~2141-2149)
+- Fixed: Email verification checks output for "sent" and absence of "error" (lines ~2150-2154)
+- Fixed: Hour guard added (0-23 validation) to fallback plans
+- FIXED: Calendar dispatch now ALWAYS parses time from summary instead of trusting LLM time
+- Removed: debug print from calendar dispatch
+
+### 4f: Re-run — ❌ NEVER GOT THERE
+
+## ============================================================
+## COMPLETE BUG INVENTORY (Found this session)
+## ============================================================
+
+### Code Bugs (fixable, model can't fix)
+1. #5 — Hallucinated success: execution loop trusts LLM response over tool output
+   - FIX ATTEMPTED: verification now forces ctx.final_response on failure
+2. #4 — Verification doesn't actually verify: calendar checks API works, not event created
+   - FIX ATTEMPTED: now checks summary keywords in agenda
+3. #3 — Email silent failure: tool returns success: false, LLM says success anyway
+   - FIX ATTEMPTED: verification checks for "sent" AND no "error" in output
+4. #7 — Calendar cancel instead of delete: no proper delete action handling
+   - NOT FIXED (deferred)
+5. #9 — Invalid time error path: no validation before API call
+   - NOT FIXED (deferred)
+
+### Model Problems (better model would fix)
+1. #1 — Wrong time (4pm → 2am or 1am): free LLM bad at time conversion
+2. #2 — Verbose event titles: LLM passes full request as summary
+3. #6 — Missing goal keywords: LLM paraphrases instead of recalling T4
+4. #8 — 92s timeout: could be loop or slow LLM
+
+### Structural Problems (deeper architectural)
+1. Verification loop is theater — runs but doesn't enforce truth
+2. Planner makes 5 LLM calls before tool executes
+3. Special-case regex handling for every edge case
+4. 2067-line monolith with no clear responsibility boundaries
+5. LLM is trusted for planning but not trusted for execution — worst of both worlds
+
+## ============================================================
+## FILES MODIFIED THIS SESSION
+## ============================================================
+- project-alfred/brain/alfred.py — multiple fixes to calendar dispatch, verification, fallback plans
+- project-alfred/requirements.txt — added missing deps
+- project-alfred/build-system/phase1-plan.txt — updated Day 3 & 4 status
+- project-alfred/build-system/phase1d3&4_info.txt — this file
+
+## ============================================================
+## DECISION MADE: Rebuild Alfred Core Loop
+## ============================================================
+The patches get us nowhere. The architecture is fundamentally wrong.
+Next step: Rebuild brain/alfred.py as a clean ~500-line execution loop.
+Keep: server.py interface, memory tiers, GWS client, all tool backends.
+Remove: intent classifier, goal expansion, reply classification, verification theater, regex workarounds.
+Replace: 5-LLM-call planner with one prompt: tools → execute → respond → learn.

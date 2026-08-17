@@ -1,0 +1,53 @@
+# Alfred Jarvis - Voice System
+sounddevice>=0.5.0
+numpy>=1.24.0
+SpeechRecognition>=3.10.0
+requests>=2.31.0
+openwakeword>=1.0.0
+edge-tts>=0.2.0
+pygame>=2.0.0
+
+# Alfred PC Control
+pyautogui>=0.9.54
+pywin32>=306
+httpx>=0.26.0
+
+# Alfred Brain - Core
+groq>=0.4.0
+openai>=1.12.0
+httpx>=0.26.0
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# Alfred Brain - Database
+supabase>=2.3.0
+
+# Alfred Brain - Tools
+python-dotenv>=1.0.0
+playwright>=1.40.0
+pyautogui>=0.9.54
+Pillow>=10.0.0
+
+# Alfred Brain - Web
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Alfred Brain - Async
+asyncio>=3.4.3
+aiohttp>=3.9.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+websockets>=12.0
+websocket-client>=1.7.0
+sse-starlette>=2.0.0
+
+# Google Workspace API (Calendar, Gmail, Drive)
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+# Alfred Brain - Utilities
+python-dateutil>=2.8.0
+pytz>=2024.1
+croniter>=1.4.0

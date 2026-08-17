@@ -1,0 +1,209 @@
+# ALFRED PHASE 1 COMPLETION PLAN
+# Author: Alfred (via Master Sam directive)
+# Date: 2026-07-16
+# Goal: Complete Phase 1 (Sovereign Core) in 7 days, publish to GitHub
+
+================================================================================
+## THE REAL STATE OF PHASE 1
+================================================================================
+
+Tracker says "Phase 1 Complete — 74%." That's a lie. Here's what's actually broken:
+
+### The 5 Blockers
+
+| # | Blocker                                       | Impact                                                  | Fix Complexity |
+|---|-----------------------------------------------|---------------------------------------------------------|----------------|
+| 1 | T4 User Profile is empty                      | Memory tests (Q1-20) all fail — Alfred doesn't know you | Small — seeder |
+| 2 | T3 Episodes are skeletons                     | T3 returns metadata, not memories                       | Medium         |
+| 3 | Cockpit codebase divergence                   | cockpit calls endpoints that don't exist in canonical   | Medium — merge |
+| 4 | GWS OAuth expired                             | Calendar/email tests (Q21-40) all fail                  | Small — re-auth|
+| 5 | start scripts point to wrong paths            | Confusion about entry point                             | Tiny           |
+
+### What's Actually Working (verified)
+- 4-phase execution loop (brain/alfred.py, 2200+ lines)
+- 23 registered tools
+- FastAPI server with WebSocket + REST
+- Error taxonomy + recovery
+- T3 FAISS + BM25 hybrid search (but data is thin)
+- T5 SQLite FTS5 archive
+- Verification loop after mutations
+- LLM-based reply classification
+- Heartbeat daemon
+- Calculator safe eval (AST-based)
+
+
+================================================================================
+## DAY 1 (TODAY): FOUNDATION FIXES ✅ DONE — 2026-07-19
+================================================================================
+Goal: Make the server start clean and the codebase unified
+
+| Task | What                                                             | Why                                                    | Est. | Status |
+|------|------------------------------------------------------------------|--------------------------------------------------------|------|--------|
+| 1a   | Wire up 4 missing cockpit routes (messages, episodes, PUT/DELETE)| Cockpit frontend calls endpoints that don't exist      | 1h   | ✅ DONE |
+| 1b   | Fix start scripts — corrected paths in3 scripts                  | Typo: AI-terminal-stiff → Ai-terminal-stuff            | 30m  | ✅ DONE |
+| 1c   | Write T4 seeder + NEURAL_SEED.json + seed Sam.md                | Memory tests need data in Sam.md                       | 1h   | ✅ DONE |
+| 1d   | Run seeder, verify Sam.md has 15+ facts                          | Validates seeder works — 34 facts written              | 15m  | ✅ DONE |
+| 1e   | Fix .gitignore — add credentials.json, token.json, .env.vercel  | Security — OAuth secrets must not be committed         | 10m  | ✅ DONE |
+| 1f   | Delete 301 skeleton T3 episodes                                 | Noise cleanup before Day 2                             | 5m   | ✅ DONE |
+
+Success criteria:
+- `python -m brain_api.server` starts without errors ✅
+- T4 profile has 15+ facts (34 written) ✅
+- Start script works ✅
+
+
+================================================================================
+## DAY 2: T3 EPISODIC MEMORY FIX ✅ DONE — 2026-07-19
+================================================================================
+Goal: Episodes store actual responses, not just metadata
+
+| Task | What                                                             | Why                                                    | Est. | Status |
+|------|------------------------------------------------------------------|--------------------------------------------------------|------|--------|
+| 2a   | Fix episode format: store task + response + tools + success/fail | Current stubs are useless for retrieval                | 1h   | ✅ DONE |
+| 2b   | Fix T3 search — inject context in chat tool, increase to 500 chars | get_context_for_llm() skipped in chat tool           | 30m  | ✅ DONE |
+| 2c   | Clean old skeleton episodes (301 stubs = noise)                  | Pollutes search results                                | 15m  | ✅ DONE |
+| 2d   | Test T3 round-trip: ask → save → ask again → recall              | Validates the fix — needs running server              | 30m  | ⏳ DEFERRED |
+
+Success criteria:
+- T3 episodes contain actual responses ✅ (now stores user request + Alfred response + execution details)
+- T3 search returns meaningful results ✅ (500 char truncation, chat tool injects context)
+- "What's my favorite food?" works from memory ⏳ (needs server test)
+
+
+================================================================================
+## DAY 3: GWS OAUTH RE-AUTHENTICATION ⏳ PENDING — 2026-07-21
+================================================================================
+Goal: Calendar and email tools actually work
+
+| Task | What                                                             | Why                                                    | Est. | Status |
+|------|------------------------------------------------------------------|--------------------------------------------------------|------|--------|
+| 3a   | Run OAuth flow: `python -m brain.tools.gws_client --auth`        | Token expired, all GWS tests fail                      | 15m  | ⏳ Master Sam handles browser |
+| 3b   | Test calendar CRUD via /api/command: create → list → delete      | Calendar tests (Q21-40) need this                      | 20m  | ⏳ PENDING |
+| 3c   | Test email send/read via /api/command                            | Email tests need this                                  | 20m  | ⏳ PENDING |
+| 3d   | Fix any GWS bugs (credential refresh, f-string injection)        | Known Bugs list                                        | 1h   | ⏳ PENDING |
+
+Success criteria:
+- `calendar` tool creates/lists/deletes events via /api/command
+- `email` tool sends and reads via /api/command
+- GWS tests pass locally
+
+
+================================================================================
+## DAY 4: RUN PHASE 1 TEST SUITE — FIRST PASS ⏳ PENDING — 2026-07-21
+================================================================================
+Goal: See where we actually stand, fix quick wins
+
+| Task | What                                                             | Why                                                    | Est. | Status |
+|------|------------------------------------------------------------------|--------------------------------------------------------|------|--------|
+| 4a   | Install missing deps: sentence-transformers, faiss-cpu, etc.     | Server won't start without these                       | 10m  | ⏳ PENDING |
+| 4b   | Start server, verify clean startup                               | Baseline                                               | 5m   | ⏳ PENDING |
+| 4c   | Run `python build-system/phase1_cockpit_test.py`                 | Get first real score                                   | 10m  | ⏳ PENDING |
+| 4d   | Triage failures: DATA issue / CODE issue / INFRA issue           | Know what to fix                                       | 15m  | ⏳ PENDING |
+| 4e   | Fix quick wins (T01 goals, T02 food, T08 delete, T12 timeout, T14 invalid time) | Obvious code bugs | 1h | ⏳ PENDING |
+| 4f   | Re-run test suite, record new score                              | Measure improvement                                   | 10m  | ⏳ PENDING |
+
+Success criteria:
+- Concrete score (e.g. "16/20 passing")
+- Triage list of every failure with root cause
+- Quick wins applied, score improved from baseline
+
+
+================================================================================
+## DAY 5: FIX ALL FAILURES
+================================================================================
+Goal: Get from current score to 80%+
+
+| Task | What                                                             | Why                                                    | Est. |
+|------|------------------------------------------------------------------|--------------------------------------------------------|------|
+| 5a   | Fix code bugs from triage (intent classifier, goal inference,    | Known Bugs                                             | 2-3h |
+|      | greeting fast-path, typo tolerance)                              |                                                        |      |
+| 5b   | Fix data gaps — missing T4 facts, episode format issues          | Data issues                                            | 30m  |
+| 5c   | Fix bootstrap injection — load AGENTS/SOUL/TOOLS/IDENTITY into   | Alfred needs personality for emotional/goal questions  | 1h   |
+|      | LLM system prompt from Obsidian vault                            |                                                        |      |
+| 5d   | Re-run test suite                                                 | Measure improvement                                    | 10m  |
+
+Success criteria:
+- Phase 1 test score >= 80% (16/20 passing)
+
+
+================================================================================
+## DAY 6: GITHUB PUBLISHING
+================================================================================
+Goal: Clean repo on GitHub with proper structure
+
+| Task | What                                                             | Why                                                    | Est. |
+|------|------------------------------------------------------------------|--------------------------------------------------------|------|
+| 6a   | Clean git state — commit all pending changes                     | Root repo is chaos                                     | 30m  |
+| 6b   | Create project-alfred repo: `gh repo create Vanaxity/project-alfred --public` | Publish to GitHub                        | 5m   |
+| 6c   | Write README.md — architecture, how to run, phase status         | Portfolio piece                                        | 30m  |
+| 6d   | Push to GitHub                                                    | It's live                                              | 5m   |
+| 6e   | Create GitHub Project board with issues for Phase 2-5            | Tracking remaining work                                | 20m  |
+| 6f   | Commit cockpit changes (page.tsx, brainApi.ts)                    | Clean cockpit repo                                     | 10m  |
+
+Success criteria:
+- github.com/Vanaxity/project-alfred is public with README
+- GitHub Project board tracks remaining work
+
+
+================================================================================
+## DAY 7: POLISH & VERIFICATION
+================================================================================
+Goal: Everything works end-to-end, demo-ready
+
+| Task | What                                                             | Why                                                    | Est. |
+|------|------------------------------------------------------------------|--------------------------------------------------------|------|
+| 7a   | Final test run — target 80%+ score, Grade B or higher            | Proof it works                                         | 10m  |
+| 7b   | End-to-end demo: cockpit → brain → Google Calendar               | Proves full stack works                                | 15m  |
+| 7c   | Update PROJECT_TRACKER.md — mark Phase 1 actually done           | Accurate tracking                                      | 15m  |
+| 7d   | Final commit with updated tracker, working tests, clean code     | Clean state                                            | 5m   |
+
+Success criteria:
+- phase1_cockpit_test.py scores >= 80%
+- GitHub repo is public with README
+- GitHub Project board tracks remaining work
+
+
+================================================================================
+## DEFERRED TO PHASE 2 (not needed for Phase 1 Sovereignty)
+================================================================================
+
+- MCP client implementation
+- Tool Forge (skill to code conversion)
+- Self-audit cron job
+- Voice pipeline fixes
+- Flet desktop app
+- Cockpit WebSocket reconnection
+- FAISS index persistence across restarts
+- SentenceTransformer lazy loading (blocks event loop 500ms)
+- planner.py ULTRAPLAN (dead code, needs rewrite)
+- lib/ tool registry (disconnected from main loop)
+- Docker sandboxing for run_code
+
+
+================================================================================
+## RISK ASSESSMENT
+================================================================================
+
+Biggest risk: Day 4 might reveal deeper issues than Known Bugs suggests.
+If test score is below 40%, we re-scope.
+
+Quickest win: Days 1-2 (T4 seeder + T3 episode fix) = 20% of tests with ~3h work.
+
+GWS OAuth (Day 3) is the riskiest day — re-auth requires browser interaction.
+
+
+================================================================================
+## PHASE 1 TEST EXPECTATIONS (from phase1_cockpit_test.py)
+================================================================================
+
+20 tests across 7 categories:
+
+1. Memory & Recall (T01-T03): primary goals, favorite food, earlier conversation
+2. Calendar & Email (T04-T07): calendar check, add study block, unread emails, send email
+3. Verification Loop (T08-T09): delete and verify, verify reminder
+4. Proactivity (T10-T12): Monday test plan, stressed about exams, wasted hour on Instagram
+5. Self-Correction (T13-T14): mid-query correction, invalid time handling
+6. Memory Persistence (T15-T16): remember friend birthday, recall study habits
+7. Edge Cases (T17-T20): casual greeting, typo tolerance, reschedule help, self-awareness
+
+Target: 80%+ (16/20 passing) = Grade B or higher
