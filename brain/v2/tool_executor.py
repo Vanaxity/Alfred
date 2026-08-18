@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+import math
 import operator as op
 import os
 import re
@@ -654,32 +655,75 @@ async def handle_chat(params: Dict, ctx: Dict) -> ToolResult:
 
 
 async def handle_calculator(params: Dict, ctx: Dict) -> ToolResult:
-    """Evaluate a math expression safely using AST."""
+    """Evaluate a math expression safely using AST.
+
+    Supports arithmetic plus an allowlist of math functions and constants, so
+    real trigonometry/geometry questions work. Without them the LLM's correct
+    first attempt (e.g. `47*tan(35*pi/180)` for an angle-of-elevation problem)
+    failed with "Unsupported: Call", pushing it to fall back to run_code — which
+    needs approval — or, worse, to answer from memory and hallucinate a number.
+    """
     expression = params.get("expression", "0")
     safe_ops = {
         ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
         ast.Div: op.truediv, ast.Pow: op.pow,
-        ast.USub: op.neg, ast.FloorDiv: op.floordiv, ast.Mod: op.mod,
+        ast.USub: op.neg, ast.UAdd: op.pos,
+        ast.FloorDiv: op.floordiv, ast.Mod: op.mod,
     }
+
+    # Allowlist only: no attribute access, no builtins, no names beyond these.
+    safe_funcs = {
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "asin": math.asin, "acos": math.acos, "atan": math.atan,
+        "atan2": math.atan2,
+        "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
+        "sqrt": math.sqrt, "cbrt": lambda x: math.copysign(abs(x) ** (1 / 3), x),
+        "log": math.log, "log2": math.log2, "log10": math.log10, "exp": math.exp,
+        "degrees": math.degrees, "radians": math.radians,
+        "abs": abs, "round": round, "floor": math.floor, "ceil": math.ceil,
+        "min": min, "max": max, "pow": pow,
+        "hypot": math.hypot, "factorial": math.factorial,
+    }
+    safe_consts = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
 
     def _eval(node: ast.AST) -> float:
         if isinstance(node, ast.Expression):
             return _eval(node.body)
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return node.value
+        if isinstance(node, ast.Name):
+            if node.id in safe_consts:
+                return safe_consts[node.id]
+            raise ValueError(f"Unknown name: {node.id}")
         if isinstance(node, ast.UnaryOp) and type(node.op) in safe_ops:
-            return safe_ops[type(node.op)](0, _eval(node.operand))
+            return safe_ops[type(node.op)](_eval(node.operand))
         if isinstance(node, ast.BinOp) and type(node.op) in safe_ops:
             return safe_ops[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.Call):
+            # Only bare `name(...)` calls resolved against the allowlist —
+            # ast.Attribute is never evaluated, so `math.__loader__` etc.
+            # cannot be reached, and keyword/star args are refused outright.
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only direct function calls are allowed")
+            fname = node.func.id
+            if fname not in safe_funcs:
+                raise ValueError(f"Unknown function: {fname}")
+            if node.keywords:
+                raise ValueError("Keyword arguments are not supported")
+            args = [_eval(a) for a in node.args]
+            return safe_funcs[fname](*args)
         raise ValueError(f"Unsupported: {type(node).__name__}")
 
     try:
         tree = ast.parse(expression, mode="eval")
         result = _eval(tree)
-        return ToolResult(
-            success=True,
-            output=str(result) if isinstance(result, (int, float)) else "Invalid",
-        )
+        if not isinstance(result, (int, float)) or isinstance(result, bool):
+            return ToolResult(success=False, error="Calculator error: non-numeric result")
+        # Trig on a calculator produces long floats (32.90862...); round for
+        # readability but keep enough precision for "to the nearest tenth".
+        if isinstance(result, float) and not result.is_integer():
+            result = round(result, 6)
+        return ToolResult(success=True, output=str(result))
     except Exception as e:
         return ToolResult(success=False, error=f"Calculator error: {e}")
 

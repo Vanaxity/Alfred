@@ -145,6 +145,8 @@ class Alfred:
             "NEVER describe what you will do — just call the tool or reply.",
             "NEVER claim an action was completed without calling the tool and seeing a success result.",
             "CRITICAL: calendar, email, weather, time answers REQUIRE a tool call. Never answer from memory.",
+            "CRITICAL: ALL arithmetic, trigonometry, and geometry REQUIRE the calculator tool — never compute mentally and never state a number you did not get from it. Word problems count: extract the expression and call calculator.",
+            "Prefer calculator over run_code for anything calculator supports; run_code needs approval and is slower.",
             "Translate raw tool output into natural language — never dump JSON, IDs, or technical errors.",
             "Self-correct on failure. If a tool errors, explain why in plain terms.",
             "If user corrects you mid-query, acknowledge the correction and redo with the correct information.",
@@ -203,8 +205,18 @@ class Alfred:
                 "params": {"message": "Message to respond to"},
             },
             "calculator": {
-                "description": "Evaluate a math expression safely.",
-                "params": {"expression": "Expression like '2+2'"},
+                "description": (
+                    "Evaluate a math expression. Supports arithmetic, powers, and "
+                    "functions: sin cos tan asin acos atan atan2 sqrt cbrt log log2 "
+                    "log10 exp degrees radians abs round floor ceil min max pow hypot "
+                    "factorial, plus constants pi/e/tau. Trig takes RADIANS — convert "
+                    "degrees with radians(x) or x*pi/180. USE THIS for any arithmetic, "
+                    "trigonometry, or geometry, including word problems; do NOT use "
+                    "run_code for math this can do."
+                ),
+                "params": {
+                    "expression": "e.g. '2+2', '47*tan(radians(35))', 'sqrt(144)'"
+                },
             },
             "calendar": {
                 "description": "List/create Google Calendar events. Actions: agenda, list, create.",
