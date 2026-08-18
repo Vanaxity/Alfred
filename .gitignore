@@ -82,6 +82,9 @@ sessions/
 *.json.bak
 *.csv.bak
 
+# Test-run artifacts (regenerated on every run, not source)
+/phase1_results.json
+
 # Audio Files (voice pipeline)
 *.wav
 *.mp3
