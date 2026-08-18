@@ -720,7 +720,6 @@ class Alfred:
             due = self.db.get_due_reminders()
             alerts = []
             for r in due:
-                self.db.mark_reminder_fired(r["id"])
                 a = {
                     "type": "reminder",
                     "text": r["text"],
@@ -728,11 +727,23 @@ class Alfred:
                     "category": r.get("category", "general"),
                 }
                 alerts.append(a)
-                self._pending_alerts.append(a)
+                self.push_alert(a)
+                self.db.mark_reminder_fired(r["id"])
             return alerts
         except Exception as e:
             print(f"[Alfred-v2] Reminder check failed: {e}")
             return []
+
+    def push_alert(self, alert: Dict[str, Any]) -> None:
+        """Queue an alert for the WebSocket broadcaster to pick up.
+
+        This is the single alert entry point — brain_api/server.py's
+        _alert_broadcaster() polls pop_alerts() below every 5s. Previously
+        CognitiveHeartbeat kept its own separate _pending_alerts that nothing
+        ever drained, so every reminder/cron/proactive alert it generated
+        vanished silently; it now calls this instead.
+        """
+        self._pending_alerts.append(alert)
 
     def pop_alerts(self) -> List[Dict]:
         """Pop pending alerts for WebSocket broadcast."""

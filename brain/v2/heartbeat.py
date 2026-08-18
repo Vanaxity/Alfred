@@ -3,13 +3,18 @@ Cognitive Heartbeat — Hermes-inspired proactive reasoning and cron.
 
 Upgrades the bare reminder-check thread into a cognitive loop that:
     (a) Checks due reminders (existing path).
-    (b) Queries the SQLite cron store for due scheduled tasks.
+    (b) Queries the SQLite cron store for due scheduled tasks and executes them.
     (c) Runs a proactive-reasoning LLM call that receives:
         - Master Sam's top-level T4 goals
         - A summary of upcoming calendar events
         - Recent inbox snippets
-        - A short recap of recent conversation
-    (d) Pushes any resulting alerts/nudges via the WebSocket mechanism.
+        - A short recap of recent T3 activity
+      and returns a confidence-tiered verdict: high confidence attempts the
+      action directly (through the same guardrail-checked path as any other
+      tool call — a proactive action never self-approves), medium confidence
+      becomes a nudge alert, low confidence is logged only.
+    (d) Pushes alerts into Alfred.push_alert(), the single queue
+        brain_api/server.py's broadcaster actually drains.
 
 Cron jobs are stored in the existing `scheduled_tasks` table in local_db.py
 (using croniter for expression parsing). The heartbeat runs on a configurable
@@ -23,6 +28,8 @@ import time
 import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from .tool_executor import _extract_json_object
 
 
 class CognitiveHeartbeat:
@@ -53,17 +60,6 @@ class CognitiveHeartbeat:
         self._interval = interval
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        self._pending_alerts: List[Dict[str, Any]] = []
-
-    @property
-    def pending_alerts(self) -> List[Dict[str, Any]]:
-        return list(self._pending_alerts)
-
-    def pop_alerts(self) -> List[Dict[str, Any]]:
-        """Pop pending alerts for WebSocket broadcast."""
-        alerts = list(self._pending_alerts)
-        self._pending_alerts.clear()
-        return alerts
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -107,7 +103,8 @@ class CognitiveHeartbeat:
         """
         Execute one heartbeat cycle.
 
-        Returns a list of alerts/nudges generated during this tick.
+        Returns a list of alerts/nudges generated during this tick (also
+        pushed into Alfred.push_alert() as they're created).
         """
         alerts: List[Dict[str, Any]] = []
 
@@ -126,8 +123,9 @@ class CognitiveHeartbeat:
         except Exception as e:
             print(f"[Heartbeat] Proactive reasoning failed: {e}")
 
-        # --- (d) Queue alerts for WebSocket broadcast ---
-        self._pending_alerts.extend(alerts)
+        # --- (d) Push alerts to the one queue the broadcaster drains ---
+        for a in alerts:
+            self._alfred.push_alert(a)
 
         if alerts:
             print(f"[Heartbeat] Generated {len(alerts)} alert(s)")
@@ -144,7 +142,6 @@ class CognitiveHeartbeat:
         try:
             due = self._db.get_due_reminders()
             for r in due:
-                self._db.mark_reminder_fired(r["id"])
                 alert = {
                     "type": "reminder",
                     "text": r["text"],
@@ -153,6 +150,11 @@ class CognitiveHeartbeat:
                     "timestamp": datetime.now().isoformat(),
                 }
                 alerts.append(alert)
+                # Mark fired only after the alert is queued: firing first
+                # (the old order) meant a reminder due during any gap between
+                # "mark fired" and "alert actually delivered" was lost for
+                # good, with no way to recover it short of a DB inspection.
+                self._db.mark_reminder_fired(r["id"])
         except Exception as e:
             print(f"[Heartbeat] Reminder check failed: {e}")
         return alerts
@@ -205,8 +207,13 @@ class CognitiveHeartbeat:
         """
         Run a proactive-reasoning LLM call.
 
-        Sends Alfred a prompt asking it to identify gaps between Master Sam's
-        goals and current state, then generates nudges for critical items.
+        Asks for a structured, confidence-tiered verdict rather than free
+        text, so this code can branch instead of treating every non-trivial
+        response identically:
+            high   -> attempt the action (guardrail-checked, never self-approved)
+            medium -> nudge alert (the old behavior)
+            low    -> logged only, no alert
+            malformed output -> treated as medium, never silently dropped
         """
         alerts: List[Dict[str, Any]] = []
 
@@ -214,63 +221,156 @@ class CognitiveHeartbeat:
         goals = self._get_goals_summary()
         calendar = self._get_calendar_summary()
         inbox = self._get_inbox_summary()
+        recap = self._get_recent_activity_recap()
 
-        if not goals and not calendar and not inbox:
+        if not goals and not calendar and not inbox and not recap:
             return alerts  # Nothing to reason about
 
-        # Build proactive reasoning prompt
-        prompt = self._build_proactive_prompt(goals, calendar, inbox)
+        prompt = self._build_proactive_prompt(goals, calendar, inbox, recap)
 
         try:
             resp = await self._router.call(
-                system_prompt="You are Alfred's proactive cognition module. "
-                "Analyze Master Sam's situation and identify critical gaps. "
-                "Be direct and actionable. No empty platitudes.",
+                system_prompt=(
+                    "You are Alfred's proactive cognition module. Analyze Master "
+                    "Sam's situation and identify critical gaps. Be direct and "
+                    "actionable. No empty platitudes.\n"
+                    "Output ONE JSON object, nothing else:\n"
+                    '{"confidence": "high"|"medium"|"low", "observation": "...", '
+                    '"action": {"tool": "name", "params": {...}} or null}\n'
+                    "confidence=high ONLY when there is a concrete, safe, "
+                    "immediately-executable action with tool+params you are "
+                    "confident about. confidence=medium for a real gap worth "
+                    "surfacing but with no safe automatic action (or none you're "
+                    "confident enough to run). confidence=low for a minor or "
+                    "speculative observation not worth interrupting for. "
+                    'If nothing notable, set observation to "No critical gaps '
+                    'detected." with confidence "low" and action null.'
+                ),
                 user_message=prompt,
                 max_tokens=400,
                 temperature=0.3,
             )
-            response = (resp.text or "").strip()
+            raw = (resp.text or "").strip()
+            parsed = _extract_json_object(raw)
 
-            # If the LLM identified something actionable, create an alert
-            if response and len(response) > 20:
-                # Check if it's a genuine insight (not just "no issues")
-                lower = response.lower()
-                no_issues = [
-                    "no issues", "no gaps", "everything looks good",
-                    "no action needed", "nothing to report",
-                ]
-                if not any(phrase in lower for phrase in no_issues):
-                    alert = {
+            if not isinstance(parsed, dict) or "confidence" not in parsed:
+                # Malformed/unparseable output must not vanish silently --
+                # that's the exact failure mode this rewrite exists to fix.
+                # Default to a medium-style nudge using the raw text, same as
+                # the module's pre-tiering behavior.
+                if raw and len(raw) > 20 and "no critical gap" not in raw.lower():
+                    alerts.append({
                         "type": "proactive_nudge",
-                        "message": response[:500],
+                        "message": raw[:500],
                         "timestamp": datetime.now().isoformat(),
-                    }
+                    })
+                return alerts
+
+            confidence = str(parsed.get("confidence", "medium")).strip().lower()
+            observation = str(parsed.get("observation", "")).strip()
+            action = parsed.get("action")
+
+            if not observation or "no critical gap" in observation.lower():
+                return alerts
+
+            if confidence == "high" and isinstance(action, dict) and action.get("tool"):
+                alert = await self._attempt_proactive_action(observation, action)
+                if alert:
                     alerts.append(alert)
+            elif confidence == "low":
+                print(f"[Heartbeat] Low-confidence observation (logged only): {observation[:120]}")
+            else:
+                # medium, or "high" without a usable action -- still worth a nudge.
+                alerts.append({
+                    "type": "proactive_nudge",
+                    "message": observation[:500],
+                    "timestamp": datetime.now().isoformat(),
+                })
 
         except Exception as e:
             print(f"[Heartbeat] Proactive reasoning LLM call failed: {e}")
 
         return alerts
 
-    def _get_goals_summary(self) -> str:
-        """Get a summary of Master Sam's goals from T4 profile."""
+    async def _attempt_proactive_action(
+        self, observation: str, action: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Execute a high-confidence proactive action.
+
+        Goes through the same ToolExecutor guardrail path as any user-issued
+        tool call, with an empty approved_actions -- a proactive action must
+        clear the same approval gate a human-issued one would, never skip it.
+        """
+        tool_name = action.get("tool")
+        params = action.get("params") or {}
+        tool_executor = getattr(self._alfred, "_tool_executor", None)
+        if tool_executor is None:
+            return None
+
+        tool_ctx = {
+            "memory": self._memory,
+            "db": self._db,
+            "router": self._router,
+            "bootstrap": getattr(self._alfred, "_bootstrap", {}),
+            "approved_actions": [],
+        }
+
         try:
-            ctx = self._memory.get_context_for_llm()
-            if ctx and "goals" in ctx.lower():
-                # Extract just the goals section
-                lines = ctx.split("\n")
-                goal_lines = []
-                in_goals = False
-                for line in lines:
-                    if "goal" in line.lower():
-                        in_goals = True
-                    if in_goals:
-                        goal_lines.append(line)
-                        if len(goal_lines) > 10:
-                            break
-                return "\n".join(goal_lines) if goal_lines else ctx[:500]
-            return ctx[:500] if ctx else ""
+            result = await tool_executor.execute(tool_name, params, tool_ctx)
+        except Exception as e:
+            print(f"[Heartbeat] Proactive action execution error: {e}")
+            return None
+
+        if result.metadata.get("awaiting_approval"):
+            # No synchronous requester to hand this back to (unlike a chat
+            # turn) -- push it as an alert instead, same payload shape
+            # Day 6's reactive approval path uses, not a second invented one.
+            return {
+                "type": "approval_request",
+                "tool": result.metadata.get("tool", tool_name),
+                "params": result.metadata.get("params", params),
+                "signature": result.metadata.get("signature"),
+                "observation": observation,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        if result.success:
+            return {
+                "type": "proactive_action_taken",
+                "tool": tool_name,
+                "observation": observation,
+                "result": str(result.output)[:300],
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        # Failed for a reason other than needing approval -- still surface
+        # the observation rather than silently dropping it.
+        return {
+            "type": "proactive_nudge",
+            "message": f"{observation} (attempted {tool_name} but it failed: {result.error})",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def _get_goals_summary(self) -> str:
+        """Read T4's structured 'goals' section directly.
+
+        The old version called get_context_for_llm() (T1 + full T4 dump) then
+        substring-scanned every line for the word "goal" -- crude, and the
+        live profile already has a clean `## goals` section with flat
+        key:value entries to read directly instead.
+        """
+        try:
+            profile = getattr(self._memory, "_t4_profile", None)
+            if not profile:
+                # Lazily loaded on first t4_get/t4_set in this process; if the
+                # heartbeat's first tick fires before any of those, force it.
+                self._memory.t4_load_profile()
+                profile = getattr(self._memory, "_t4_profile", None)
+            goals = (profile or {}).get("goals", {})
+            if not goals:
+                return ""
+            lines = [f"{k}: {v}" for k, v in list(goals.items())[:10]]
+            return "\n".join(lines)
         except Exception:
             return ""
 
@@ -298,8 +398,32 @@ class CognitiveHeartbeat:
         except Exception:
             return ""
 
+    def _get_recent_activity_recap(self) -> str:
+        """A short recap of the most recent T3 episodes, by recency.
+
+        The module docstring has claimed a "recent conversation recap" was
+        part of the proactive prompt since this file was written; it never
+        was -- _build_proactive_prompt() only ever took goals/calendar/inbox.
+        """
+        try:
+            from ..memory.five_tier import T3_EPISODIC_DIR
+            files = sorted(
+                T3_EPISODIC_DIR.glob("*.md"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:3]
+            snippets = []
+            for f in files:
+                try:
+                    snippets.append(f.read_text(encoding="utf-8")[:200])
+                except Exception:
+                    continue
+            return "\n---\n".join(snippets)
+        except Exception:
+            return ""
+
     def _build_proactive_prompt(
-        self, goals: str, calendar: str, inbox: str
+        self, goals: str, calendar: str, inbox: str, recap: str = ""
     ) -> str:
         """Build the proactive reasoning prompt."""
         parts = [
@@ -316,6 +440,9 @@ class CognitiveHeartbeat:
         if inbox:
             parts.append(f"## Recent Inbox\n{inbox}\n")
 
+        if recap:
+            parts.append(f"## Recent Activity\n{recap}\n")
+
         parts.extend([
             "## Task",
             "Based on the above, identify:",
@@ -323,8 +450,7 @@ class CognitiveHeartbeat:
             "2. Any goal that lacks a concrete next step.",
             "3. Any email that requires a response.",
             "",
-            "If you find a critical gap, describe it in 1-2 sentences and suggest a concrete action.",
-            "If everything looks good, say: 'No critical gaps detected.'",
+            "Respond with the JSON object described in your system prompt.",
         ])
 
         return "\n".join(parts)
