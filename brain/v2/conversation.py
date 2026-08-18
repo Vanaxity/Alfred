@@ -469,8 +469,12 @@ class Alfred:
             conv.add_tool_result(tool_name, result_dict)
 
             # --- Mutation verification ---
-            if result.success and tool_name in MUTATION_TOOLS:
-                verify_result = await self._tool_executor.verify_mutation(tool_name, tool_ctx)
+            # is_mutation() is action-aware: a calendar "agenda" read is not a
+            # mutation even though "calendar" is in MUTATION_TOOLS.
+            if result.success and self._tool_executor.is_mutation(tool_name, tool_params):
+                verify_result = await self._tool_executor.verify_mutation(
+                    tool_name, tool_ctx, tool_params
+                )
                 if verify_result:
                     verify_output = verify_result.output if verify_result.success else verify_result.error
                     conv.add_tool_result(

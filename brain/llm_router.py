@@ -1,7 +1,8 @@
 import asyncio
+import re
 import time
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
@@ -28,6 +29,9 @@ class Provider:
     timeout: Optional[float] = None
     min_timeout: float = 5.0
     ema_latency_ms: float = 0.0
+    # Provider-specific request params merged into the completion call
+    # (e.g. reasoning_effort, which only Groq's gpt-oss models accept).
+    extra_params: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.timeout is None:
@@ -76,6 +80,33 @@ class LLMResponse:
     error: Optional[str] = None
 
 
+# Reasoning models (qwen, nemotron, deepseek-style) wrap their scratchpad in
+# tags and leave it in `content`. Alfred expects strict JSON, so strip it.
+_REASONING_BLOCK = re.compile(
+    r"<(think|thinking|reasoning|thought)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_REASONING_UNCLOSED = re.compile(
+    r"<(think|thinking|reasoning|thought)\b[^>]*>.*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_reasoning(content: Optional[str]) -> str:
+    """Remove tag-delimited reasoning blocks from an LLM completion.
+
+    Undelimited reasoning prose is left alone — the JSON brace-scanner in
+    conversation.py already skips past leading prose to find the object.
+    """
+    if not content:
+        return ""
+    cleaned = _REASONING_BLOCK.sub("", content)
+    # A truncated completion can leave an opening tag with no closer; anything
+    # after it is reasoning that never reached an answer.
+    cleaned = _REASONING_UNCLOSED.sub("", cleaned)
+    return cleaned.strip()
+
+
 class LLMRouter:
     def __init__(self, groq_key: str, gemini_key: str, openrouter_key: str):
         self.providers: List[Provider] = []
@@ -89,14 +120,19 @@ class LLMRouter:
                 2, openrouter_key, base_timeout=20.0
             ))
         if groq_key:
+            # gpt-oss is a reasoning model: without reasoning_effort="low" it
+            # spends the whole token budget on reasoning and returns empty
+            # content, or tries native tool-calling and 400s (Alfred's protocol
+            # is JSON-in-text, so no `tools` array is ever sent).
             self.providers.append(Provider(
-                "groq", "llama-3.1-8b-instant",
+                "groq", "openai/gpt-oss-120b",
                 Groq(api_key=groq_key, timeout=15.0), 1, groq_key,
-                base_timeout=10.0
+                base_timeout=10.0,
+                extra_params={"reasoning_effort": "low"},
             ))
         if gemini_key:
             self.providers.append(Provider(
-                "gemini", "gemini-2.0-flash",
+                "gemini", "gemini-2.5-flash",
                 genai.Client(api_key=gemini_key), 3, gemini_key,
                 base_timeout=20.0
             ))
@@ -249,10 +285,17 @@ class LLMRouter:
         """Cheap connectivity check used only when a breaker is HALF_OPEN."""
         try:
             await self._execute_provider(
-                provider, "ping", "ping", None, 1, 0.0,
+                provider, "ping", "ping", None, 16, 0.0,
                 timeout=3.0, record_latency=False,
             )
             return True
+        except ValueError as e:
+            # An empty completion still proves the endpoint is reachable, which
+            # is all a connectivity probe needs to know. Reasoning models often
+            # return empty content at a tiny max_tokens because the reasoning
+            # pass consumes the whole budget — that must not wedge the breaker
+            # permanently in HALF_OPEN.
+            return "empty response" in str(e).lower()
         except Exception:
             return False
 
@@ -299,9 +342,10 @@ class LLMRouter:
                     max_output_tokens=max_tokens, temperature=temperature,
                 ),
             )
-        if not response.text or not response.text.strip():
+        text = strip_reasoning(response.text)
+        if not text:
             raise ValueError("Gemini returned empty response")
-        return response.text
+        return text
 
     def _call_openai_compatible(
         self, provider: Provider, system_prompt: str, user_message: str,
@@ -316,8 +360,10 @@ class LLMRouter:
         response = provider.client.chat.completions.create(
             model=provider.model, messages=msg_list,
             max_tokens=max_tokens, temperature=temperature,
+            **provider.extra_params,
         )
         content = response.choices[0].message.content
+        content = strip_reasoning(content)
         if not content or not content.strip():
             raise ValueError("LLM returned empty response")
         return content
@@ -327,7 +373,7 @@ async def test_router():
     import os
     router = LLMRouter(
         groq_key=os.getenv("GROQ_API_KEY", ""),
-        gemini_key=os.getenv("GEMINI_API_KEY", ""),
+        gemini_key=os.getenv("GOOGLE_API_KEY", ""),
         openrouter_key=os.getenv("OPENROUTER_API_KEY", ""),
     )
     response = await router.call(
