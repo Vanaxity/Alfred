@@ -45,6 +45,7 @@ from brain.v2 import (  # noqa: E402
     create_tool_executor,
 )
 from brain.v2.tool_executor import (  # noqa: E402
+    _action_signature,
     _is_safe_path,
     handle_glob,
     handle_open_app,
@@ -157,8 +158,11 @@ def test_deny_pattern_blocks_even_when_approved():
         "shell", h,
         guardrails=Guardrails(require_approval=True, deny_patterns=[r"\brm\s+-[a-z]*[rf]"]),
     )
-    # Approval granted, yet the destructive command must still be refused.
-    r = run(ex.execute("shell", {"command": "rm -rf /"}, {"approved_tools": {"shell"}}))
+    params = {"command": "rm -rf /"}
+    sig = _action_signature("shell", params)
+    # Approval granted for this exact action, yet the destructive command must
+    # still be refused — deny_patterns is a backstop that survives approval.
+    r = run(ex.execute("shell", params, {"approved_actions": {sig}}))
     assert not r.success
     assert "denied pattern" in r.error
     assert r.metadata.get("denied_by")
@@ -168,16 +172,41 @@ def test_deny_pattern_blocks_even_when_approved():
 def test_require_approval_gates_until_granted():
     h = scripted_handler([ok("ran"), ok("ran")])
     ex = executor_with("shell", h, guardrails=Guardrails(require_approval=True))
+    params = {"command": "echo hi"}
 
-    blocked = run(ex.execute("shell", {"command": "echo hi"}, {}))
+    blocked = run(ex.execute("shell", params, {}))
     assert not blocked.success
     assert blocked.metadata.get("awaiting_approval") is True
     assert blocked.metadata.get("tool") == "shell"
+    sig = blocked.metadata.get("signature")
+    assert sig == _action_signature("shell", params), (
+        "client must be able to echo the exact signature back verbatim"
+    )
     assert h.calls == []
 
-    allowed = run(ex.execute("shell", {"command": "echo hi"}, {"approved_tools": ["shell"]}))
+    allowed = run(ex.execute("shell", params, {"approved_actions": [sig]}))
     assert allowed.success, allowed.error
     assert len(h.calls) == 1
+
+
+def test_approval_is_per_action_not_per_tool():
+    # Core guarantee: approving one call must not blanket-approve every future
+    # call to the same tool — "approval each time" means per exact params.
+    h = scripted_handler([ok(), ok()])
+    ex = executor_with("shell", h, guardrails=Guardrails(require_approval=True))
+
+    sig_a = _action_signature("shell", {"command": "echo a"})
+    approved_only_a = {"approved_actions": [sig_a]}
+
+    ran_a = run(ex.execute("shell", {"command": "echo a"}, approved_only_a))
+    assert ran_a.success, ran_a.error
+
+    still_blocked_b = run(ex.execute("shell", {"command": "echo b"}, approved_only_a))
+    assert not still_blocked_b.success, (
+        "approving 'echo a' must not silently approve the different 'echo b' call"
+    )
+    assert still_blocked_b.metadata.get("awaiting_approval") is True
+    assert len(h.calls) == 1, "the still-blocked call must never reach the handler"
 
 
 def test_allowed_patterns_act_as_allowlist():
@@ -491,6 +520,31 @@ def test_toolresult_to_dict_shape():
     assert ToolResult(success=False, error="bad").to_dict() == {"error": "bad"}
     # A failure with no error text still reports something actionable.
     assert "error" in ToolResult(success=False).to_dict()
+
+
+def test_toolresult_to_dict_preserves_metadata():
+    # The bug: metadata used to be dropped entirely on to_dict(), so the
+    # approval-required signal (awaiting_approval/tool/params) could never
+    # survive into conversation history even though execute() sets it.
+    blocked = ToolResult(
+        success=False, error="requires approval", tool_name="shell",
+        metadata={"awaiting_approval": True, "tool": "shell", "params": {"command": "echo hi"}},
+    )
+    d = blocked.to_dict()
+    assert d["error"] == "requires approval"
+    assert d["metadata"]["awaiting_approval"] is True
+    assert d["metadata"]["params"] == {"command": "echo hi"}
+
+    # Metadata must survive on the success branch too — execute()'s retry loop
+    # sets metadata (attempts/recovered_after) on a result that ultimately succeeded.
+    recovered = ToolResult(success=True, output="done", metadata={"recovered_after": 2})
+    d2 = recovered.to_dict()
+    assert d2["output"] == "done"
+    assert d2["metadata"]["recovered_after"] == 2
+
+    # Empty metadata must not add a stray key — keeps the common case lean.
+    assert "metadata" not in ToolResult(success=True, output="x").to_dict()
+    assert "metadata" not in ToolResult(success=False, error="x").to_dict()
 
 
 # ---------------------------------------------------------------------------

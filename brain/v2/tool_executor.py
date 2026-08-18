@@ -47,10 +47,25 @@ class ToolResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dict for LLM consumption."""
-        if self.success:
-            return {"output": str(self.output) if self.output else ""}
-        return {"error": self.error or "Unknown error"}
+        """Convert to dict for LLM consumption.
+
+        metadata is nested under its own key, not spread at the top level, so an
+        unrelated future metadata key can never collide with "output"/"error".
+        Only included when non-empty — most results carry none, and every extra
+        key here is extra tokens sent back to the LLM every turn. This matters on
+        both branches: success results can carry metadata too (e.g. execute()'s
+        retry loop sets "attempts"/"recovered_after" on a result that succeeded
+        after an initial failure), so dropping it only on the error branch would
+        silently lose that signal.
+        """
+        base = (
+            {"output": str(self.output) if self.output else ""}
+            if self.success
+            else {"error": self.error or "Unknown error"}
+        )
+        if self.metadata:
+            base["metadata"] = self.metadata
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +170,9 @@ _DESTRUCTIVE_PATTERNS: List[str] = [
 ]
 
 # Per-tool guardrails. Anything that can execute arbitrary code or launch a
-# process requires explicit approval; approval is granted by putting the tool
-# name in context["approved_tools"].
+# process requires explicit approval; approval is granted per exact tool+params
+# call by putting that action's signature (see _action_signature) into
+# context["approved_actions"].
 TOOL_GUARDRAILS: Dict[str, Guardrails] = {
     "shell": Guardrails(
         require_approval=True,
@@ -302,8 +318,9 @@ class ToolExecutor:
                 )
 
         if gr.require_approval:
-            approved = (context or {}).get("approved_tools") or ()
-            if tool_name not in approved:
+            sig = _action_signature(tool_name, params)
+            approved = set((context or {}).get("approved_actions") or ())
+            if sig not in approved:
                 return ToolResult(
                     success=False,
                     error=f"Tool '{tool_name}' requires explicit approval before running.",
@@ -312,6 +329,7 @@ class ToolExecutor:
                         "awaiting_approval": True,
                         "tool": tool_name,
                         "params": params,
+                        "signature": sig,
                     },
                 )
 
@@ -516,6 +534,20 @@ class ToolExecutor:
 # ---------------------------------------------------------------------------
 # Legacy adapter
 # ---------------------------------------------------------------------------
+
+def _action_signature(tool_name: str, params: Dict[str, Any]) -> str:
+    """A deterministic signature identifying one exact tool+params call.
+
+    Used for "approve this exact action, not this tool forever" semantics — a
+    signature is echoed back to the client in awaiting_approval.signature, and
+    the client returns it verbatim in approved_actions to authorize a retry.
+    Nothing needs to be recomputed client-side, which keeps this robust across
+    languages/JSON serializers rather than requiring the client to replicate
+    Python's exact canonicalization.
+    """
+    canonical = json.dumps(params or {}, sort_keys=True, default=str)
+    return f"{tool_name}:{canonical}"
+
 
 def _extract_json_object(text: str) -> Optional[Any]:
     """Pull the first balanced JSON object out of a possibly-chatty reply."""
@@ -1352,7 +1384,9 @@ if __name__ == "__main__":
         r = await ex.execute("shell", {"command": "echo hi"}, {})
         print(f"shell (no appr) -> success={r.success} awaiting={r.metadata.get('awaiting_approval')}")
 
-        r = await ex.execute("shell", {"command": "rm -rf /"}, {"approved_tools": {"shell"}})
+        denied_params = {"command": "rm -rf /"}
+        denied_sig = _action_signature("shell", denied_params)
+        r = await ex.execute("shell", denied_params, {"approved_actions": {denied_sig}})
         print(f"shell (denied)  -> success={r.success} error={str(r.error)[:60]!r}")
 
         print(f"\ncalendar agenda is mutation? {ex.is_mutation('calendar', {'action': 'agenda'})}")

@@ -385,6 +385,7 @@ class Alfred:
             "db": self.db,
             "router": self._router,
             "bootstrap": self._bootstrap,
+            "approved_actions": (context or {}).get("approved_actions") or [],
         }
 
         # Initialize conversation history
@@ -398,6 +399,7 @@ class Alfred:
         final_reply = ""
         tools_called: List[str] = []
         tool_results: List[Dict[str, Any]] = []
+        awaiting_approval: Optional[Dict[str, Any]] = None
 
         for turn in range(self.MAX_TURNS):
             # --- Build prompt ---
@@ -429,6 +431,16 @@ class Alfred:
 
             # --- Parse output ---
             reply, tool_name, tool_params = self._parse_llm_output(raw)
+
+            # Record the LLM's own output into history. Message.is_tool_call is
+            # computed from content (does it parse as JSON with a "tool" key?),
+            # so recording raw here — before branching on what it turned out to
+            # be — makes ConversationHistory._find_last_tool_pair_start() able
+            # to recognize a tool-call turn automatically. Without this, the
+            # ASSISTANT message a TOOL result depends on never existed, so
+            # compression could never identify a pair to preserve.
+            if raw:
+                conv.add_assistant(raw)
 
             if reply is not None:
                 if reply.strip():
@@ -467,6 +479,25 @@ class Alfred:
             # --- Add tool result to conversation ---
             result_dict = result.to_dict()
             conv.add_tool_result(tool_name, result_dict)
+
+            # --- Stop immediately if the tool needs approval ---
+            # Don't burn the remaining turns retrying a call that's blocked on a
+            # human decision, not a fixable error — the LLM has no params
+            # correction that gets past "a human hasn't said yes yet." The
+            # attempt is already recorded above (add_assistant + add_tool_result),
+            # so a resend with approved_actions set will have full context.
+            if result.metadata.get("awaiting_approval"):
+                awaiting_approval = {
+                    "tool": result.metadata.get("tool", tool_name),
+                    "params": result.metadata.get("params"),
+                    "signature": result.metadata.get("signature"),
+                }
+                final_reply = (
+                    f"I need your approval before running {tool_name}. "
+                    "Confirm and I'll proceed."
+                )
+                thinking.append(f"  Awaiting approval: {tool_name}")
+                break
 
             # --- Mutation verification ---
             # is_mutation() is action-aware: a calendar "agenda" read is not a
@@ -533,6 +564,7 @@ class Alfred:
             "tools_called": tools_called,
             "tool_results": tool_results,
             "episodes_saved": episodes_saved,
+            "awaiting_approval": awaiting_approval,
         }
 
     # ------------------------------------------------------------------
