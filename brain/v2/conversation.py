@@ -71,9 +71,11 @@ class Alfred:
         from ..memory.skill_manager import get_skill_manager
         from ..local_db import get_local_db
         from ..llm_router import LLMRouter
+        from ..goal_inference import get_goal_expander
 
         self.memory = get_memory()
         self.skill_manager = get_skill_manager()
+        self.goal_expander = get_goal_expander()
         self.db = get_local_db()
         self.heartbeat_enabled = True
         self._pending_alerts: List[Dict] = []
@@ -116,11 +118,20 @@ class Alfred:
     # System prompt assembly (via PromptBuilder)
     # ------------------------------------------------------------------
 
-    def _build_system_prompt(self, memory_snippets: Optional[List[str]] = None) -> str:
+    def _build_system_prompt(
+        self,
+        memory_snippets: Optional[List[str]] = None,
+        matched_skill: Optional[Any] = None,
+    ) -> "tuple[str, List[str]]":
         """
         Build the system prompt using PromptBuilder.
 
-        Priority: Identity > Rules > Profile > Tools > Skills > Memory
+        Priority: Identity > Rules > Profile > Tools > Memory > Skills
+
+        Returns (system_text, dropped_section_names) — the latter surfaces
+        sections that lost the token-budget fitting entirely (not merely
+        truncated), so a caller can log when memory silently vanished
+        instead of that being invisible.
         """
         # Identity
         identity = "You are Alfred, Master Sam's autonomous AI assistant."
@@ -160,17 +171,17 @@ class Alfred:
                 parameters=desc_dict.get("params", {}),
             ))
 
-        # Skills (T2)
+        # Skills (T2) — a specifically-matched skill for this task, not an
+        # arbitrary unranked "first 5" (the old behavior had no relevance
+        # filtering at all: it showed whatever happened to be first in the
+        # index regardless of the task, which is noise, not guidance).
         skills = []
-        try:
-            for s in self.memory._t2_skills_index[:5]:
-                skills.append({
-                    "title": s.get("title", ""),
-                    "description": s.get("description", ""),
-                    "steps": s.get("steps", []),
-                })
-        except Exception:
-            pass
+        if matched_skill is not None:
+            skills.append({
+                "title": matched_skill.title,
+                "description": matched_skill.description,
+                "steps": matched_skill.steps,
+            })
 
         # Assemble
         result = self._prompt_builder.assemble(
@@ -182,7 +193,7 @@ class Alfred:
             rules=rules,
         )
 
-        return result.system
+        return result.system, result.dropped_sections
 
     def _get_tool_descriptions(self) -> Dict[str, Dict[str, Any]]:
         """Get tool descriptions for prompt injection."""
@@ -385,6 +396,7 @@ class Alfred:
             "db": self.db,
             "router": self._router,
             "bootstrap": self._bootstrap,
+            "approved_actions": (context or {}).get("approved_actions") or [],
         }
 
         # Initialize conversation history
@@ -398,12 +410,49 @@ class Alfred:
         final_reply = ""
         tools_called: List[str] = []
         tool_results: List[Dict[str, Any]] = []
+        awaiting_approval: Optional[Dict[str, Any]] = None
+
+        # --- Goal expansion + skill matching (once, before the loop) ---
+        # Expansion must happen before matching, since matching is meant to
+        # consume the clarified intent ("bro I have tests every Monday" ->
+        # "Prepare and study consistently...") rather than raw casual phrasing
+        # a title-similarity/word-overlap matcher would score poorly against.
+        # Only .expanded feeds skill-matching; conv.add_user()/task above and
+        # T3 episode titles below keep using literal `task` so history stays
+        # human-readable rather than showing Alfred's paraphrase of the user.
+        planning_text = task
+        try:
+            expanded = await self.goal_expander.expand(task)
+            planning_text = expanded.expanded or task
+        except Exception:
+            pass
+
+        matched_skill = None
+        try:
+            # search_ecosystem=False: this runs on every task, and the
+            # ecosystem path can shell out to npx and install files with a
+            # 60s timeout -- fine for an explicit "find me a skill" action,
+            # not as a side effect of ordinary conversation turns.
+            matched_skill = self.skill_manager.find_skill(
+                planning_text, search_ecosystem=False
+            )
+        except Exception:
+            pass
+
+        # --- T3 memory snippets (once, before the loop) ---
+        # task is fixed for the whole call, so recomputing this every turn was
+        # a redundant embedding/DB round trip with an identical result each time.
+        memory_snippets = self._get_memory_snippets(task)
+        memory_drop_logged = False
 
         for turn in range(self.MAX_TURNS):
             # --- Build prompt ---
-            # Get memory snippets for prompt
-            memory_snippets = self._get_memory_snippets(task)
-            system = self._build_system_prompt(memory_snippets)
+            system, dropped_sections = self._build_system_prompt(memory_snippets, matched_skill)
+            if "memory" in dropped_sections and not memory_drop_logged:
+                thinking.append(
+                    "  Memory dropped from prompt (token budget too tight to fit it)"
+                )
+                memory_drop_logged = True
 
             # Convert conversation to LLM format
             llm_messages = conv.to_llm_messages()
@@ -429,6 +478,16 @@ class Alfred:
 
             # --- Parse output ---
             reply, tool_name, tool_params = self._parse_llm_output(raw)
+
+            # Record the LLM's own output into history. Message.is_tool_call is
+            # computed from content (does it parse as JSON with a "tool" key?),
+            # so recording raw here — before branching on what it turned out to
+            # be — makes ConversationHistory._find_last_tool_pair_start() able
+            # to recognize a tool-call turn automatically. Without this, the
+            # ASSISTANT message a TOOL result depends on never existed, so
+            # compression could never identify a pair to preserve.
+            if raw:
+                conv.add_assistant(raw)
 
             if reply is not None:
                 if reply.strip():
@@ -457,6 +516,7 @@ class Alfred:
                 "tool": tool_name,
                 "output": str(output)[:500],
                 "success": result.success,
+                "params": tool_params,
             })
 
             if is_error:
@@ -467,6 +527,25 @@ class Alfred:
             # --- Add tool result to conversation ---
             result_dict = result.to_dict()
             conv.add_tool_result(tool_name, result_dict)
+
+            # --- Stop immediately if the tool needs approval ---
+            # Don't burn the remaining turns retrying a call that's blocked on a
+            # human decision, not a fixable error — the LLM has no params
+            # correction that gets past "a human hasn't said yes yet." The
+            # attempt is already recorded above (add_assistant + add_tool_result),
+            # so a resend with approved_actions set will have full context.
+            if result.metadata.get("awaiting_approval"):
+                awaiting_approval = {
+                    "tool": result.metadata.get("tool", tool_name),
+                    "params": result.metadata.get("params"),
+                    "signature": result.metadata.get("signature"),
+                }
+                final_reply = (
+                    f"I need your approval before running {tool_name}. "
+                    "Confirm and I'll proceed."
+                )
+                thinking.append(f"  Awaiting approval: {tool_name}")
+                break
 
             # --- Mutation verification ---
             # is_mutation() is action-aware: a calendar "agenda" read is not a
@@ -504,6 +583,7 @@ class Alfred:
 
         # --- Save T3 episode ---
         episodes_saved = 0
+        episode_path: Optional[str] = None
         if any(t != "chat" for t in tools_called):
             try:
                 tools_used = ", ".join(tools_called)
@@ -512,20 +592,21 @@ class Alfred:
                     f"## Tools Used\n{tools_used}\n\n"
                     f"## Alfred Response\n{final_reply}"
                 )
-                self.memory.t3_save_episode(title=task[:80], content=summary[:2000])
+                episode_path = self.memory.t3_save_episode(title=task[:80], content=summary[:2000])
                 thinking.append("Saved to T3 episodic memory")
                 episodes_saved = 1
             except Exception:
                 pass
 
         # --- Maybe generate skill ---
+        skill_generated = False
         if len(tools_called) >= 3 and not any(
             tr.get("success") is False for tr in tool_results
         ):
             try:
-                self._maybe_generate_skill(task, tools_called)
-            except Exception:
-                pass
+                skill_generated = self._maybe_generate_skill(task, tool_results)
+            except Exception as e:
+                thinking.append(f"  Skill generation failed: {e}")
 
         return {
             "response": final_reply,
@@ -533,6 +614,10 @@ class Alfred:
             "tools_called": tools_called,
             "tool_results": tool_results,
             "episodes_saved": episodes_saved,
+            "episode_path": episode_path,
+            "skill_used": matched_skill is not None,
+            "skill_generated": skill_generated,
+            "awaiting_approval": awaiting_approval,
         }
 
     # ------------------------------------------------------------------
@@ -581,14 +666,32 @@ class Alfred:
         except Exception:
             return ""
 
-    def _maybe_generate_skill(self, task: str, tools: List[str]) -> None:
-        """Auto-generate a skill for complex multi-tool tasks."""
-        self.skill_manager.create_skill(
-            title=f"v2-auto-{task[:40]}",
-            description=f"Auto-generated from task: {task[:100]}",
-            steps=tools,
-            category="auto",
+    def _maybe_generate_skill(self, task: str, tool_results: List[Dict[str, Any]]) -> bool:
+        """Auto-generate a skill for complex multi-tool tasks.
+
+        Was previously calling SkillManager.create_skill(), a method that does
+        not exist — every call threw AttributeError, silently swallowed by a
+        bare except, so skills were never actually generated on this path.
+        generate_skill() needs steps as List[Dict] with real params to be worth
+        anything when replayed, not just the tool names — tool_results already
+        carries params per call, so build proper steps from it.
+        """
+        steps = [
+            {
+                "tool": tr["tool"],
+                "description": f"Call {tr['tool']}",
+                "params": tr.get("params") or {},
+            }
+            for tr in tool_results
+            if tr.get("success")
+        ]
+        if not steps:
+            return False
+        complexity = "complex" if len(steps) >= 5 else "moderate"
+        skill = self.skill_manager.generate_skill(
+            task=task, steps=steps, task_complexity=complexity, had_error=False,
         )
+        return skill is not None
 
     # ------------------------------------------------------------------
     # Heartbeat

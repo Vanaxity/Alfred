@@ -18,7 +18,7 @@ import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
@@ -260,7 +260,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if msg_type == "chat":
                 response = await process_chat(
-                    message.get("message", ""), message.get("session_id")
+                    message.get("message", ""),
+                    message.get("session_id"),
+                    message.get("approved_actions"),
                 )
                 await websocket.send_json(response.model_dump() if hasattr(response, 'model_dump') else response.__dict__)
             elif msg_type == "ping":
@@ -299,7 +301,7 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat(message: ChatMessage):
     """Main chat endpoint."""
-    return await process_chat(message.message, message.session_id)
+    return await process_chat(message.message, message.session_id, message.approved_actions)
 
 
 @app.post("/api/command")
@@ -307,26 +309,32 @@ async def api_command(data: Dict):
     """Cockpit compatibility endpoint."""
     message = data.get("command", data.get("message", ""))
     session_id = data.get("session_id")
-    result = await process_chat(message, session_id)
+    approved_actions = data.get("approved_actions")
+    result = await process_chat(message, session_id, approved_actions)
     return {
         "response": result.response,
-        "thinking": result.thinking if hasattr(result, 'thinking') else []
+        "thinking": result.thinking if hasattr(result, 'thinking') else [],
+        "awaiting_approval": result.awaiting_approval if hasattr(result, 'awaiting_approval') else None,
     }
 
 
 async def process_chat(
-    user_message: str, session_id: Optional[str] = None
+    user_message: str,
+    session_id: Optional[str] = None,
+    approved_actions: Optional[List[str]] = None,
 ) -> ChatResponse:
     """Process a chat message through Alfred loop."""
     alfred = get_alfred()
     db = get_local_db()
-    
+
     try:
         # Load history before persisting current message to avoid duplication
         history = db.get_recent_context(session_id, count=20) if session_id else []
         if session_id:
             db.add_message(session_id, "user", user_message)
         context = {"session_id": session_id, "conversation_history": history} if session_id else {"conversation_history": []}
+        if approved_actions:
+            context["approved_actions"] = approved_actions
 
         result = await alfred.execute(user_message, context)
         response_text = result.get("response", "Done.")
@@ -367,6 +375,7 @@ async def process_chat(
             steps=result.get("steps", []),
             session_id=session_id,
             thinking=result.get("thinking", []),
+            awaiting_approval=result.get("awaiting_approval"),
         )
 
     except Exception as e:

@@ -29,6 +29,32 @@ VALID_TOOLS: set = {
     "memory_save", "memory_search", "weather", "run_code",
 }
 
+def _parse_params(raw: Any) -> dict:
+    """Parse a step's params from markdown (a raw string) or an already-dict value.
+
+    Was a dead SkillManager staticmethod with zero callers — Skill.from_markdown()
+    stored params as an unparsed string instead of calling it, so any skill
+    reloaded from disk had unusable step params for direct execution. Module-level
+    since both Skill (a dataclass, no SkillManager access) and SkillManager need it.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        import ast
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
 STOP_WORDS: set = {
     "the", "a", "an", "is", "are", "do", "my", "for", "to",
     "of", "in", "on", "at", "with", "and", "or", "but", "it",
@@ -124,8 +150,8 @@ class Skill:
                 elif ":" in line:
                     current_step["tool"] = line.split(":", 1)[1].strip()
             elif "**Params:**" in line or "Params:" in line:
-                params = line.split("`")[1] if "`" in line else "{}"
-                current_step["params"] = params
+                raw_params = line.split("`")[1] if "`" in line else "{}"
+                current_step["params"] = _parse_params(raw_params)
 
         if current_step:
             steps.append(current_step)
@@ -256,22 +282,7 @@ class SkillManager:
 
     @staticmethod
     def _parse_params(raw: Any) -> dict:
-        if isinstance(raw, dict):
-            return raw
-        if not isinstance(raw, str) or not raw.strip():
-            return {}
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        try:
-            import ast
-            parsed = ast.literal_eval(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-        return {}
+        return _parse_params(raw)
 
     def _is_low_quality_skill(self, skill: Skill) -> bool:
         if not skill.steps:
