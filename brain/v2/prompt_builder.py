@@ -9,14 +9,19 @@ Priority order (highest → lowest):
     2. Rules      — behavioral constraints
     3. Profile    — T4 user data (Master Sam's facts)
     4. Tools      — available tool schemas
-    5. Skills     — T2 learned procedures
-    6. Memory     — T3 episodic snippets
+    5. Memory     — T3 episodic snippets
+    6. Skills     — T2 learned procedures
+
+Memory ranks above Skills, not below: the manifesto treats T3 episodic
+injection as a core Phase 1 ask (Sovereignty Gap #1), while the Skills
+section now carries at most one specifically-matched skill rather than an
+unranked handful, so it's cheaper to lose under budget pressure.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
@@ -59,6 +64,10 @@ class AssembledPrompt:
     tool_schemas: List[ToolSchema]
     memory_snippets: List[str]
     token_count: int
+    # Section names that were candidates but didn't survive fitting under
+    # budget at all (not merely truncated -- truncation leaves a visible
+    # marker in `system`; a full drop leaves no trace unless reported here).
+    dropped_sections: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -79,8 +88,8 @@ PRIO_IDENTITY = 1
 PRIO_RULES = 2
 PRIO_PROFILE = 3
 PRIO_TOOLS = 4
-PRIO_SKILLS = 5
-PRIO_MEMORY = 6
+PRIO_MEMORY = 5
+PRIO_SKILLS = 6
 
 
 class PromptBuilder:
@@ -189,6 +198,7 @@ class PromptBuilder:
 
         # --- Fit within budget ---------------------------------------
         fitted = self._fit_sections(sections, budget)
+        dropped = [s.name for s in sections if s.name not in {f.name for f in fitted}]
 
         # --- Assemble final prompt -----------------------------------
         parts: List[str] = []
@@ -205,6 +215,7 @@ class PromptBuilder:
             tool_schemas=tools or [],
             memory_snippets=memory or [],
             token_count=total_tokens,
+            dropped_sections=dropped,
         )
 
     # ------------------------------------------------------------------

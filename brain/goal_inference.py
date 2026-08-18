@@ -85,7 +85,11 @@ class GoalExpander:
             from groq import Groq
             client = Groq(api_key=self.api_key)
             response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                # llama-3.1-8b-instant was decommissioned (model_not_found); this
+                # module makes its own direct Groq call rather than going through
+                # LLMRouter, so it needed the same fix applied there separately.
+                model="openai/gpt-oss-120b",
+                reasoning_effort="low",
                 messages=[
                     {"role": "system", "content": self.SYSTEM_PROMPT},
                     {"role": "user", "content": user_input},
@@ -93,7 +97,8 @@ class GoalExpander:
                 temperature=0.3,
                 max_tokens=100,
             )
-            return response.choices[0].message.content or ""
+            content = response.choices[0].message.content or ""
+            return content.strip()
 
         try:
             return await asyncio.wait_for(
