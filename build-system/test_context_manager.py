@@ -153,6 +153,77 @@ def test_compress_noop_under_budget():
         assert len(ch.messages) == 2
 
 
+def test_reply_shaped_tool_call_is_treated_as_a_reply():
+    """A reply the model dressed up as a tool call must not be dispatched.
+
+    There is no `reply` tool. Seen live: the model emitted
+    {"tool": "reply", "params": {...}}, the executor was handed a nonexistent
+    tool, the turn was wasted, and the loop spun to MAX_TURNS.
+    """
+    from brain.v2.conversation import Alfred
+    f = Alfred.__dict__["_reply_shaped_tool"].__func__
+
+    assert f({"tool": "reply", "params": {"message": "42"}}) == "42"
+    assert f({"tool": "respond", "params": {"text": "hi"}}) == "hi"
+    assert f({"tool": "final_answer", "params": "plain string"}) == "plain string"
+    assert f({"tool": "reply", "message": "top level"}) == "top level"
+
+    # Real tool calls must pass straight through untouched.
+    assert f({"tool": "calculator", "params": {"expression": "2+2"}}) is None
+    assert f({"tool": "time", "params": {}}) is None
+
+
+def test_tool_call_wins_over_narration_reply():
+    """A tool call must beat a reply when the model emits both.
+
+    The parser used to "prefer reply over tool call", which is backwards:
+    models narrate before acting ({"reply": "Let me calculate that"} then
+    {"tool": "calculator"}), and taking the narration meant the tool never ran
+    and the narration became the answer -- a direct path to a confident
+    ungrounded number.
+    """
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+    })
+    s = Stub()
+
+    both = '{"reply": "Let me work that out."} {"tool": "calculator", "params": {"expression": "47*tan(radians(35))"}}'
+    reply, tool, params = s._parse_llm_output(both)
+    assert tool == "calculator", f"tool must win over narration, got reply={reply!r}"
+    assert params == {"expression": "47*tan(radians(35))"}
+
+    # Order in the text must not matter.
+    reversed_order = '{"tool": "time", "params": {}} {"reply": "Checking the clock."}'
+    reply, tool, params = s._parse_llm_output(reversed_order)
+    assert tool == "time", f"tool must win regardless of order, got reply={reply!r}"
+
+    # A lone reply is still a reply.
+    reply, tool, params = s._parse_llm_output('{"reply": "The answer is 42."}')
+    assert reply == "The answer is 42." and tool is None
+
+
+def test_reply_is_not_truncated_at_500_chars():
+    """Long explanations must survive. A hard [:500] cut silently amputated
+    homework working mid-sentence."""
+    from brain.v2.conversation import Alfred
+    import json as _json
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+    })
+    long_answer = "Step one. " * 120  # ~1200 chars
+    raw = _json.dumps({"reply": long_answer})
+    reply, tool, params = Stub()._parse_llm_output(raw)
+    assert reply is not None
+    assert len(reply) > 500, f"reply was truncated to {len(reply)} chars"
+
+
 def test_public_api_exported():
     assert ConversationHistory is not None
     assert Message is not None

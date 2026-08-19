@@ -146,6 +146,8 @@ class Alfred:
             "NEVER claim an action was completed without calling the tool and seeing a success result.",
             "CRITICAL: calendar, email, weather, time answers REQUIRE a tool call. Never answer from memory.",
             "CRITICAL: ALL arithmetic, trigonometry, and geometry REQUIRE the calculator tool — never compute mentally and never state a number you did not get from it. Word problems count: extract the expression and call calculator.",
+            "If the question contains a contradiction or impossible premise (e.g. a right triangle whose leg exceeds its hypotenuse, a date that doesn't exist), SAY SO and stop. Never silently reinterpret the numbers into something solvable — for homework, a confident answer to a broken question is worse than no answer.",
+            "If a required detail is genuinely missing (a time, a name, a value), ASK for it. Never invent it and never quietly assume a default.",
             "Prefer calculator over run_code for anything calculator supports; run_code needs approval and is slower.",
             "Translate raw tool output into natural language — never dump JSON, IDs, or technical errors.",
             "NEVER use LaTeX or backslash commands in your reply. Write math in plain text: 'x^2' not '\\(x^2\\)', '1/2' not '\\frac{1}{2}', 'theta' not '\\theta'. Backslashes corrupt the JSON envelope and the UI shows plain text anyway.",
@@ -371,14 +373,25 @@ class Alfred:
                     start = -1
 
         if json_objects:
-            # Prefer reply over tool call
-            for obj in json_objects:
-                if "reply" in obj:
-                    return (str(obj["reply"])[:500], None, None)
-            # Otherwise use first tool call
+            # Prefer a TOOL CALL over a reply when the model emits both.
+            #
+            # This used to be the other way round ("prefer reply over tool
+            # call"), which is backwards: models routinely narrate before
+            # acting -- {"reply": "Let me calculate that..."} followed by
+            # {"tool": "calculator", ...} -- and taking the narration meant the
+            # tool never ran and the narration became the final answer. That is
+            # a direct path to a confident, ungrounded number (the live "53
+            # feet" answer to a trig question whose real answer was 33).
+            # A tool call produces grounded data; narration does not.
             for obj in json_objects:
                 if "tool" in obj:
+                    as_reply = self._reply_shaped_tool(obj)
+                    if as_reply is not None:
+                        return (as_reply, None, None)
                     return (None, obj["tool"], self._extract_params(obj))
+            for obj in json_objects:
+                if "reply" in obj:
+                    return (str(obj["reply"]), None, None)
 
         # Fallback: brace scanning
         first_brace = text.find("{")
@@ -387,9 +400,12 @@ class Alfred:
                 if text[end] == "}":
                     obj = self._loads_lenient(text[first_brace:end + 1])
                     if isinstance(obj, dict):
-                        if "reply" in obj:
-                            return (str(obj["reply"])[:500], None, None)
+                        if "reply" in obj and "tool" not in obj:
+                            return (str(obj["reply"]), None, None)
                         if "tool" in obj:
+                            as_reply = self._reply_shaped_tool(obj)
+                            if as_reply is not None:
+                                return (as_reply, None, None)
                             return (None, obj["tool"], self._extract_params(obj))
 
         # Unparseable. Never hand a raw JSON envelope to the user — a model that
@@ -404,6 +420,39 @@ class Alfred:
                 None,
             )
         return (text[:500], None, None)
+
+    @staticmethod
+    def _reply_shaped_tool(obj: Dict[str, Any]) -> Optional[str]:
+        """Detect a reply the model dressed up as a tool call.
+
+        There is no `reply` tool, but models emit {"tool": "reply", "params":
+        {"message": "..."}} anyway — mixing up the two shapes in the protocol.
+        Seen live: a run where 'reply' appears in tools_called, meaning the
+        executor was asked to run a tool that doesn't exist, the turn was
+        wasted, and the loop kept going until it hit MAX_TURNS.
+
+        Returns the reply text, or None if this really is a tool call.
+        """
+        name = str(obj.get("tool", "")).strip().lower()
+        if name not in ("reply", "respond", "answer", "final_answer", "response"):
+            return None
+        params = obj.get("params")
+        if isinstance(params, dict):
+            for key in ("reply", "message", "text", "content", "answer", "response"):
+                val = params.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val[:500]
+            # Single unnamed string param — take it rather than lose the answer.
+            strings = [v for v in params.values() if isinstance(v, str) and v.strip()]
+            if len(strings) == 1:
+                return strings[0][:500]
+        elif isinstance(params, str) and params.strip():
+            return params[:500]
+        for key in ("reply", "message", "text", "content"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val[:500]
+        return None
 
     @staticmethod
     def _extract_params(obj: Dict[str, Any]) -> Dict[str, Any]:
@@ -468,6 +517,7 @@ class Alfred:
         tools_called: List[str] = []
         tool_results: List[Dict[str, Any]] = []
         awaiting_approval: Optional[Dict[str, Any]] = None
+        repeats: Dict[str, int] = {}
 
         # --- Goal expansion + skill matching (once, before the loop) ---
         # Expansion must happen before matching, since matching is meant to
@@ -561,6 +611,23 @@ class Alfred:
                 thinking.append(f"[Turn {turn + 1}] Unparseable: {raw[:60]}")
                 break
 
+            # --- Break out of repeat loops ---
+            # Seen live: five identical memory_search calls in a row, burning
+            # every turn and ending in the MAX_TURNS fallback. Re-running the
+            # exact same call cannot produce a different result, so tell the
+            # model plainly instead of letting it spin.
+            call_sig = f"{tool_name}:{json.dumps(tool_params, sort_keys=True, default=str)}"
+            repeats[call_sig] = repeats.get(call_sig, 0) + 1
+            if repeats[call_sig] > 2:
+                thinking.append(f"[Turn {turn + 1}] Aborting repeat of {tool_name}")
+                conv.add_user(
+                    f"You have already called {tool_name} with those exact arguments "
+                    f"{repeats[call_sig] - 1} times and got the same result. Do not call "
+                    "it again. Either answer with what you have, or say what specific "
+                    "information you are missing."
+                )
+                continue
+
             # --- Execute tool ---
             thinking.append(f"[Turn {turn + 1}] Tool: {tool_name}")
             result = await self._tool_executor.execute(tool_name, tool_params, tool_ctx)
@@ -629,12 +696,25 @@ class Alfred:
             # so the next LLM call will see it naturally.
 
         # --- Fallback if no reply ---
+        # The loop ran out of turns without the model producing an answer. The
+        # old text here listed internal tool names at the user ("Task completed
+        # using 10 tool(s): memory_search, memory_search, ..."), which leaks
+        # implementation detail and, worse, claims completion for something that
+        # did not complete. Say what actually happened instead.
         if not final_reply:
             if tools_called:
-                final_reply = (
-                    f"Task completed using {len(tools_called)} tool(s): "
-                    f"{', '.join(tools_called)}."
-                )
+                last = tool_results[-1] if tool_results else None
+                if last and last.get("success") and last.get("output"):
+                    final_reply = (
+                        "I ran out of steps before I could summarize that properly. "
+                        f"Here's the last thing I got back:\n\n{str(last['output'])[:400]}"
+                    )
+                else:
+                    final_reply = (
+                        "I wasn't able to finish that — I kept working but never "
+                        "reached an answer. Could you narrow it down or give me the "
+                        "missing detail?"
+                    )
             else:
                 final_reply = "I wasn't able to process that request."
 

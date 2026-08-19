@@ -326,7 +326,10 @@ class LLMRouter:
             for msg in messages:
                 role = "user" if msg["role"] == "user" else "model"
                 contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
-            contents.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
+            # Deliberately NOT re-appending user_message here — see the note in
+            # _call_openai_compatible. `messages` already ends with the latest
+            # turn; repeating the original question after a tool result buries
+            # the result and biases the model toward answering from scratch.
             response = provider.client.models.generate_content(
                 model=provider.model, contents=contents,
                 config=types.GenerateContentConfig(
@@ -355,7 +358,14 @@ class LLMRouter:
         if messages:
             for msg in messages:
                 msg_list.append({"role": msg["role"], "content": msg["content"]})
-        msg_list.append({"role": "user", "content": user_message})
+        else:
+            # Only when there's no history. `messages` already ends with the
+            # latest turn (a tool result, mid-loop), and appending the original
+            # question after it made the LAST thing the model saw on every
+            # single turn be "answer this question" rather than "here is the
+            # result you asked for" -- pushing it to answer directly instead of
+            # using what the tool just returned.
+            msg_list.append({"role": "user", "content": user_message})
 
         response = provider.client.chat.completions.create(
             model=provider.model, messages=msg_list,
