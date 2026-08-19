@@ -357,6 +357,18 @@ async def process_chat(
                     if len(updated) > 2000:
                         updated = updated[-2000:]
                     db.update_session(session_id, summary=updated)
+
+                    # Name the session after the FIRST thing the user said, set
+                    # once and then left alone -- a title that keeps changing to
+                    # the latest message makes the sidebar useless for finding
+                    # an old conversation.
+                    if not (session.get("session_name") or "").strip():
+                        title = " ".join(user_message.split())[:60]
+                        if len(" ".join(user_message.split())) > 60:
+                            title = title.rstrip() + "..."
+                        if title:
+                            db.update_session(session_id, session_name=title)
+
                     db.touch_session(session_id)
             except Exception:
                 pass

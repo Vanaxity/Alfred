@@ -262,7 +262,16 @@ class LocalDB:
             for key, value in kwargs.items():
                 if key in ["session_name", "summary", "last_active_at", "is_active"]:
                     fields.append(f"{key} = ?")
-                    values.append(1 if value else 0 if key == "is_active" else value)
+                    # Only is_active is a boolean column. This was previously
+                    # written as `1 if value else 0 if key == "is_active" else value`,
+                    # which Python parses right-associatively as
+                    # `1 if value else (0 if ... else ...)` -- so EVERY truthy
+                    # value became literal 1, silently destroying every summary
+                    # and session_name ever written.
+                    if key == "is_active":
+                        values.append(1 if value else 0)
+                    else:
+                        values.append(value)
             if fields:
                 values.append(session_id)
                 conn.execute(
