@@ -169,6 +169,7 @@ def looks_starved(result):
 
 
 async def run_one(alfred, scenario):
+    """Single-turn: one question in, one graded answer out."""
     try:
         result = await alfred.execute(scenario["question"], {})
     except Exception as e:
@@ -177,6 +178,61 @@ async def run_one(alfred, scenario):
         return False, ["NO LLM RESPONSE (provider/network problem, not behavior)"], result, True
     passed, reasons = grade(scenario, result)
     return passed, reasons, result, False
+
+
+async def run_turns(alfred, scenario):
+    """Multi-turn: replay scenario['turns'] in one growing conversation.
+
+    History is threaded exactly the way the real API does it (server.py's
+    process_chat reads/writes context["conversation_history"] the same
+    shape) -- a local [{"role","content"}, ...] list grown after each turn,
+    not a DB-backed session, so this never touches real session state.
+
+    Overall pass requires every turn to pass. A starved turn (no LLM
+    response) aborts the rest of the scenario rather than continuing on a
+    conversation that's missing a turn — a later turn "passing" against
+    broken history would be a false signal, not a real result.
+    """
+    history = []
+    turn_results = []
+    overall_reasons = []
+    for i, turn in enumerate(scenario["turns"]):
+        try:
+            result = await alfred.execute(turn["question"], {"conversation_history": list(history)})
+        except Exception as e:
+            turn_results.append({"turn": i + 1, "passed": False, "starved": False,
+                                  "reasons": [f"EXCEPTION: {e}"], "response": ""})
+            overall_reasons.append(f"turn {i + 1}: EXCEPTION: {e}")
+            return False, overall_reasons, turn_results, False
+
+        if looks_starved(result):
+            turn_results.append({"turn": i + 1, "passed": False, "starved": True,
+                                  "reasons": ["NO LLM RESPONSE"], "response": ""})
+            return False, [f"turn {i + 1}: no LLM response, aborting rest of conversation"], turn_results, True
+
+        passed, reasons = grade(turn, result)
+        response_text = result.get("response") or ""
+        turn_results.append({
+            "turn": i + 1, "passed": passed, "starved": False, "reasons": reasons,
+            "response": response_text[:400], "tools_called": result.get("tools_called") or [],
+        })
+        if not passed:
+            overall_reasons.append(f"turn {i + 1}: " + "; ".join(reasons))
+
+        history.append({"role": "user", "content": turn["question"]})
+        history.append({"role": "assistant", "content": response_text})
+
+    overall_passed = all(t["passed"] for t in turn_results)
+    return overall_passed, overall_reasons, turn_results, False
+
+
+async def run_scenario(alfred, scenario):
+    """Dispatch by shape. Returns (passed, reasons, detail, starved) where
+    detail is a single result dict for single-turn or a list of per-turn
+    dicts for multi-turn."""
+    if "turns" in scenario and scenario["turns"]:
+        return await run_turns(alfred, scenario)
+    return await run_one(alfred, scenario)
 
 
 async def main_async(args):
@@ -214,19 +270,36 @@ async def main_async(args):
             if sc["category"] != current:
                 current = sc["category"]
                 print(f"\n  -- {current} " + "-" * (58 - len(current)))
-            passed, reasons, result, starved = await run_one(alfred, sc)
-            rows.append({"id": sc["id"], "category": sc["category"], "passed": passed,
-                         "starved": starved, "reasons": reasons,
-                         "response": (result.get("response") or "")[:400],
-                         "tools_called": result.get("tools_called") or []})
-            mark = "[PASS]" if passed else ("[SKIP]" if starved else "[FAIL]")
-            print(f"  {mark} {sc['id']}")
-            if not passed:
-                for r in reasons:
-                    print(f"           ! {r}")
-                if not starved:
-                    snippet = " ".join((result.get("response") or "").split())[:150]
-                    print(f"           got: {snippet!r}")
+            is_multi = "turns" in sc and sc["turns"]
+            passed, reasons, detail, starved = await run_scenario(alfred, sc)
+
+            if is_multi:
+                rows.append({"id": sc["id"], "category": sc["category"], "passed": passed,
+                             "starved": starved, "reasons": reasons, "multi_turn": True,
+                             "turns": detail})
+                mark = "[PASS]" if passed else ("[SKIP]" if starved else "[FAIL]")
+                print(f"  {mark} {sc['id']} ({len(detail)} turn(s))")
+                if not passed:
+                    for t in detail:
+                        if not t["passed"]:
+                            print(f"           turn {t['turn']}: {'; '.join(t['reasons']) or '?'}")
+                            snippet = " ".join((t.get('response') or '').split())[:130]
+                            print(f"                     got: {snippet!r}")
+            else:
+                result = detail
+                rows.append({"id": sc["id"], "category": sc["category"], "passed": passed,
+                             "starved": starved, "reasons": reasons,
+                             "response": (result.get("response") or "")[:400],
+                             "tools_called": result.get("tools_called") or []})
+                mark = "[PASS]" if passed else ("[SKIP]" if starved else "[FAIL]")
+                print(f"  {mark} {sc['id']}")
+                if not passed:
+                    for r in reasons:
+                        print(f"           ! {r}")
+                    if not starved:
+                        snippet = " ".join((result.get("response") or "").split())[:150]
+                        print(f"           got: {snippet!r}")
+
             if args.delay:
                 await asyncio.sleep(args.delay)
 
