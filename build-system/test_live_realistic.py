@@ -56,15 +56,36 @@ def load_scenarios():
     return json.loads(SCENARIO_FILE.read_text(encoding="utf-8"))
 
 
+# Models emit typographic punctuation constantly: "don't" comes back as
+# "don’t", "..." as "…", "-" as "–". Comparing those against
+# ASCII-typed expectations silently false-fails correct answers -- observed
+# live, where a perfect "I don't have that information" was marked FAIL purely
+# because the apostrophe was curly. Normalize both sides before matching.
+_PUNCT_FOLD = {
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "–": "-", "—": "-", "−": "-", "‐": "-", "‑": "-",
+    " ": " ", " ": " ", " ": " ", " ": " ",
+    "…": "...",
+}
+
+
+def norm(text: str) -> str:
+    """Lowercase and fold typographic punctuation to ASCII for comparison."""
+    for a, b in _PUNCT_FOLD.items():
+        text = text.replace(a, b)
+    return text.lower()
+
+
 def grade(scenario, result):
     """Return (passed, list_of_failure_reasons)."""
     response = (result.get("response") or "")
-    lowered = response.lower()
+    lowered = norm(response)
     called = result.get("tools_called") or []
     reasons = []
 
     wanted = scenario.get("expect_substrings") or []
-    if wanted and not any(w.lower() in lowered for w in wanted):
+    if wanted and not any(norm(w) in lowered for w in wanted):
         reasons.append(f"none of {wanted[:4]} in response")
 
     for t in scenario.get("expect_tools") or []:
