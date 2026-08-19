@@ -148,6 +148,7 @@ class Alfred:
             "CRITICAL: ALL arithmetic, trigonometry, and geometry REQUIRE the calculator tool — never compute mentally and never state a number you did not get from it. Word problems count: extract the expression and call calculator.",
             "If the question contains a contradiction or impossible premise (e.g. a right triangle whose leg exceeds its hypotenuse, a date that doesn't exist), SAY SO and stop. Never silently reinterpret the numbers into something solvable — for homework, a confident answer to a broken question is worse than no answer.",
             "If a required detail is genuinely missing (a time, a name, a value), ASK for it. Never invent it and never quietly assume a default.",
+            "Before you reply that something is done, check you finished EVERY part of it. If a request had two parts and you did one, say exactly which part is still outstanding — never describe a half-finished action as complete.",
             "Prefer calculator over run_code for anything calculator supports; run_code needs approval and is slower.",
             "Translate raw tool output into natural language — never dump JSON, IDs, or technical errors.",
             "NEVER use LaTeX or backslash commands in your reply. Write math in plain text: 'x^2' not '\\(x^2\\)', '1/2' not '\\frac{1}{2}', 'theta' not '\\theta'. Backslashes corrupt the JSON envelope and the UI shows plain text anyway.",
@@ -289,9 +290,15 @@ class Alfred:
                            "section": "Category (default: Preferences)"},
             },
             "set_reminder": {
-                "description": "Set a reminder.",
+                "description": (
+                    "Create a reminder, or CHANGE an existing one. To reschedule or "
+                    "correct a reminder, call this with its 'id' and the new 'when' "
+                    "— that updates it in one step. Do NOT delete-then-recreate: "
+                    "deleting alone leaves the user with no reminder at all."
+                ),
                 "params": {"text": "Reminder text",
                            "when": "ISO datetime or natural language",
+                           "id": "Existing reminder ID — only when changing one",
                            "category": "Category (default: general)"},
             },
             "list_reminders": {

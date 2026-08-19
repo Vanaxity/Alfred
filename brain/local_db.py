@@ -11,7 +11,7 @@ import json
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 DB_PATH = Path(__file__).parent / "data" / "alfred.db"
 
@@ -389,6 +389,50 @@ class LocalDB:
         conn = self._get_conn()
         with self._lock:
             cur = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def update_reminder(
+        self,
+        reminder_id: int,
+        text: Optional[str] = None,
+        due_at: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> bool:
+        """Update an existing reminder in place. Returns False if it's gone.
+
+        Exists so that "actually, make it 4:15 not 4:45" is ONE operation.
+        Without it, a correction is delete-then-add, which the model was
+        observed half-completing: it deleted the old reminder, replied
+        "Understood. The correct time is 4:15", and never created the
+        replacement -- leaving the user with no reminder at all and a
+        message saying otherwise.
+        """
+        fields = []
+        values: List[Any] = []
+        if text is not None:
+            fields.append("text = ?")
+            values.append(text)
+        if due_at is not None:
+            fields.append("due_at = ?")
+            values.append(due_at)
+        if category is not None:
+            fields.append("category = ?")
+            values.append(category)
+        if not fields:
+            return False
+
+        # Re-arm a reminder that already fired, since changing its time means
+        # it should fire again at the new time.
+        fields.append("fired = 0")
+
+        conn = self._get_conn()
+        with self._lock:
+            values.append(reminder_id)
+            cur = conn.execute(
+                f"UPDATE reminders SET {', '.join(fields)} WHERE id = ?",
+                values,
+            )
             conn.commit()
             return cur.rowcount > 0
 

@@ -1140,20 +1140,61 @@ async def handle_remember(params: Dict, ctx: Dict) -> ToolResult:
 
 
 async def handle_set_reminder(params: Dict, ctx: Dict) -> ToolResult:
-    """Set a reminder."""
+    """Create a reminder, or update an existing one when `id` is given.
+
+    Rescheduling is deliberately ONE call rather than delete-then-add. The
+    two-step version was observed being half-completed: the model deleted the
+    old reminder, said "Understood. The correct time is 4:15", and never
+    created the replacement -- so the user ended up with no reminder and a
+    message claiming otherwise.
+    """
+    db = ctx.get("db")
+    if not db:
+        return ToolResult(success=False, error="Database unavailable")
+
     text = params.get("text", "")
     when = params.get("when", "")
     cat = params.get("category", "general")
-    if not text or not when:
-        return ToolResult(success=False, error="text and when required")
-    db = ctx.get("db")
-    if db:
+    raw_id = params.get("id")
+
+    # --- Update path: correcting an existing reminder ---
+    if raw_id not in (None, "", 0, "0"):
         try:
-            rid = db.add_reminder(text, when, cat)
-            return ToolResult(success=True, output=f"Reminder set: '{text}' at {when} (ID: {rid})")
+            rid = int(raw_id)
+        except (ValueError, TypeError):
+            return ToolResult(success=False, error=f"Invalid reminder id: {raw_id!r}")
+        if not text and not when:
+            return ToolResult(
+                success=False,
+                error="To update a reminder, give at least a new 'text' or a new 'when'.",
+            )
+        try:
+            ok = db.update_reminder(
+                rid,
+                text=text or None,
+                due_at=when or None,
+                category=params.get("category") or None,
+            )
         except Exception as e:
             return ToolResult(success=False, error=str(e))
-    return ToolResult(success=False, error="Database unavailable")
+        if not ok:
+            return ToolResult(
+                success=False,
+                error=f"Reminder {rid} not found — it may have been deleted already.",
+            )
+        changed = " and ".join(
+            p for p in (f"text to '{text}'" if text else "", f"time to {when}" if when else "") if p
+        )
+        return ToolResult(success=True, output=f"Reminder {rid} updated: {changed}.")
+
+    # --- Create path ---
+    if not text or not when:
+        return ToolResult(success=False, error="text and when required")
+    try:
+        rid = db.add_reminder(text, when, cat)
+        return ToolResult(success=True, output=f"Reminder set: '{text}' at {when} (ID: {rid})")
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
 
 
 async def handle_list_reminders(params: Dict, ctx: Dict) -> ToolResult:
