@@ -148,6 +148,7 @@ class Alfred:
             "CRITICAL: ALL arithmetic, trigonometry, and geometry REQUIRE the calculator tool — never compute mentally and never state a number you did not get from it. Word problems count: extract the expression and call calculator.",
             "Prefer calculator over run_code for anything calculator supports; run_code needs approval and is slower.",
             "Translate raw tool output into natural language — never dump JSON, IDs, or technical errors.",
+            "NEVER use LaTeX or backslash commands in your reply. Write math in plain text: 'x^2' not '\\(x^2\\)', '1/2' not '\\frac{1}{2}', 'theta' not '\\theta'. Backslashes corrupt the JSON envelope and the UI shows plain text anyway.",
             "Self-correct on failure. If a tool errors, explain why in plain terms.",
             "If user corrects you mid-query, acknowledge the correction and redo with the correct information.",
         ]
@@ -322,6 +323,27 @@ class Alfred:
     # LLM output parser
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _loads_lenient(chunk: str) -> Optional[Any]:
+        """json.loads, retrying once with invalid backslash escapes repaired.
+
+        Models writing math reply in LaTeX -- "the derivative of \\(x^2\\)" --
+        which is not valid JSON, since \\( and \\) aren't legal escapes. Strict
+        json.loads rejects the whole object, the reply can't be extracted, and
+        the user is shown the raw JSON envelope instead of the answer. That hits
+        essentially every math explanation, so repair rather than lose it.
+        """
+        try:
+            return json.loads(chunk)
+        except json.JSONDecodeError:
+            pass
+        # Escape any backslash not starting a valid JSON escape (" \ / b f n r t u).
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", chunk)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+
     def _parse_llm_output(self, content: str) -> tuple:
         """
         Parse LLM output into (reply, tool_name, tool_params).
@@ -343,10 +365,9 @@ class Alfred:
             elif ch == "}":
                 depth -= 1
                 if depth == 0 and start >= 0:
-                    try:
-                        json_objects.append(json.loads(text[start:i + 1]))
-                    except json.JSONDecodeError:
-                        pass
+                    obj = self._loads_lenient(text[start:i + 1])
+                    if obj is not None:
+                        json_objects.append(obj)
                     start = -1
 
         if json_objects:
@@ -357,31 +378,55 @@ class Alfred:
             # Otherwise use first tool call
             for obj in json_objects:
                 if "tool" in obj:
-                    params = obj.get("params", {})
-                    # Handle nested tool calls
-                    if isinstance(params, dict) and "tool" in params:
-                        params = params.get("params", {})
-                    return (None, obj["tool"], params)
+                    return (None, obj["tool"], self._extract_params(obj))
 
         # Fallback: brace scanning
         first_brace = text.find("{")
         if first_brace >= 0:
             for end in range(first_brace + 1, min(len(text), first_brace + 600)):
                 if text[end] == "}":
-                    try:
-                        obj = json.loads(text[first_brace:end + 1])
-                        if isinstance(obj, dict):
-                            if "reply" in obj:
-                                return (str(obj["reply"])[:500], None, None)
-                            if "tool" in obj:
-                                params = obj.get("params", {})
-                                if isinstance(params, dict) and "tool" in params:
-                                    params = params.get("params", {})
-                                return (None, obj["tool"], params)
-                    except json.JSONDecodeError:
-                        continue
+                    obj = self._loads_lenient(text[first_brace:end + 1])
+                    if isinstance(obj, dict):
+                        if "reply" in obj:
+                            return (str(obj["reply"])[:500], None, None)
+                        if "tool" in obj:
+                            return (None, obj["tool"], self._extract_params(obj))
 
+        # Unparseable. Never hand a raw JSON envelope to the user — a model that
+        # emits truncated or malformed JSON (seen live: an unclosed brace when
+        # output hit the token cap) would otherwise surface as
+        # '{ "tool": "calculator", "expression": ...' in the chat window.
+        if text.lstrip().startswith(("{", "[")):
+            return (
+                "I got a malformed response from the model on that one. "
+                "Could you ask again?",
+                None,
+                None,
+            )
         return (text[:500], None, None)
+
+    @staticmethod
+    def _extract_params(obj: Dict[str, Any]) -> Dict[str, Any]:
+        """Pull tool params out of a parsed tool-call object.
+
+        Tolerates the shapes models actually emit, not just the documented one:
+          {"tool": t, "params": {...}}            — the contract
+          {"tool": t, "params": {"tool":…, "params":{...}}} — nested duplication
+          {"tool": t, "expression": "2+2"}        — params inlined at top level
+        The last was seen live: a model wrote `{"tool":"calculator",
+        "expression":"..."}`, which used to yield empty params and silently run
+        the tool against nothing.
+        """
+        params = obj.get("params")
+        if isinstance(params, dict):
+            # Nested tool call: unwrap one level.
+            if "tool" in params:
+                inner = params.get("params")
+                return inner if isinstance(inner, dict) else {}
+            return params
+        # No usable "params" key — treat any other top-level keys as the params.
+        inlined = {k: v for k, v in obj.items() if k not in ("tool", "params", "reply")}
+        return inlined
 
     # ------------------------------------------------------------------
     # Main execute loop
