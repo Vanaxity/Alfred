@@ -59,6 +59,14 @@ class FakeCompletions:
             raise Exception("Error code: 429 - rate limit exceeded")
         if behavior == "500":
             raise Exception("Error code: 500 - internal server error")
+        if behavior == "tool_choice_conflict":
+            raise Exception(
+                "Error code: 400 - {'error': {'message': 'Tool choice is none, "
+                "but model called a tool', 'type': 'invalid_request_error', "
+                "'code': 'tool_use_failed'}}"
+            )
+        if behavior == "400":
+            raise Exception("Error code: 400 - {'error': {'message': 'malformed request'}}")
         raise AssertionError(f"unknown behavior: {behavior}")
 
 
@@ -197,6 +205,38 @@ def test_get_stats():
     assert pb["success_count"] == 1
     assert "state" in pa and "timeout" in pa and "model" in pa
     assert "ema_latency_ms" in pb
+
+
+def test_tool_choice_conflict_fails_over_not_terminal():
+    """Groq's gpt-oss-120b 'tool choice is none, but model called a tool' 400
+    is a per-request model quirk, not a broken request. It must fail over to
+    the next provider, not abort the whole chain the way a real terminal
+    error does (see test_generic_400_terminal_aborts_all_providers)."""
+    router = build_router([
+        make_provider("a", ["tool_choice_conflict"]),
+        make_provider("b", ["ok"]),
+    ])
+    resp = run(router.call("sys", "hello"))
+    assert resp.text == "hello", f"expected fallback to 'b', got {resp!r}"
+    assert resp.provider == "b"
+    assert resp.fallback_used is True
+    assert resp.fallback_reason and "tool_choice conflict" in resp.fallback_reason
+    assert router.breakers["a"].failure_count == 1, "still counts toward a's health"
+
+
+def test_generic_400_terminal_aborts_all_providers():
+    """A genuine terminal error (malformed request, bad key) still aborts the
+    whole call rather than trying other providers -- unchanged pre-existing
+    behavior, asserted here so the tool_choice carve-out above can't silently
+    widen into swallowing real terminal errors too."""
+    router = build_router([
+        make_provider("a", ["400"]),
+        make_provider("b", ["ok"]),
+    ])
+    resp = run(router.call("sys", "hello"))
+    assert resp.text is None, f"expected no response (stop_all), got {resp!r}"
+    assert resp.provider is None
+    assert resp.error and "unavailable" in resp.error.lower()
 
 
 def test_adaptive_timeout_shrinks_and_recovers():

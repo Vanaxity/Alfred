@@ -183,7 +183,17 @@ class PromptBuilder:
 
         # --- Memory (T3) ---------------------------------------------
         if memory:
-            mem_text = "## Relevant Past Episodes\n\n" + "\n\n---\n\n".join(memory)
+            mem_text = (
+                "## Past Episodes (only use if actually related to the CURRENT "
+                "request below — ignore entirely if the topic doesn't match; "
+                "never reuse a past answer, number, or tool choice for an "
+                "unrelated task. These are historical: NEVER reuse a past "
+                "episode's date, time, weather, or other live-data value as "
+                "today's answer — the tool-call rules above still apply and "
+                "require a fresh call for live data even if a similar past "
+                "episode is shown here)\n\n"
+                + "\n\n---\n\n".join(memory)
+            )
             sections.append(_Section(
                 name="memory",
                 content=mem_text,

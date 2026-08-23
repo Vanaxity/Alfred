@@ -88,8 +88,7 @@ class Guardrails:
 
 # Tools that mutate external state (need verification after execution)
 MUTATION_TOOLS: Set[str] = {
-    "calendar", "email", "remember", "set_reminder",
-    "delete_reminder", "write_file", "memory_save", "run_code",
+    "calendar", "email", "remember", "write_file", "memory_save", "run_code",
 }
 
 # calendar and email dispatch both reads and writes through a single tool, so
@@ -120,16 +119,6 @@ VERIFY_MAP: Dict[str, Dict[str, Any]] = {
         "read_tool": "email",
         "read_params": {"action": "triage"},
         "description": "email triage",
-    },
-    "set_reminder": {
-        "read_tool": "list_reminders",
-        "read_params": {},
-        "description": "list reminders",
-    },
-    "delete_reminder": {
-        "read_tool": "list_reminders",
-        "read_params": {},
-        "description": "list reminders",
     },
     "remember": {
         "read_tool": "memory_search",
@@ -599,11 +588,18 @@ def _legacy_dict_to_schema(name: str, tool_dict: Dict[str, Any]) -> Dict[str, An
 # ---------------------------------------------------------------------------
 
 async def handle_time(params: Dict, ctx: Dict) -> ToolResult:
-    """Get current date and time."""
-    now = datetime.now()
+    """Get current date and time in this machine's own local timezone only."""
+    now = datetime.now().astimezone()
+    offset = now.strftime("%z")  # e.g. "+0530"
+    offset_fmt = f"UTC{offset[:3]}:{offset[3:]}" if offset else "UTC offset unknown"
+    tz_name = now.tzname() or "local"
     return ToolResult(
         success=True,
-        output=now.strftime("%A, %B %d, %Y at %I:%M %p"),
+        output=(
+            now.strftime("%A, %B %d, %Y at %I:%M %p")
+            + f" ({tz_name}, {offset_fmt}) — this is Master Sam's own device time; "
+              "no other city's or timezone's current time is known."
+        ),
     )
 
 
@@ -729,7 +725,7 @@ async def handle_calculator(params: Dict, ctx: Dict) -> ToolResult:
 
 
 async def handle_calendar(params: Dict, ctx: Dict) -> ToolResult:
-    """List/create Google Calendar events."""
+    """List/create/delete Google Calendar events."""
     try:
         from ..tools.gws_client import GWSClient
         client = GWSClient()
@@ -744,6 +740,11 @@ async def handle_calendar(params: Dict, ctx: Dict) -> ToolResult:
             out = client.get_agenda(days=14)
         elif act == "create":
             out = _calendar_create(client, params)
+        elif act == "delete":
+            query = params.get("summary") or params.get("query", "")
+            if not query:
+                return ToolResult(success=False, error="delete needs a summary/query naming the event")
+            out = client.delete_event_by_query(query)
         else:
             out = client.get_agenda()
 
@@ -1139,94 +1140,6 @@ async def handle_remember(params: Dict, ctx: Dict) -> ToolResult:
     return ToolResult(success=False, error="Memory system unavailable")
 
 
-async def handle_set_reminder(params: Dict, ctx: Dict) -> ToolResult:
-    """Create a reminder, or update an existing one when `id` is given.
-
-    Rescheduling is deliberately ONE call rather than delete-then-add. The
-    two-step version was observed being half-completed: the model deleted the
-    old reminder, said "Understood. The correct time is 4:15", and never
-    created the replacement -- so the user ended up with no reminder and a
-    message claiming otherwise.
-    """
-    db = ctx.get("db")
-    if not db:
-        return ToolResult(success=False, error="Database unavailable")
-
-    text = params.get("text", "")
-    when = params.get("when", "")
-    cat = params.get("category", "general")
-    raw_id = params.get("id")
-
-    # --- Update path: correcting an existing reminder ---
-    if raw_id not in (None, "", 0, "0"):
-        try:
-            rid = int(raw_id)
-        except (ValueError, TypeError):
-            return ToolResult(success=False, error=f"Invalid reminder id: {raw_id!r}")
-        if not text and not when:
-            return ToolResult(
-                success=False,
-                error="To update a reminder, give at least a new 'text' or a new 'when'.",
-            )
-        try:
-            ok = db.update_reminder(
-                rid,
-                text=text or None,
-                due_at=when or None,
-                category=params.get("category") or None,
-            )
-        except Exception as e:
-            return ToolResult(success=False, error=str(e))
-        if not ok:
-            return ToolResult(
-                success=False,
-                error=f"Reminder {rid} not found — it may have been deleted already.",
-            )
-        changed = " and ".join(
-            p for p in (f"text to '{text}'" if text else "", f"time to {when}" if when else "") if p
-        )
-        return ToolResult(success=True, output=f"Reminder {rid} updated: {changed}.")
-
-    # --- Create path ---
-    if not text or not when:
-        return ToolResult(success=False, error="text and when required")
-    try:
-        rid = db.add_reminder(text, when, cat)
-        return ToolResult(success=True, output=f"Reminder set: '{text}' at {when} (ID: {rid})")
-    except Exception as e:
-        return ToolResult(success=False, error=str(e))
-
-
-async def handle_list_reminders(params: Dict, ctx: Dict) -> ToolResult:
-    """List pending reminders."""
-    db = ctx.get("db")
-    if not db:
-        return ToolResult(success=False, error="Database unavailable")
-    inc = params.get("include_fired", "").lower() == "true"
-    try:
-        rems = db.list_reminders(inc)
-        if not rems:
-            return ToolResult(success=True, output="No reminders.")
-        lines = [f"- ID {r['id']}: {r['text']} (due: {r['due_at']})" for r in rems]
-        return ToolResult(success=True, output="\n".join(lines))
-    except Exception as e:
-        return ToolResult(success=False, error=str(e))
-
-
-async def handle_delete_reminder(params: Dict, ctx: Dict) -> ToolResult:
-    """Delete a reminder by ID."""
-    db = ctx.get("db")
-    if not db:
-        return ToolResult(success=False, error="Database unavailable")
-    try:
-        rid = int(params.get("id", 0))
-        if db.delete_reminder(rid):
-            return ToolResult(success=True, output=f"Reminder {rid} deleted.")
-        return ToolResult(success=False, error=f"Reminder {rid} not found.")
-    except (ValueError, TypeError):
-        return ToolResult(success=False, error="Invalid ID")
-
-
 async def handle_memory_save(params: Dict, ctx: Dict) -> ToolResult:
     """Save to memory (T3/T4/T5)."""
     memory = ctx.get("memory")
@@ -1267,9 +1180,12 @@ async def handle_memory_search(params: Dict, ctx: Dict) -> ToolResult:
             for r in memory.t3_find_episodes(q, max_results=3):
                 out.append(f"[T3] {r['title']} (score:{r['final_score']:.2f})")
         if tier in ("t4", "all"):
-            v = memory.t4_get(q)
-            if v:
-                out.append(f"[T4] {q}: {v}")
+            # t4_get is an exact key-name lookup, so a natural-language query
+            # ("what do you know about my doubt session") will not match a
+            # stored key ("physics_doubt_session"). t4_search handles that:
+            # exact match, then keyword overlap, then semantic fallback.
+            for k, val in memory.t4_search(q):
+                out.append(f"[T4] {k}: {val}")
         if tier in ("t5", "all"):
             for r in memory.t5_search(q, max_results=3):
                 out.append(f"[T5] {r['title']}: {r['snippet']}")
@@ -1435,9 +1351,6 @@ def create_tool_executor() -> ToolExecutor:
         "open_app": handle_open_app,
         "gws": handle_gws,
         "remember": handle_remember,
-        "set_reminder": handle_set_reminder,
-        "list_reminders": handle_list_reminders,
-        "delete_reminder": handle_delete_reminder,
         "memory_save": handle_memory_save,
         "memory_search": handle_memory_search,
         "weather": handle_weather,

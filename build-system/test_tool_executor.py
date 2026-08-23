@@ -328,7 +328,7 @@ def test_is_mutation_is_action_aware():
     assert ex.is_mutation("email", {"action": "send"})
     # Tools without an action sub-parameter always mutate.
     assert ex.is_mutation("write_file", {"path": "x"})
-    assert ex.is_mutation("set_reminder", {})
+    assert ex.is_mutation("remember", {})
     # Non-mutation tools never do.
     assert not ex.is_mutation("time", {})
     assert not ex.is_mutation("web_search", {"query": "x"})
@@ -456,65 +456,6 @@ def test_glob_blocks_escape_patterns():
             assert "safe directories" in (r.error or ""), r.error
 
 
-def test_set_reminder_updates_in_place_when_given_an_id():
-    """Rescheduling must be ONE atomic call, not delete-then-add.
-
-    The two-step version was observed being half-completed live: the model
-    deleted the old reminder, replied "Understood. The correct time is 4:15",
-    and never created the replacement -- leaving no reminder at all behind a
-    message claiming success.
-    """
-    from brain.v2.tool_executor import handle_set_reminder
-
-    class FakeDB:
-        def __init__(self):
-            self.rows = {}
-            self.next_id = 1
-            self.deleted = []
-
-        def add_reminder(self, text, due_at, category="general"):
-            rid = self.next_id
-            self.next_id += 1
-            self.rows[rid] = {"id": rid, "text": text, "due_at": due_at, "category": category}
-            return rid
-
-        def update_reminder(self, rid, text=None, due_at=None, category=None):
-            if rid not in self.rows:
-                return False
-            if text is not None:
-                self.rows[rid]["text"] = text
-            if due_at is not None:
-                self.rows[rid]["due_at"] = due_at
-            return True
-
-        def delete_reminder(self, rid):
-            self.deleted.append(rid)
-            return self.rows.pop(rid, None) is not None
-
-    db = FakeDB()
-    ctx = {"db": db}
-
-    created = run(handle_set_reminder({"text": "chem practical", "when": "16:45"}, ctx))
-    assert created.success, created.error
-    rid = int(created.output.split("ID: ")[1].rstrip(")"))
-
-    updated = run(handle_set_reminder({"id": rid, "when": "16:15"}, ctx))
-    assert updated.success, updated.error
-    assert db.rows[rid]["due_at"] == "16:15", "time must actually change"
-    assert db.rows[rid]["text"] == "chem practical", "text must survive a time-only update"
-    assert db.deleted == [], "an update must NOT delete anything"
-
-    # A stale id must fail loudly rather than silently creating a duplicate.
-    gone = run(handle_set_reminder({"id": 9999, "when": "10:00"}, ctx))
-    assert not gone.success
-    assert "not found" in (gone.error or "")
-    assert len(db.rows) == 1, "a failed update must not create a new reminder"
-
-    # An id with nothing to change is a caller error, not a silent no-op.
-    empty = run(handle_set_reminder({"id": rid}, ctx))
-    assert not empty.success
-
-
 def test_calculator_supports_real_trig_word_problems():
     """The two questions that exposed this gap in live use.
 
@@ -613,9 +554,8 @@ def test_factory_registers_all_tools():
     expected = {
         "time", "chat", "calculator", "calendar", "email", "web_search",
         "web_fetch", "shell", "read_file", "write_file", "list_directory",
-        "glob", "screenshot", "open_app", "gws", "remember", "set_reminder",
-        "list_reminders", "delete_reminder", "memory_save", "memory_search",
-        "weather", "run_code",
+        "glob", "screenshot", "open_app", "gws", "remember",
+        "memory_save", "memory_search", "weather", "run_code",
     }
     missing = expected - set(ex.tool_names)
     assert not missing, f"unregistered tools: {sorted(missing)}"

@@ -49,6 +49,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Windows' console codepage can't encode every character a live LLM response
+# might contain (e.g. fullwidth punctuation) -- replacing the unprintable ones
+# beats crashing mid-suite and losing every result gathered so far.
+sys.stdout.reconfigure(errors="replace")
+
+# preflight() below reads GROQ_API_KEY straight from os.environ, and it runs
+# before anything imports brain.v2.conversation (the module that would
+# otherwise load .env as a side effect). Without this, preflight() checks an
+# empty key, sends an empty Bearer token, and Groq's 401 gets misread as "key
+# rejected" when the key was simply never loaded yet.
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 SCENARIO_FILE = Path(__file__).parent / "live_scenarios.json"
 
 
@@ -125,24 +138,26 @@ _NO_RESPONSE_MARKERS = (
 )
 
 
-def preflight() -> str:
-    """Return '' if the LLM is reachable, else a human-readable reason."""
+def _check_provider(name: str, host: str, url: str, api_key: str) -> str:
+    """Return '' if reachable, else a human-readable reason. Shared by all
+    three provider checks in preflight() -- kept provider-agnostic on
+    purpose: LLMRouter itself fails over across providers, whichever is
+    configured as priority-1 changes over time (already has this session),
+    and a preflight hardcoded to one provider gives a false "everything is
+    down" when only that one specific provider is having a bad day."""
     import socket
     import urllib.error
     import urllib.request
 
     try:
-        socket.getaddrinfo("api.groq.com", 443)
+        socket.getaddrinfo(host, 443)
     except socket.gaierror as e:
-        return f"DNS resolution failed ({e}) — no network. Nothing here can run."
+        return f"{name}: DNS resolution failed ({e})"
 
-    # A real User-Agent is required, not optional: Groq sits behind Cloudflare,
-    # which rejects urllib's default UA with a 403 (error 1010). Without this
-    # header the preflight reports "API key rejected" on a perfectly good key.
     req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/models",
+        url,
         headers={
-            "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY', '')}",
+            "Authorization": f"Bearer {api_key}",
             "User-Agent": "alfred-live-suite/1.0",
         },
     )
@@ -150,15 +165,46 @@ def preflight() -> str:
         with urllib.request.urlopen(req, timeout=15) as r:
             if r.status == 200:
                 return ""
-            return f"Groq /models returned HTTP {r.status}"
+            return f"{name}: HTTP {r.status}"
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            return "Groq is rate limiting (HTTP 429). Wait for the window to reset."
+            return f"{name}: rate limited (429)"
         if e.code in (401, 403):
-            return f"Groq rejected the API key (HTTP {e.code}). Check GROQ_API_KEY."
-        return f"Groq returned HTTP {e.code}"
+            return f"{name}: API key rejected ({e.code})"
+        return f"{name}: HTTP {e.code}"
     except Exception as e:
-        return f"Cannot reach Groq: {e}"
+        return f"{name}: {e}"
+
+
+def preflight() -> str:
+    """Return '' if ANY configured provider is reachable, else a combined
+    human-readable reason. Provider-agnostic by design -- see
+    _check_provider()."""
+    checks = []
+    if os.environ.get("OPENROUTER_API_KEY"):
+        checks.append(("openrouter", "openrouter.ai",
+                        "https://openrouter.ai/api/v1/models",
+                        os.environ.get("OPENROUTER_API_KEY", "")))
+    if os.environ.get("GROQ_API_KEY"):
+        checks.append(("groq", "api.groq.com",
+                        "https://api.groq.com/openai/v1/models",
+                        os.environ.get("GROQ_API_KEY", "")))
+    if os.environ.get("GOOGLE_API_KEY"):
+        checks.append(("gemini", "generativelanguage.googleapis.com",
+                        "https://generativelanguage.googleapis.com/v1beta/models?key="
+                        + os.environ.get("GOOGLE_API_KEY", ""), ""))
+
+    if not checks:
+        return "No provider API keys set (GROQ_API_KEY / OPENROUTER_API_KEY / GOOGLE_API_KEY)."
+
+    reasons = []
+    for name, host, url, key in checks:
+        reason = _check_provider(name, host, url, key)
+        if not reason:
+            return ""  # at least one provider reachable -- good to go
+        reasons.append(reason)
+
+    return "All configured providers unreachable: " + "; ".join(reasons)
 
 
 def looks_starved(result):
@@ -244,10 +290,40 @@ async def main_async(args):
             print("  produce 18 meaningless failures. Use --skip-preflight to force.\n")
             return 2
 
-    # Import after sys.path setup. Neutralize the heartbeat's background thread:
-    # it ticks immediately on construction and would race these calls.
-    from brain.v2 import heartbeat as hb_module
-    hb_module.CognitiveHeartbeat.start = lambda self: None
+    # Isolate this run's T2/T3/T4 memory writes from the real Obsidian vault.
+    # Confirmed live: every prior test run wrote learned-skill and episodic-
+    # memory files straight into the user's real vault -- 813 T3 episodes and
+    # 11 T2 skills accumulated there from months of test runs, indistinguishable
+    # from genuine usage, and directly contributed to a context-bleed bug (a
+    # just-saved test episode outscoring on recency and leaking into an
+    # unrelated later question). OBSIDIAN_VAULT_PATH is read once at import
+    # time by brain.memory.five_tier, so this MUST be set before that module
+    # (or anything importing it, like brain.v2.conversation) is ever imported.
+    if not args.pollute_real_vault:
+        test_vault = Path(__file__).parent / ".test_vault"
+        for sub in ("T1-Context", "T2-Skills", "T3-Episodic", "T4-UserProfile", "T5-Archive"):
+            (test_vault / "Memory" / sub).mkdir(parents=True, exist_ok=True)
+        os.environ["OBSIDIAN_VAULT_PATH"] = str(test_vault)
+
+        # Seed T4 (Sam.md) so profile-dependent scenarios (t4_favorite_food_recall
+        # and friends) have something real to recall -- a fresh isolated vault
+        # otherwise starts with an empty profile and those scenarios fail for a
+        # reason that has nothing to do with the code being tested. Reuses
+        # seed_t4.py's own logic via direct file import (build-system/ has a
+        # hyphen, so it isn't a valid dotted package for a normal import).
+        sam_md = test_vault / "Memory" / "T4-UserProfile" / "Sam.md"
+        if not sam_md.exists():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "seed_t4", Path(__file__).parent / "seed_t4.py"
+            )
+            seed_t4 = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(seed_t4)
+            seed_t4.main()
+
+        print(f"  Using isolated test vault: {test_vault}\n")
+
+    # Import after sys.path setup and the vault-path override above.
     from brain.v2.conversation import Alfred
 
     scenarios = load_scenarios()
@@ -352,6 +428,11 @@ def main():
                          "rate limits that look like failures (default 3, use 0 to disable)")
     ap.add_argument("--skip-preflight", action="store_true",
                     help="run even if the LLM looks unreachable")
+    ap.add_argument("--pollute-real-vault", action="store_true",
+                    help="write T2/T3/T4 memory to the real OBSIDIAN_VAULT_PATH "
+                         "instead of an isolated .test_vault -- off by default; "
+                         "months of runs without this flag already polluted the "
+                         "real vault with 800+ fake episodes, see build-system/README")
     args = ap.parse_args()
     return asyncio.run(main_async(args))
 

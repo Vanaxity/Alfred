@@ -29,6 +29,55 @@ from .tool_executor import ToolExecutor, ToolResult, create_tool_executor, MUTAT
 
 
 # ---------------------------------------------------------------------------
+# Untooled completion-claim detection
+# ---------------------------------------------------------------------------
+
+# Multi-word phrases that claim a persistent state change happened. Anchored
+# as multi-word idioms specifically to avoid the project's documented
+# single-word substring trap (e.g. "read" matching "already read"/"thread").
+_COMPLETION_CLAIM_PHRASES = (
+    "is now set", "has been set", "i've set", "i have set",
+    "will be factored into", "i'll factor", "i will factor",
+    "i've saved", "i have saved", "has been saved", "is saved",
+    "i've added", "i have added", "has been added",
+    "i've scheduled", "i have scheduled", "has been scheduled", "is scheduled",
+    "i've updated", "i have updated", "has been updated",
+    "i'll remember that", "i will remember that", "i've remembered",
+    "all set for", "done and saved",
+)
+
+# Cues that this is a legitimate refusal/limitation reply, not a false
+# completion claim — must not be nudged (calendar_down_reminders_still_work,
+# impossible_right_triangle, reminder_missing_time all rely on exactly this
+# vocabulary and must pass through untouched).
+_REFUSAL_CUES = (
+    "can't", "cannot", "unable to", "haven't", "not able to",
+    "not possible", "no credentials", "not connected", "isn't connected",
+    "don't have", "do not have", "no record", "not stored",
+)
+
+
+# ---------------------------------------------------------------------------
+# Tool-output-vs-reply consistency (model-agnostic — no city/location
+# matching, just: does the final reply state a clock time the `time` tool
+# never actually returned. Confirmed live: handle_time() now explicitly
+# says "no other city's or timezone's current time is known," and the
+# model stated a Boston time anyway. A textual disclaimer alone doesn't
+# enforce anything -- this checks the claim against the tool's real output.
+# ---------------------------------------------------------------------------
+
+_CLOCK_TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)\b")
+
+
+def _extract_clock_times(text: str) -> set:
+    """Normalized set of HH:MM AM/PM tokens found in `text`."""
+    return {
+        f"{int(h)}:{m} {ap.upper()}"
+        for h, m, ap in _CLOCK_TIME_RE.findall(text or "")
+    }
+
+
+# ---------------------------------------------------------------------------
 # Response dataclass
 # ---------------------------------------------------------------------------
 
@@ -52,8 +101,6 @@ class Alfred:
 
     Public API:
         execute(task, context) -> Response
-        pop_alerts() -> List[Dict]
-        check_due_reminders() -> List[Dict]
     """
 
     CHAT_MODEL = "llama-3.1-8b-instant"
@@ -77,8 +124,6 @@ class Alfred:
         self.skill_manager = get_skill_manager()
         self.goal_expander = get_goal_expander()
         self.db = get_local_db()
-        self.heartbeat_enabled = True
-        self._pending_alerts: List[Dict] = []
 
         # LLM router (3-provider fallback)
         groq_key = os.environ.get("GROQ_API_KEY", "")
@@ -95,9 +140,6 @@ class Alfred:
 
         # Bootstrap (AGENTS.md, SOUL.md, etc.)
         self._bootstrap = self._load_bootstrap()
-
-        # Start heartbeat
-        self._start_heartbeat()
 
     # ------------------------------------------------------------------
     # Bootstrap
@@ -138,7 +180,7 @@ class Alfred:
 
         # Rules
         rules = [
-            "For personal questions about Master Sam, answer from the profile below. NEVER search memory for it.",
+            "For personal questions about Master Sam that you can answer directly from the profile below (e.g. 'what's my favorite food'), answer from it and do NOT call memory_search. But if Master Sam explicitly asks what you know, remember, or have saved about something (e.g. 'what do you know about X', 'what have you got saved', 'search your memory for X'), call memory_search so the answer comes from an actual lookup rather than just reciting the prompt.",
             "For live data (time, weather, calendar, web), call the appropriate tool.",
             "Output ONE JSON per message: {\"tool\": \"name\", \"params\": {...}} or {\"reply\": \"answer\"}",
             "After a tool runs you will see the result. Call another tool or reply.",
@@ -146,6 +188,8 @@ class Alfred:
             "NEVER claim an action was completed without calling the tool and seeing a success result.",
             "CRITICAL: calendar, email, weather, time answers REQUIRE a tool call. Never answer from memory.",
             "CRITICAL: ALL arithmetic, trigonometry, and geometry REQUIRE the calculator tool — never compute mentally and never state a number you did not get from it. Word problems count: extract the expression and call calculator.",
+            "CRITICAL: To find, read, or list files, use glob/read_file/list_directory — never shell. Those run immediately; shell requires human approval and stalls the turn.",
+            "CRITICAL: A standing or recurring fact about the user ('from now on...', 'permanently...', 'every week...', 'no longer...') is a `remember` call, not silent acknowledgement — always persist it.",
             "If the question contains a contradiction or impossible premise (e.g. a right triangle whose leg exceeds its hypotenuse, a date that doesn't exist), SAY SO and stop. Never silently reinterpret the numbers into something solvable — for homework, a confident answer to a broken question is worse than no answer.",
             "If a required detail is genuinely missing (a time, a name, a value), ASK for it. Never invent it and never quietly assume a default.",
             "Before you reply that something is done, check you finished EVERY part of it. If a request had two parts and you did one, say exactly which part is still outstanding — never describe a half-finished action as complete.",
@@ -223,10 +267,10 @@ class Alfred:
                 },
             },
             "calendar": {
-                "description": "List/create Google Calendar events. Actions: agenda, list, create.",
+                "description": "List/create/delete Google Calendar events. Actions: agenda, list, create, delete.",
                 "params": {
-                    "action": "agenda/list/create",
-                    "summary": "Title (for create)",
+                    "action": "agenda/list/create/delete",
+                    "summary": "Title (for create) or search text naming the event (for delete)",
                     "start_time": "ISO datetime (for create)",
                     "end_time": "ISO datetime (optional, auto +1hr)",
                 },
@@ -249,11 +293,25 @@ class Alfred:
                 "params": {"url": "URL to fetch"},
             },
             "shell": {
-                "description": "Run a PowerShell command.",
+                "description": (
+                    "Run a PowerShell command, ONLY for system tasks with no dedicated "
+                    "tool. Requires human approval before it runs, so a plan that starts "
+                    "with shell stalls the conversation. Do NOT use shell to find files "
+                    "(use glob), read a file (use read_file), or list a folder (use "
+                    "list_directory) — those run immediately with no approval gate and "
+                    "are almost always what the user actually wants."
+                ),
                 "params": {"command": "Command", "cwd": "Working dir (optional)"},
             },
             "read_file": {
-                "description": "Read a file from safe directories.",
+                "description": (
+                    "Read a file's contents. Restricted to safe project directories — "
+                    "if the path is outside them (e.g. Windows system folders), this "
+                    "returns an honest 'Path not in safe directories' error instead of "
+                    "reading anything. USE THIS (not shell/Get-Content) to read any "
+                    "file, even one expected to be out of bounds: the resulting error "
+                    "IS the correct answer to relay, not a reason to fall back to shell."
+                ),
                 "params": {"path": "File path", "offset": 1, "limit": 2000},
             },
             "write_file": {
@@ -261,11 +319,22 @@ class Alfred:
                 "params": {"path": "File path", "content": "Content"},
             },
             "list_directory": {
-                "description": "List files in a directory.",
+                "description": (
+                    "List files and folders directly inside ONE directory (not "
+                    "recursive). USE THIS for 'what's in this folder' requests. For "
+                    "'find every file matching X, including subfolders', use glob "
+                    "instead. Do NOT use shell (dir/ls) — it requires approval."
+                ),
                 "params": {"path": "Directory path"},
             },
             "glob": {
-                "description": "Find files by glob pattern.",
+                "description": (
+                    "Find files by name/extension pattern, recursively, in safe "
+                    "project directories — runs immediately, no approval needed. USE "
+                    "THIS (not shell) for 'find every file...', 'list all .py files', "
+                    "'search subfolders for X'. '**/*.py' searches all subfolders "
+                    "including nested ones."
+                ),
                 "params": {"pattern": "**/*.py"},
             },
             "screenshot": {
@@ -281,36 +350,36 @@ class Alfred:
                 "params": {"command": "string"},
             },
             "time": {
-                "description": "Get current date and time.",
+                "description": (
+                    "Get the current date and time in Master Sam's own device "
+                    "timezone ONLY. This tool cannot determine the time in any other "
+                    "city, region, or timezone — if asked for another location's "
+                    "current time, still call it for the date context, but tell the "
+                    "user plainly you don't know that location's local time rather "
+                    "than presenting this value as theirs."
+                ),
                 "params": {},
             },
             "remember": {
-                "description": "Save a fact to long-term profile (T4).",
+                "description": (
+                    "Save a durable, standing fact to the user's long-term profile "
+                    "(T4) — preferences, recurring commitments, permanent schedule "
+                    "changes ('my AoPS block moved to 6:30am', 'my physics session is "
+                    "every Thursday 4pm now'). USE THIS whenever the user signals "
+                    "permanence — 'from now on', 'permanently', 'every week', 'no "
+                    "longer' — even if the fact sounds schedule-like."
+                ),
                 "params": {"key": "Fact name", "value": "Fact value",
                            "section": "Category (default: Preferences)"},
             },
-            "set_reminder": {
-                "description": (
-                    "Create a reminder, or CHANGE an existing one. To reschedule or "
-                    "correct a reminder, call this with its 'id' and the new 'when' "
-                    "— that updates it in one step. Do NOT delete-then-recreate: "
-                    "deleting alone leaves the user with no reminder at all."
-                ),
-                "params": {"text": "Reminder text",
-                           "when": "ISO datetime or natural language",
-                           "id": "Existing reminder ID — only when changing one",
-                           "category": "Category (default: general)"},
-            },
-            "list_reminders": {
-                "description": "List pending reminders.",
-                "params": {"include_fired": "true/false"},
-            },
-            "delete_reminder": {
-                "description": "Delete a reminder by ID.",
-                "params": {"id": "Reminder ID"},
-            },
             "memory_save": {
-                "description": "Save to memory (T3/T4/T5).",
+                "description": (
+                    "Save free-form content to a specific memory tier: t3 (episodic "
+                    "notes/summaries), t4 (profile facts — same store as `remember`, "
+                    "free text instead of key/value), or t5. For a simple durable "
+                    "fact about the user, prefer `remember` — same effect, simpler "
+                    "params."
+                ),
                 "params": {"tier": "t3/t4/t5", "content": "Content",
                            "title": "Optional title"},
             },
@@ -319,7 +388,16 @@ class Alfred:
                 "params": {"query": "Query", "tier": "all/t3/t4/t5"},
             },
             "weather": {
-                "description": "Get weather for a location.",
+                "description": (
+                    "Get real, current weather conditions for a location — the "
+                    "dedicated tool for any 'is it raining', 'what's the weather', "
+                    "'check conditions' request, including when the user says "
+                    "'actually check' or 'don't guess'. USE THIS, not web_search "
+                    "or web_fetch — those are slower and less reliable for live "
+                    "weather data. Its result is authoritative on its own: once "
+                    "it returns, answer from it directly and do not also call "
+                    "web_search or web_fetch to cross-check the same forecast."
+                ),
                 "params": {"location": "City or 'auto'"},
             },
             "run_code": {
@@ -352,6 +430,17 @@ class Alfred:
             return json.loads(repaired)
         except json.JSONDecodeError:
             return None
+
+    @staticmethod
+    def _is_untooled_completion_claim(reply: str) -> bool:
+        """True if `reply` claims a persistent action completed, in language
+        that would mislead the user if no tool actually ran this turn."""
+        text = reply.strip().lower()
+        if not text or text.endswith("?"):
+            return False  # clarifying questions / offers are never claims
+        if any(cue in text for cue in _REFUSAL_CUES):
+            return False  # honest "I can't do that" must never be nudged
+        return any(phrase in text for phrase in _COMPLETION_CLAIM_PHRASES)
 
     def _parse_llm_output(self, content: str) -> tuple:
         """
@@ -525,6 +614,10 @@ class Alfred:
         tool_results: List[Dict[str, Any]] = []
         awaiting_approval: Optional[Dict[str, Any]] = None
         repeats: Dict[str, int] = {}
+        completion_claim_nudge_used = False
+        time_mismatch_nudge_used = False
+        time_tool_output: Optional[str] = None
+        weather_tool_output: Optional[str] = None
 
         # --- Goal expansion + skill matching (once, before the loop) ---
         # Expansion must happen before matching, since matching is meant to
@@ -605,6 +698,48 @@ class Alfred:
 
             if reply is not None:
                 if reply.strip():
+                    if (
+                        not tools_called
+                        and not completion_claim_nudge_used
+                        and self._is_untooled_completion_claim(reply)
+                    ):
+                        completion_claim_nudge_used = True
+                        thinking.append(
+                            f"[Turn {turn + 1}] Completion-claim reply with no tool call — nudging"
+                        )
+                        conv.add_user(
+                            "You just told me something was done, but you did not call a tool "
+                            f"this turn -- nothing actually happened. Task: {task}. If this "
+                            "needs an action (saving, scheduling, reminding, calculating, etc.), "
+                            "call the matching tool now with a real {\"tool\": ..., \"params\": "
+                            "{...}} call. If you genuinely can't do it, say so plainly instead "
+                            "of claiming it's done."
+                        )
+                        continue
+                    if (
+                        time_tool_output is not None
+                        and not time_mismatch_nudge_used
+                        and not any(cue in reply.lower() for cue in _REFUSAL_CUES)
+                    ):
+                        claimed = _extract_clock_times(reply)
+                        grounded = _extract_clock_times(time_tool_output)
+                        fabricated = claimed - grounded
+                        if fabricated:
+                            time_mismatch_nudge_used = True
+                            thinking.append(
+                                f"[Turn {turn + 1}] Reply states a time {fabricated} the "
+                                "time tool never returned — nudging"
+                            )
+                            conv.add_user(
+                                f"The time tool returned: {time_tool_output}. Your reply "
+                                f"states a different time ({', '.join(fabricated)}) that "
+                                "tool never gave you -- that's fabricated, not grounded. "
+                                "This device's clock cannot tell you another city's or "
+                                "timezone's current time. Redo your answer: state only "
+                                "the time the tool actually returned, and say plainly you "
+                                "don't know any other location's local time."
+                            )
+                            continue
                     final_reply = reply
                     thinking.append(f"[Turn {turn + 1}] Reply: {reply[:80]}")
                     break
@@ -635,6 +770,24 @@ class Alfred:
                 )
                 continue
 
+            # --- Don't let a successful weather call get second-guessed ---
+            # Live-observed (weather_rain_before_evening_run): the model calls
+            # weather, gets a real forecast back, then calls web_search and
+            # web_fetch anyway for the same question -- redundant cross-checks
+            # of a tool that already answered authoritatively. Strengthening
+            # the tool description alone didn't stop it, so refuse the call
+            # outright instead of just asking nicely.
+            if tool_name in ("web_search", "web_fetch") and weather_tool_output is not None:
+                thinking.append(
+                    f"[Turn {turn + 1}] Blocking redundant {tool_name} after weather succeeded"
+                )
+                conv.add_user(
+                    f"The weather tool already returned: {weather_tool_output}. "
+                    f"Don't call {tool_name} to cross-check it -- answer the "
+                    "user's question directly from that result now."
+                )
+                continue
+
             # --- Execute tool ---
             thinking.append(f"[Turn {turn + 1}] Tool: {tool_name}")
             result = await self._tool_executor.execute(tool_name, tool_params, tool_ctx)
@@ -649,6 +802,10 @@ class Alfred:
                 "success": result.success,
                 "params": tool_params,
             })
+            if tool_name == "time" and result.success:
+                time_tool_output = str(output)
+            if tool_name == "weather" and result.success:
+                weather_tool_output = str(output)
 
             if is_error:
                 thinking.append(f"  X {tool_name}: {str(output)[:100]}")
@@ -726,9 +883,19 @@ class Alfred:
                 final_reply = "I wasn't able to process that request."
 
         # --- Save T3 episode ---
+        # Skip turns whose only tool calls were perishable/live-data lookups
+        # (time, weather): saving them creates episodes whose only "content"
+        # is a stale clock/weather reading, which a later unrelated turn can
+        # retrieve as if it were current -- confirmed live: a saved "07:10
+        # PM" time answer got reused a day later instead of a fresh call.
+        # Combined turns (e.g. calendar + time) still save normally since
+        # tools_called won't be a subset of PERISHABLE_ONLY_TOOLS | {chat}.
+        PERISHABLE_ONLY_TOOLS = {"time", "weather"}
         episodes_saved = 0
         episode_path: Optional[str] = None
-        if any(t != "chat" for t in tools_called):
+        if any(t != "chat" for t in tools_called) and not set(tools_called) <= (
+            PERISHABLE_ONLY_TOOLS | {"chat"}
+        ):
             try:
                 tools_used = ", ".join(tools_called)
                 summary = (
@@ -836,64 +1003,6 @@ class Alfred:
             task=task, steps=steps, task_complexity=complexity, had_error=False,
         )
         return skill is not None
-
-    # ------------------------------------------------------------------
-    # Heartbeat
-    # ------------------------------------------------------------------
-
-    def _start_heartbeat(self) -> None:
-        """Start the CognitiveHeartbeat background loop."""
-        from .heartbeat import CognitiveHeartbeat
-        self._heartbeat = CognitiveHeartbeat(
-            alfred=self,
-            db=self.db,
-            router=self._router,
-            memory=self.memory,
-            interval=1800,
-        )
-        self._heartbeat.start()
-
-    def stop(self) -> None:
-        """Stop the background heartbeat (called on interpreter shutdown)."""
-        if getattr(self, "_heartbeat", None):
-            self._heartbeat.stop()
-
-    def check_due_reminders(self) -> List[Dict]:
-        """Check for due reminders and queue alerts."""
-        try:
-            due = self.db.get_due_reminders()
-            alerts = []
-            for r in due:
-                a = {
-                    "type": "reminder",
-                    "text": r["text"],
-                    "id": r["id"],
-                    "category": r.get("category", "general"),
-                }
-                alerts.append(a)
-                self.push_alert(a)
-                self.db.mark_reminder_fired(r["id"])
-            return alerts
-        except Exception as e:
-            print(f"[Alfred-v2] Reminder check failed: {e}")
-            return []
-
-    def push_alert(self, alert: Dict[str, Any]) -> None:
-        """Queue an alert for the WebSocket broadcaster to pick up.
-
-        This is the single alert entry point — brain_api/server.py's
-        _alert_broadcaster() polls pop_alerts() below every 5s. Previously
-        CognitiveHeartbeat kept its own separate _pending_alerts that nothing
-        ever drained, so every reminder/cron/proactive alert it generated
-        vanished silently; it now calls this instead.
-        """
-        self._pending_alerts.append(alert)
-
-    def pop_alerts(self) -> List[Dict]:
-        """Pop pending alerts for WebSocket broadcast."""
-        alerts = list(self._pending_alerts)
-        self._pending_alerts.clear()
-        return alerts
 
 
 # ---------------------------------------------------------------------------

@@ -142,3 +142,6 @@ config.local.json
 
 # Live-suite run artifact (regenerated every run)
 /build-system/live_results.json
+
+# Isolated test vault for the live suite (regenerated every run, not source)
+/build-system/.test_vault/
