@@ -530,9 +530,23 @@ class SkillManager:
     def improve_skill(
         self, skill_id: str, improvement_note: str, new_steps: List[Dict] = None
     ) -> bool:
+        """Patch a skill's steps and persist the change to both disk and the
+        in-memory cache.
+
+        Previously wrote the improvement note to disk as a trailing log
+        section but never updated `skill.steps` or `self._skills_cache` --
+        the next time this same skill got matched and injected into a
+        prompt (`_build_system_prompt`), it still showed the old, wrong
+        steps, because the cached object was never touched. new_steps now
+        actually replaces the object's steps before regenerating markdown
+        from it, so disk and cache agree.
+        """
         skill = self._skills_cache.get(skill_id)
         if not skill:
             return False
+
+        if new_steps:
+            skill.steps = new_steps
 
         improvement_section = f"""
 
@@ -540,13 +554,9 @@ class SkillManager:
 **Updated:** {datetime.now().strftime("%Y-%m-%d %H:%M")}
 **Note:** {improvement_note}
 """
-        if new_steps:
-            improvement_section += "\n### Updated Steps:\n"
-            for step in new_steps:
-                improvement_section += f"- {step}\n"
-
         updated_content = skill.to_markdown() + improvement_section
         Path(skill.path).write_text(updated_content, encoding="utf-8")
+        self._skills_cache[skill_id] = skill
         return True
 
     def get_all_skills(self) -> List[Skill]:
