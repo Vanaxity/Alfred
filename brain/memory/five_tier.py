@@ -628,6 +628,42 @@ class FiveTierMemory:
 
         return []
 
+    def t4_forget(self, key_or_query: str) -> str:
+        """Delete a fact from the user profile by exact key or natural-
+        language query. Mirrors the safe-resolution pattern already shipped
+        for delete_event_by_query (gws_client.py) -- exact key match first,
+        else fall back to t4_search's keyword/semantic resolution; refuses
+        to guess when a query matches more than one distinct key rather than
+        deleting all of them.
+        """
+        if not self._t4_profile:
+            self._t4_profile = self.t4_load_profile()
+
+        for section, data in self._t4_profile.items():
+            if isinstance(data, dict) and key_or_query in data:
+                value = data.pop(key_or_query)
+                self._save_t4_profile()
+                return f"Forgot: {key_or_query} = {value}"
+
+        matches = self.t4_search(key_or_query)
+        if not matches:
+            return f"No stored fact found matching '{key_or_query}'."
+
+        distinct_keys = {k for k, _ in matches}
+        if len(distinct_keys) > 1:
+            lines = [f"{len(distinct_keys)} facts match '{key_or_query}' -- say which one by exact key instead:"]
+            for k, v in matches:
+                lines.append(f"  - {k}: {v}")
+            return "\n".join(lines)
+
+        key = matches[0][0]
+        for section, data in self._t4_profile.items():
+            if isinstance(data, dict) and key in data:
+                value = data.pop(key)
+                self._save_t4_profile()
+                return f"Forgot: {key} = {value}"
+        return f"No stored fact found matching '{key_or_query}'."
+
     def _save_t4_profile(self) -> None:
         """Persist user profile to disk."""
         profile_path = PROFILES_DIR / "Sam.md"

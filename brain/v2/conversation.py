@@ -12,6 +12,7 @@ Hermes-inspired:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -140,6 +141,10 @@ class Alfred:
 
         # Bootstrap (AGENTS.md, SOUL.md, etc.)
         self._bootstrap = self._load_bootstrap()
+
+        # Post-turn memory curation tasks (fire-and-forget) -- kept here so
+        # they aren't garbage-collected mid-flight; never awaited by a turn.
+        self._pending_curation_tasks: List[Any] = []
 
     # ------------------------------------------------------------------
     # Bootstrap
@@ -374,18 +379,30 @@ class Alfred:
             },
             "memory_save": {
                 "description": (
-                    "Save free-form content to a specific memory tier: t3 (episodic "
-                    "notes/summaries), t4 (profile facts — same store as `remember`, "
-                    "free text instead of key/value), or t5. For a simple durable "
-                    "fact about the user, prefer `remember` — same effect, simpler "
-                    "params."
+                    "Save free-form content to the user's profile (t4, free text "
+                    "instead of key/value — same store as `remember`) or to the "
+                    "t5 full-text archive. For a simple durable fact about the "
+                    "user, prefer `remember` — same effect, simpler params. Do "
+                    "NOT use this for a note about what just happened in this "
+                    "conversation — that's saved automatically, you don't need "
+                    "to call anything for it."
                 ),
-                "params": {"tier": "t3/t4/t5", "content": "Content",
+                "params": {"tier": "t4/t5", "content": "Content",
                            "title": "Optional title"},
             },
             "memory_search": {
                 "description": "Search memory tiers.",
                 "params": {"query": "Query", "tier": "all/t3/t4/t5"},
+            },
+            "forget": {
+                "description": (
+                    "Delete a fact from the user's long-term profile (T4) — use "
+                    "when the user says something is no longer true, was a "
+                    "mistake, or explicitly asks you to forget/remove/delete a "
+                    "stored fact."
+                ),
+                "params": {"key_or_query": "Exact key, or a natural-language "
+                                            "description of the fact to remove"},
             },
             "weather": {
                 "description": (
@@ -919,6 +936,39 @@ class Alfred:
             except Exception as e:
                 thinking.append(f"  Skill generation failed: {e}")
 
+        # --- Maybe improve skill ---
+        # A matched skill was used to shape this turn and something in it
+        # still failed -- the recipe was wrong, patch it, mirroring Hermes
+        # Agent's skill self-improvement loop. Same gate shape as skill
+        # generation above, inverted (that one requires no failures; this one
+        # requires a failure plus a skill actually having been in play).
+        if matched_skill is not None and any(
+            tr.get("success") is False for tr in tool_results
+        ):
+            failed = next((tr for tr in tool_results if tr.get("success") is False), {})
+            failure_detail = failed.get("output") or failed.get("error") or "unknown"
+            note = f"Used for '{task[:80]}' and a step failed: {str(failure_detail)[:150]}"
+            try:
+                self.skill_manager.improve_skill(matched_skill.skill_id, note)
+                thinking.append(f"  Flagged skill '{matched_skill.title}' for improvement")
+            except Exception as e:
+                thinking.append(f"  Skill improvement failed: {e}")
+
+        # --- Post-turn memory curation (fire-and-forget) ---
+        # A second, independent look at this exchange, restricted to
+        # remember/forget/memory_search only -- catches durable facts the
+        # live turn's own tool choice missed or misfiled (e.g. a casual
+        # mention with no "remember this" cue, or memory_save picking the
+        # wrong tier). Never awaited: must not add latency to the response
+        # the user is waiting on.
+        task_ref = asyncio.create_task(
+            self._curate_memory(task, final_reply, tools_called, tool_results)
+        )
+        self._pending_curation_tasks.append(task_ref)
+        self._pending_curation_tasks = [
+            t for t in self._pending_curation_tasks if not t.done()
+        ]
+
         return {
             "response": final_reply,
             "thinking": thinking,
@@ -1003,6 +1053,86 @@ class Alfred:
             task=task, steps=steps, task_complexity=complexity, had_error=False,
         )
         return skill is not None
+
+    async def _curate_memory(
+        self,
+        task: str,
+        final_reply: str,
+        tools_called: List[str],
+        tool_results: List[Dict[str, Any]],
+    ) -> None:
+        """Second, independent look at a finished turn, restricted to
+        remember/forget/memory_search, deciding whether anything belongs in
+        the durable profile (T4) regardless of what the live turn's own tool
+        choice did or missed.
+
+        Modeled on Hermes Agent's background_review.py, adapted to Alfred's
+        actually-async loop (a fire-and-forget asyncio task, not a forked
+        agent in a daemon thread) and to LLMRouter having no native
+        tool-calling API -- restricting available tools here is just a
+        smaller prompt, not something the router needs to support.
+
+        Fire-and-forget: never raises into the caller, never touches
+        `thinking` (the turn that spawned this has already returned).
+        """
+        try:
+            allowed = {"remember", "forget", "memory_search"}
+            descriptions = self._get_tool_descriptions()
+            tool_blocks = "\n\n".join(
+                ToolSchema(
+                    name=name,
+                    description=descriptions[name]["description"],
+                    parameters=descriptions[name]["params"],
+                ).to_prompt_block()
+                for name in allowed
+            )
+            already_saved = any(t in ("remember", "memory_save") for t in tools_called)
+            system = (
+                "You are Alfred's memory curator. You do not talk to the "
+                "user -- you only decide whether the exchange below is worth "
+                "persisting to the user's long-term profile. Call `remember` "
+                "if it contains a durable fact worth keeping (preferences, "
+                "standing facts, recurring commitments -- not one-off task "
+                "details, those are saved automatically) AND it was not "
+                "already saved this turn (see below). Call `forget` if it "
+                "invalidates or corrects a previously stored fact. If "
+                "there is nothing left worth persisting, reply with "
+                '{"reply": "nothing to save"} and make no tool call. Do not '
+                "re-save a fact under a new key just because you'd phrase "
+                "the key differently -- if it's already saved, leave it.\n\n"
+                f"Available tools:\n\n{tool_blocks}\n\n"
+                'Respond with exactly one JSON object: either '
+                '{"tool": "<name>", "params": {...}} or {"reply": "..."}.'
+            )
+            summary = (
+                f"User said: {task}\n\n"
+                f"Alfred replied: {final_reply[:500]}\n\n"
+                f"Tools used this turn: {', '.join(tools_called) or 'none'}"
+                + (
+                    "\n\nNote: remember/memory_save already ran this turn -- "
+                    "the main fact from this exchange is very likely already "
+                    "saved. Only act if you spot something distinct it missed."
+                    if already_saved else ""
+                )
+            )
+            resp = await self._router.call(
+                system_prompt=system,
+                user_message=summary,
+                max_tokens=300,
+                temperature=0.1,
+            )
+            raw = (resp.text or "").strip()
+            if not raw:
+                return
+            _reply, tool_name, tool_params = self._parse_llm_output(raw)
+            if tool_name is None or tool_name not in allowed:
+                return
+            tool_ctx = {"memory": self.memory, "db": self.db, "router": self._router}
+            await self._tool_executor.execute(
+                tool_name, tool_params or {}, tool_ctx, allowed_tools=allowed,
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

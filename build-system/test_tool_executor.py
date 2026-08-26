@@ -48,9 +48,11 @@ from brain.v2.tool_executor import (  # noqa: E402
     _action_signature,
     _is_safe_path,
     handle_calculator,
+    handle_forget,
     handle_glob,
     handle_open_app,
 )
+from brain.memory.five_tier import FiveTierMemory  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +114,31 @@ def executor_with(name, handler, guardrails=None, schema=None):
     ex = ToolExecutor()
     ex.register(name, handler, guardrails=guardrails, schema=schema)
     return ex
+
+
+def _bare_memory(profile):
+    """A FiveTierMemory with no disk/DB/model setup -- __init__ is never run,
+    so this touches no files. Only t4_* logic (pure in-memory dict ops) is
+    under test here; disk persistence is FiveTierMemory's own concern."""
+    mem = object.__new__(FiveTierMemory)
+    mem._t4_profile = profile
+    mem._t3_vector_model = None  # force keyword-only resolution, deterministic
+    mem._save_t4_profile = lambda: None
+    return mem
+
+
+class FakeMemoryForForget:
+    """Stands in for FiveTierMemory in handle_forget's own dispatch test --
+    t4_forget's actual resolution logic is covered separately, against a
+    _bare_memory(), below."""
+
+    def __init__(self, out):
+        self._out = out
+        self.calls = []
+
+    def t4_forget(self, key_or_query):
+        self.calls.append(key_or_query)
+        return self._out
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +381,74 @@ def test_verify_map_read_tools_are_registered():
         assert info["read_tool"] in ex.tool_names, (
             f"{tool} verifies via unregistered tool {info['read_tool']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 20-22. allowed_tools -- hard allowlist for restricted callers (the
+# post-turn memory-curation pass must not reach shell/run_code/etc. even if
+# the model hallucinates a tool name that happens to be registered)
+# ---------------------------------------------------------------------------
+
+def test_execute_rejects_tool_outside_allowlist():
+    ex = executor_with("shell", scripted_handler([ok()]))
+    r = run(ex.execute("shell", {}, {}, allowed_tools={"remember"}))
+    assert not r.success
+    assert "not permitted" in r.error
+
+
+def test_execute_allows_tool_inside_allowlist():
+    ex = executor_with("remember", scripted_handler([ok("saved")]))
+    r = run(ex.execute("remember", {}, {}, allowed_tools={"remember", "forget"}))
+    assert r.success
+
+
+def test_execute_allowed_tools_none_is_unrestricted():
+    # Default (no allowed_tools passed) must preserve every existing call
+    # site's behavior -- unrestricted dispatch.
+    ex = executor_with("shell", scripted_handler([ok()]))
+    r = run(ex.execute("shell", {}, {}))
+    assert r.success
+
+
+# ---------------------------------------------------------------------------
+# 23-26. forget -- new T4 delete capability
+# ---------------------------------------------------------------------------
+
+def test_handle_forget_delegates_to_t4_forget():
+    fake = FakeMemoryForForget("Forgot: favorite_food = Biryani")
+    result = run(handle_forget({"key_or_query": "favorite_food"}, {"memory": fake}))
+    assert result.success
+    assert "Forgot" in result.output
+    assert fake.calls == ["favorite_food"]
+
+
+def test_handle_forget_requires_key_or_query():
+    result = run(handle_forget({}, {"memory": FakeMemoryForForget("")}))
+    assert not result.success
+
+
+def test_t4_forget_exact_key_removes_it():
+    mem = _bare_memory({"Preferences": {"favorite_food": "Biryani"}})
+    out = mem.t4_forget("favorite_food")
+    assert "Forgot" in out
+    assert "favorite_food" not in mem._t4_profile["Preferences"]
+
+
+def test_t4_forget_refuses_ambiguous_query_without_deleting():
+    mem = _bare_memory({"Preferences": {
+        "physics_test": "Monday",
+        "physics_doubt_session": "Thursday",
+    }})
+    out = mem.t4_forget("physics")
+    assert "say which one" in out
+    assert "physics_test" in mem._t4_profile["Preferences"]
+    assert "physics_doubt_session" in mem._t4_profile["Preferences"]
+
+
+def test_t4_forget_no_match_is_informational_not_error():
+    mem = _bare_memory({"Preferences": {}})
+    out = mem.t4_forget("nonexistent_thing")
+    assert "No stored fact found" in out
 
 
 def test_verify_mutation_carries_params_to_readback():

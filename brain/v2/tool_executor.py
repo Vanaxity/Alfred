@@ -89,6 +89,7 @@ class Guardrails:
 # Tools that mutate external state (need verification after execution)
 MUTATION_TOOLS: Set[str] = {
     "calendar", "email", "remember", "write_file", "memory_save", "run_code",
+    "forget",
 }
 
 # calendar and email dispatch both reads and writes through a single tool, so
@@ -137,6 +138,12 @@ VERIFY_MAP: Dict[str, Dict[str, Any]] = {
         "read_params": {},
         "carry": {"tier": "tier", "title": "query"},
         "description": "memory search saved tier",
+    },
+    "forget": {
+        "read_tool": "memory_search",
+        "read_params": {"tier": "t4"},
+        "carry": {"key_or_query": "query"},
+        "description": "memory search T4 (should now come up empty)",
     },
 }
 
@@ -330,11 +337,17 @@ class ToolExecutor:
         tool_name: str,
         params: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
+        allowed_tools: Optional[Set[str]] = None,
     ) -> ToolResult:
         """
         Execute a tool with guardrails, validation, and self-correcting retry.
 
         1. Reject unknown tools.
+        1b. If allowed_tools is given, reject anything outside it — a hard
+            deny independent of what the caller's own prompt offered, for
+            callers (e.g. the post-turn memory-curation pass) that must not
+            reach tools beyond a restricted set even if the model
+            hallucinates a name that happens to be registered.
         2. Check guardrails (disabled / deny patterns / approval).
         3. Execute handler and validate the result.
         4. On a mutating call's failure, ask the LLM to correct the params from
@@ -349,6 +362,13 @@ class ToolExecutor:
             return ToolResult(
                 success=False,
                 error=f"Unknown tool: {tool_name}",
+                tool_name=tool_name,
+            )
+
+        if allowed_tools is not None and tool_name not in allowed_tools:
+            return ToolResult(
+                success=False,
+                error=f"Tool '{tool_name}' is not permitted in this context",
                 tool_name=tool_name,
             )
 
@@ -1196,6 +1216,24 @@ async def handle_memory_search(params: Dict, ctx: Dict) -> ToolResult:
     return ToolResult(success=True, output="\n".join(out))
 
 
+async def handle_forget(params: Dict, ctx: Dict) -> ToolResult:
+    """Delete a fact from the long-term profile (T4)."""
+    memory = ctx.get("memory")
+    if not memory:
+        return ToolResult(success=False, error="Memory system unavailable")
+    key_or_query = params.get("key_or_query", "")
+    if not key_or_query:
+        return ToolResult(success=False, error="key_or_query required")
+    try:
+        out = memory.t4_forget(key_or_query.strip())
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+    # "No stored fact found" / an ambiguous-match listing are informational,
+    # not failures -- same convention as delete_event_by_query's calendar
+    # equivalent (gws_client.py).
+    return ToolResult(success=True, output=out)
+
+
 async def handle_weather(params: Dict, ctx: Dict) -> ToolResult:
     """Get weather for a location."""
     loc = params.get("location", "auto")
@@ -1353,6 +1391,7 @@ def create_tool_executor() -> ToolExecutor:
         "remember": handle_remember,
         "memory_save": handle_memory_save,
         "memory_search": handle_memory_search,
+        "forget": handle_forget,
         "weather": handle_weather,
         "run_code": handle_run_code,
     }
