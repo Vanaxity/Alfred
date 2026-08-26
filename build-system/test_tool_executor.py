@@ -47,6 +47,7 @@ from brain.v2 import (  # noqa: E402
 from brain.v2.tool_executor import (  # noqa: E402
     _action_signature,
     _is_safe_path,
+    handle_calculator,
     handle_glob,
     handle_open_app,
 )
@@ -327,7 +328,7 @@ def test_is_mutation_is_action_aware():
     assert ex.is_mutation("email", {"action": "send"})
     # Tools without an action sub-parameter always mutate.
     assert ex.is_mutation("write_file", {"path": "x"})
-    assert ex.is_mutation("set_reminder", {})
+    assert ex.is_mutation("remember", {})
     # Non-mutation tools never do.
     assert not ex.is_mutation("time", {})
     assert not ex.is_mutation("web_search", {"query": "x"})
@@ -455,6 +456,63 @@ def test_glob_blocks_escape_patterns():
             assert "safe directories" in (r.error or ""), r.error
 
 
+def test_calculator_supports_real_trig_word_problems():
+    """The two questions that exposed this gap in live use.
+
+    Before math functions were allowed, `47*tan(35*pi/180)` failed with
+    "Unsupported: Call", so the LLM either fell back to run_code (which needs
+    approval nothing can grant yet) or skipped tools entirely and stated a
+    confidently wrong number.
+    """
+    r = run(handle_calculator({"expression": "47*tan(35*pi/180)"}, {}))
+    assert r.success, r.error
+    assert abs(float(r.output) - 32.9098) < 0.01, r.output
+
+    # Same thing written with radians() instead of the manual conversion.
+    r = run(handle_calculator({"expression": "47*tan(radians(35))"}, {}))
+    assert r.success, r.error
+    assert abs(float(r.output) - 32.9098) < 0.01, r.output
+
+    r = run(handle_calculator({"expression": "8*cos(51*pi/180)"}, {}))
+    assert r.success, r.error
+    assert abs(float(r.output) - 5.0346) < 0.01, r.output
+
+
+def test_calculator_function_and_constant_allowlist():
+    cases = [
+        ("sqrt(144)", 12.0), ("hypot(3,4)", 5.0), ("log10(1000)", 3.0),
+        ("degrees(pi)", 180.0), ("factorial(5)", 120), ("max(3,7)", 7),
+        ("abs(-4)", 4), ("2**10", 1024), ("floor(3.9)", 3), ("ceil(3.1)", 4),
+    ]
+    for expr, want in cases:
+        r = run(handle_calculator({"expression": expr}, {}))
+        assert r.success, f"{expr}: {r.error}"
+        assert abs(float(r.output) - want) < 1e-9, f"{expr} -> {r.output}, want {want}"
+
+
+def test_calculator_refuses_sandbox_escapes():
+    """The allowlist must not become an arbitrary-eval hole.
+
+    ast.Attribute is never evaluated and only bare name(...) calls resolve
+    against the allowlist, so the usual dunder-walk escapes are unreachable.
+    """
+    escapes = [
+        '__import__("os").system("echo pwned")',
+        "math.__loader__",
+        'open("secret.txt")',
+        "(1).__class__",
+        'eval("1+1")',
+        'exec("x=1")',
+        "[].__class__.__base__",
+        "sqrt.__globals__",
+        "globals()",
+        "lambda: 1",
+    ]
+    for expr in escapes:
+        r = run(handle_calculator({"expression": expr}, {}))
+        assert not r.success, f"{expr!r} must be refused, got {r.output!r}"
+
+
 def test_open_app_refuses_shell_metacharacters():
     r = run(handle_open_app({"app_name": "notepad & del *.*"}, {}))
     assert not r.success, "shell metacharacters must never be launched"
@@ -496,9 +554,8 @@ def test_factory_registers_all_tools():
     expected = {
         "time", "chat", "calculator", "calendar", "email", "web_search",
         "web_fetch", "shell", "read_file", "write_file", "list_directory",
-        "glob", "screenshot", "open_app", "gws", "remember", "set_reminder",
-        "list_reminders", "delete_reminder", "memory_save", "memory_search",
-        "weather", "run_code",
+        "glob", "screenshot", "open_app", "gws", "remember",
+        "memory_save", "memory_search", "weather", "run_code",
     }
     missing = expected - set(ex.tool_names)
     assert not missing, f"unregistered tools: {sorted(missing)}"

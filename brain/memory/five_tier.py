@@ -10,10 +10,11 @@ Tier 5: Full-Text Archive (SQLite FTS5 for all past dialogues)
 
 import json
 import os
+import re
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 import sqlite3
 
@@ -324,7 +325,18 @@ class FiveTierMemory:
                     result["recency"] * 0.3
                 )
 
-        results = list(results_dict.values())
+        # Recency must never be the sole reason an episode surfaces -- require
+        # some actual topical signal (vector or keyword) in addition to the
+        # blended score. all-MiniLM-L6-v2 cosine similarity between unrelated
+        # sentences typically sits below ~0.25-0.3; genuine topical matches
+        # usually land well above that. Confirmed live without this: a
+        # just-saved, topically unrelated episode (recency ~1.0) outscored
+        # into the top results and got parroted back for a different task.
+        MIN_TOPICAL_VECTOR = 0.3
+        results = [
+            r for r in results_dict.values()
+            if r["vector_score"] >= MIN_TOPICAL_VECTOR or r["bm25_score"] > 0
+        ]
         results.sort(key=lambda x: x["final_score"], reverse=True)
         return results[:max_results]
 
@@ -537,6 +549,84 @@ class FiveTierMemory:
             if isinstance(data, dict) and key in data:
                 return data[key]
         return default
+
+    _T4_SEARCH_STOPWORDS = {
+        "what", "do", "you", "know", "about", "have", "got", "saved",
+        "tell", "me", "my", "the", "a", "an", "is", "are", "to", "for",
+        "of", "on", "in", "i", "like", "please", "can", "could", "would",
+        "just", "curious", "whats", "hey", "yeah", "any",
+    }
+
+    def t4_search(self, query: str) -> List[Tuple[str, Any]]:
+        """Natural-language search over T4, for queries that don't match a
+        stored key exactly. t4_get() is an exact-key lookup only -- a query
+        like "what do you know about what I like to eat" will never equal
+        the literal key "favorite_food", confirmed live (returned "No
+        memories" despite the fact being present under that key).
+
+        Three layers, cheapest first:
+          1. Exact key match (delegates to t4_get).
+          2. Stopword-stripped keyword overlap against keys AND values --
+             catches most everyday phrasing cheaply, no model call.
+          3. Semantic fallback via the same embedding model T3 already
+             loads (all-MiniLM-L6-v2) -- only reached if 1-2 find nothing,
+             since it's the one layer with real cost. Needed because some
+             real queries share no substring with the answer at all (e.g.
+             "eat" vs. key "favorite_food" / value "Biryani" -- zero
+             lexical overlap, but "eat" and "food" are semantically close).
+
+        Returns a list of (key, value) pairs, best-effort ranked.
+        """
+        if not self._t4_profile:
+            self._t4_profile = self.t4_load_profile()
+
+        for section, data in self._t4_profile.items():
+            if isinstance(data, dict) and query in data:
+                return [(query, data[query])]
+
+        normalized = re.sub(r"[^\w\s]", " ", query.lower())
+        words = {
+            w for w in normalized.split()
+            if w not in self._T4_SEARCH_STOPWORDS and len(w) > 2
+        }
+
+        all_pairs: List[Tuple[str, Any]] = []
+        for section, data in self._t4_profile.items():
+            if isinstance(data, dict):
+                all_pairs.extend(data.items())
+
+        if words:
+            keyword_matches = []
+            for key, val in all_pairs:
+                key_norm = key.lower().replace("_", " ")
+                val_str = str(val).lower()
+                if any(w in key_norm or w in val_str for w in words):
+                    keyword_matches.append((key, val))
+            if keyword_matches:
+                return keyword_matches
+
+        if self._t3_vector_model is not None and all_pairs:
+            try:
+                pair_texts = [f"{k.replace('_', ' ')}: {v}" for k, v in all_pairs]
+                embeddings = self._t3_vector_model.encode(
+                    pair_texts + [query], show_progress_bar=False
+                )
+                query_vec = embeddings[-1]
+                pair_vecs = embeddings[:-1]
+                import numpy as np
+                q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+                scored = []
+                for (key, val), vec in zip(all_pairs, pair_vecs):
+                    v_norm = vec / (np.linalg.norm(vec) + 1e-8)
+                    sim = float(np.dot(q_norm, v_norm))
+                    if sim >= 0.35:  # same floor used for T3 topical relevance
+                        scored.append((sim, key, val))
+                scored.sort(reverse=True)
+                return [(k, v) for _, k, v in scored[:3]]
+            except Exception:
+                pass
+
+        return []
 
     def _save_t4_profile(self) -> None:
         """Persist user profile to disk."""

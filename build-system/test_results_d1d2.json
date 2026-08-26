@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-17T21:33:34.833703",
+  "timestamp": "2026-08-22T13:57:01.095007",
   "total": 11,
   "passed": 10,
   "failed": 1,
@@ -22,25 +22,25 @@
       "id": "B03",
       "name": "Alfred knows career goals (AI/Finance)",
       "passed": true,
-      "detail": "response snippet: 'Your career goals are to become an AI researcher, eventually founding your own AI\u2011focused startup. You\u2019re targeting expe...'"
+      "detail": "response snippet: 'Your career goals, straight from your profile:\n\n**Primary:** AI Research\n**Secondary:** Startup Founder\n\n**Fields you're...'"
     },
     {
       "id": "B04",
       "name": "Alfred knows age/education",
       "passed": true,
-      "detail": "response snippet: 'You\u2019re 15 years old and currently in 10th grade....'"
+      "detail": "response snippet: 'You're 15 years old and in 10th grade....'"
     },
     {
       "id": "B05",
       "name": "Tool command creates T3 episode",
       "passed": true,
-      "detail": "before=653, after=654"
+      "detail": "before=0, after=1"
     },
     {
       "id": "B06",
       "name": "Episode has proper format",
       "passed": true,
-      "detail": "file=Check-my-calendar-for-today-and-get-the-weather_20260817_213302.md, request=True, response=True, details=False"
+      "detail": "file=Check-my-calendar-for-today-and-get-the-weather_20260822_135610.md, request=True, response=True, details=False"
     },
     {
       "id": "B07-B10",
@@ -70,7 +70,7 @@
       "id": "B14",
       "name": "History persists across messages in session",
       "passed": true,
-      "detail": "msg1='OK...' msg2='Your project codename is Phoenix....'"
+      "detail": "msg1='OK....' msg2='Phoenix....'"
     }
   ]
 }

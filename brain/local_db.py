@@ -11,7 +11,7 @@ import json
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 DB_PATH = Path(__file__).parent / "data" / "alfred.db"
 
@@ -262,7 +262,16 @@ class LocalDB:
             for key, value in kwargs.items():
                 if key in ["session_name", "summary", "last_active_at", "is_active"]:
                     fields.append(f"{key} = ?")
-                    values.append(1 if value else 0 if key == "is_active" else value)
+                    # Only is_active is a boolean column. This was previously
+                    # written as `1 if value else 0 if key == "is_active" else value`,
+                    # which Python parses right-associatively as
+                    # `1 if value else (0 if ... else ...)` -- so EVERY truthy
+                    # value became literal 1, silently destroying every summary
+                    # and session_name ever written.
+                    if key == "is_active":
+                        values.append(1 if value else 0)
+                    else:
+                        values.append(value)
             if fields:
                 values.append(session_id)
                 conn.execute(
@@ -341,97 +350,13 @@ class LocalDB:
             conn.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
             conn.commit()
 
-    # ============ REMINDERS ============
-
-    def add_reminder(self, text: str, due_at: str, category: str = "general") -> int:
-        conn = self._get_conn()
-        with self._lock:
-            cur = conn.execute(
-                "INSERT INTO reminders (text, due_at, category) VALUES (?, ?, ?)",
-                (text, due_at, category)
-            )
-            conn.commit()
-            return cur.lastrowid
-
-    def get_due_reminders(self) -> List[Dict]:
-        conn = self._get_conn()
-        with self._lock:
-            rows = conn.execute(
-                "SELECT id, text, due_at, category FROM reminders WHERE fired = 0 AND due_at <= datetime('now')"
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    def mark_reminder_fired(self, reminder_id: int):
-        conn = self._get_conn()
-        with self._lock:
-            conn.execute("UPDATE reminders SET fired = 1 WHERE id = ?", (reminder_id,))
-            conn.commit()
-
-    def list_reminders(self, include_fired: bool = False) -> List[Dict]:
-        conn = self._get_conn()
-        with self._lock:
-            if include_fired:
-                rows = conn.execute("SELECT id, text, due_at, category, fired FROM reminders ORDER BY due_at")
-            else:
-                rows = conn.execute("SELECT id, text, due_at, category FROM reminders WHERE fired = 0 ORDER BY due_at")
-            return [dict(r) for r in rows]
-
-    def delete_reminder(self, reminder_id: int) -> bool:
-        conn = self._get_conn()
-        with self._lock:
-            cur = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
-            conn.commit()
-            return cur.rowcount > 0
-
-    # ============ SCHEDULED TASKS ============
-
-    def add_scheduled_task(self, task: str, cron_expr: str) -> int:
-        conn = self._get_conn()
-        with self._lock:
-            cur = conn.execute(
-                "INSERT INTO scheduled_tasks (task, cron_expr) VALUES (?, ?)",
-                (task, cron_expr)
-            )
-            conn.commit()
-            return cur.lastrowid
-
-    def get_scheduled_tasks(self, active_only: bool = True) -> List[Dict]:
-        conn = self._get_conn()
-        with self._lock:
-            query = "SELECT id, task, cron_expr, last_run FROM scheduled_tasks"
-            if active_only:
-                query += " WHERE active = 1"
-            return [dict(r) for r in conn.execute(query).fetchall()]
-
-    def get_due_scheduled_tasks(self) -> List[Dict]:
-        """Get scheduled tasks whose cron expression matches current time and hasn't run yet."""
-        from croniter import croniter
-        from datetime import datetime
-        tasks = self.get_scheduled_tasks(active_only=True)
-        now = datetime.now()
-        due = []
-        for task in tasks:
-            try:
-                cron = croniter(task["cron_expr"], now)
-                prev_run = cron.get_prev(datetime)
-                last_run = None
-                if task.get("last_run"):
-                    last_run = datetime.fromisoformat(task["last_run"])
-                if last_run is None or prev_run > last_run:
-                    due.append(task)
-            except (ValueError, KeyError):
-                continue
-        return due
+    # ============ SCHEDULED TASKS (legacy v1 path only — see local_db.py) ============
 
     def update_last_run(self, task_id: int):
         conn = self._get_conn()
         with self._lock:
             conn.execute("UPDATE scheduled_tasks SET last_run = datetime('now') WHERE id = ?", (task_id,))
             conn.commit()
-
-    def mark_scheduled_task_run(self, task_id: int):
-        """Alias for update_last_run (used by the v2 cognitive heartbeat)."""
-        self.update_last_run(task_id)
 
 
 # Singleton

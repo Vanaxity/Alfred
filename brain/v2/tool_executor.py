@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+import math
 import operator as op
 import os
 import re
@@ -87,8 +88,7 @@ class Guardrails:
 
 # Tools that mutate external state (need verification after execution)
 MUTATION_TOOLS: Set[str] = {
-    "calendar", "email", "remember", "set_reminder",
-    "delete_reminder", "write_file", "memory_save", "run_code",
+    "calendar", "email", "remember", "write_file", "memory_save", "run_code",
 }
 
 # calendar and email dispatch both reads and writes through a single tool, so
@@ -119,16 +119,6 @@ VERIFY_MAP: Dict[str, Dict[str, Any]] = {
         "read_tool": "email",
         "read_params": {"action": "triage"},
         "description": "email triage",
-    },
-    "set_reminder": {
-        "read_tool": "list_reminders",
-        "read_params": {},
-        "description": "list reminders",
-    },
-    "delete_reminder": {
-        "read_tool": "list_reminders",
-        "read_params": {},
-        "description": "list reminders",
     },
     "remember": {
         "read_tool": "memory_search",
@@ -598,11 +588,18 @@ def _legacy_dict_to_schema(name: str, tool_dict: Dict[str, Any]) -> Dict[str, An
 # ---------------------------------------------------------------------------
 
 async def handle_time(params: Dict, ctx: Dict) -> ToolResult:
-    """Get current date and time."""
-    now = datetime.now()
+    """Get current date and time in this machine's own local timezone only."""
+    now = datetime.now().astimezone()
+    offset = now.strftime("%z")  # e.g. "+0530"
+    offset_fmt = f"UTC{offset[:3]}:{offset[3:]}" if offset else "UTC offset unknown"
+    tz_name = now.tzname() or "local"
     return ToolResult(
         success=True,
-        output=now.strftime("%A, %B %d, %Y at %I:%M %p"),
+        output=(
+            now.strftime("%A, %B %d, %Y at %I:%M %p")
+            + f" ({tz_name}, {offset_fmt}) — this is Master Sam's own device time; "
+              "no other city's or timezone's current time is known."
+        ),
     )
 
 
@@ -654,38 +651,81 @@ async def handle_chat(params: Dict, ctx: Dict) -> ToolResult:
 
 
 async def handle_calculator(params: Dict, ctx: Dict) -> ToolResult:
-    """Evaluate a math expression safely using AST."""
+    """Evaluate a math expression safely using AST.
+
+    Supports arithmetic plus an allowlist of math functions and constants, so
+    real trigonometry/geometry questions work. Without them the LLM's correct
+    first attempt (e.g. `47*tan(35*pi/180)` for an angle-of-elevation problem)
+    failed with "Unsupported: Call", pushing it to fall back to run_code — which
+    needs approval — or, worse, to answer from memory and hallucinate a number.
+    """
     expression = params.get("expression", "0")
     safe_ops = {
         ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
         ast.Div: op.truediv, ast.Pow: op.pow,
-        ast.USub: op.neg, ast.FloorDiv: op.floordiv, ast.Mod: op.mod,
+        ast.USub: op.neg, ast.UAdd: op.pos,
+        ast.FloorDiv: op.floordiv, ast.Mod: op.mod,
     }
+
+    # Allowlist only: no attribute access, no builtins, no names beyond these.
+    safe_funcs = {
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "asin": math.asin, "acos": math.acos, "atan": math.atan,
+        "atan2": math.atan2,
+        "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
+        "sqrt": math.sqrt, "cbrt": lambda x: math.copysign(abs(x) ** (1 / 3), x),
+        "log": math.log, "log2": math.log2, "log10": math.log10, "exp": math.exp,
+        "degrees": math.degrees, "radians": math.radians,
+        "abs": abs, "round": round, "floor": math.floor, "ceil": math.ceil,
+        "min": min, "max": max, "pow": pow,
+        "hypot": math.hypot, "factorial": math.factorial,
+    }
+    safe_consts = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
 
     def _eval(node: ast.AST) -> float:
         if isinstance(node, ast.Expression):
             return _eval(node.body)
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return node.value
+        if isinstance(node, ast.Name):
+            if node.id in safe_consts:
+                return safe_consts[node.id]
+            raise ValueError(f"Unknown name: {node.id}")
         if isinstance(node, ast.UnaryOp) and type(node.op) in safe_ops:
-            return safe_ops[type(node.op)](0, _eval(node.operand))
+            return safe_ops[type(node.op)](_eval(node.operand))
         if isinstance(node, ast.BinOp) and type(node.op) in safe_ops:
             return safe_ops[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.Call):
+            # Only bare `name(...)` calls resolved against the allowlist —
+            # ast.Attribute is never evaluated, so `math.__loader__` etc.
+            # cannot be reached, and keyword/star args are refused outright.
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only direct function calls are allowed")
+            fname = node.func.id
+            if fname not in safe_funcs:
+                raise ValueError(f"Unknown function: {fname}")
+            if node.keywords:
+                raise ValueError("Keyword arguments are not supported")
+            args = [_eval(a) for a in node.args]
+            return safe_funcs[fname](*args)
         raise ValueError(f"Unsupported: {type(node).__name__}")
 
     try:
         tree = ast.parse(expression, mode="eval")
         result = _eval(tree)
-        return ToolResult(
-            success=True,
-            output=str(result) if isinstance(result, (int, float)) else "Invalid",
-        )
+        if not isinstance(result, (int, float)) or isinstance(result, bool):
+            return ToolResult(success=False, error="Calculator error: non-numeric result")
+        # Trig on a calculator produces long floats (32.90862...); round for
+        # readability but keep enough precision for "to the nearest tenth".
+        if isinstance(result, float) and not result.is_integer():
+            result = round(result, 6)
+        return ToolResult(success=True, output=str(result))
     except Exception as e:
         return ToolResult(success=False, error=f"Calculator error: {e}")
 
 
 async def handle_calendar(params: Dict, ctx: Dict) -> ToolResult:
-    """List/create Google Calendar events."""
+    """List/create/delete Google Calendar events."""
     try:
         from ..tools.gws_client import GWSClient
         client = GWSClient()
@@ -700,6 +740,11 @@ async def handle_calendar(params: Dict, ctx: Dict) -> ToolResult:
             out = client.get_agenda(days=14)
         elif act == "create":
             out = _calendar_create(client, params)
+        elif act == "delete":
+            query = params.get("summary") or params.get("query", "")
+            if not query:
+                return ToolResult(success=False, error="delete needs a summary/query naming the event")
+            out = client.delete_event_by_query(query)
         else:
             out = client.get_agenda()
 
@@ -1095,53 +1140,6 @@ async def handle_remember(params: Dict, ctx: Dict) -> ToolResult:
     return ToolResult(success=False, error="Memory system unavailable")
 
 
-async def handle_set_reminder(params: Dict, ctx: Dict) -> ToolResult:
-    """Set a reminder."""
-    text = params.get("text", "")
-    when = params.get("when", "")
-    cat = params.get("category", "general")
-    if not text or not when:
-        return ToolResult(success=False, error="text and when required")
-    db = ctx.get("db")
-    if db:
-        try:
-            rid = db.add_reminder(text, when, cat)
-            return ToolResult(success=True, output=f"Reminder set: '{text}' at {when} (ID: {rid})")
-        except Exception as e:
-            return ToolResult(success=False, error=str(e))
-    return ToolResult(success=False, error="Database unavailable")
-
-
-async def handle_list_reminders(params: Dict, ctx: Dict) -> ToolResult:
-    """List pending reminders."""
-    db = ctx.get("db")
-    if not db:
-        return ToolResult(success=False, error="Database unavailable")
-    inc = params.get("include_fired", "").lower() == "true"
-    try:
-        rems = db.list_reminders(inc)
-        if not rems:
-            return ToolResult(success=True, output="No reminders.")
-        lines = [f"- ID {r['id']}: {r['text']} (due: {r['due_at']})" for r in rems]
-        return ToolResult(success=True, output="\n".join(lines))
-    except Exception as e:
-        return ToolResult(success=False, error=str(e))
-
-
-async def handle_delete_reminder(params: Dict, ctx: Dict) -> ToolResult:
-    """Delete a reminder by ID."""
-    db = ctx.get("db")
-    if not db:
-        return ToolResult(success=False, error="Database unavailable")
-    try:
-        rid = int(params.get("id", 0))
-        if db.delete_reminder(rid):
-            return ToolResult(success=True, output=f"Reminder {rid} deleted.")
-        return ToolResult(success=False, error=f"Reminder {rid} not found.")
-    except (ValueError, TypeError):
-        return ToolResult(success=False, error="Invalid ID")
-
-
 async def handle_memory_save(params: Dict, ctx: Dict) -> ToolResult:
     """Save to memory (T3/T4/T5)."""
     memory = ctx.get("memory")
@@ -1182,9 +1180,12 @@ async def handle_memory_search(params: Dict, ctx: Dict) -> ToolResult:
             for r in memory.t3_find_episodes(q, max_results=3):
                 out.append(f"[T3] {r['title']} (score:{r['final_score']:.2f})")
         if tier in ("t4", "all"):
-            v = memory.t4_get(q)
-            if v:
-                out.append(f"[T4] {q}: {v}")
+            # t4_get is an exact key-name lookup, so a natural-language query
+            # ("what do you know about my doubt session") will not match a
+            # stored key ("physics_doubt_session"). t4_search handles that:
+            # exact match, then keyword overlap, then semantic fallback.
+            for k, val in memory.t4_search(q):
+                out.append(f"[T4] {k}: {val}")
         if tier in ("t5", "all"):
             for r in memory.t5_search(q, max_results=3):
                 out.append(f"[T5] {r['title']}: {r['snippet']}")
@@ -1350,9 +1351,6 @@ def create_tool_executor() -> ToolExecutor:
         "open_app": handle_open_app,
         "gws": handle_gws,
         "remember": handle_remember,
-        "set_reminder": handle_set_reminder,
-        "list_reminders": handle_list_reminders,
-        "delete_reminder": handle_delete_reminder,
         "memory_save": handle_memory_save,
         "memory_search": handle_memory_search,
         "weather": handle_weather,

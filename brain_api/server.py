@@ -45,7 +45,6 @@ from brain_api.models import (
     TaskInfo,
     HealthResponse,
     AlfredStatus,
-    PhaseInfo,
 )
 from brain import get_alfred, get_memory, get_skill_manager
 from brain.local_db import get_local_db
@@ -103,12 +102,8 @@ async def lifespan(app: FastAPI):
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 
-    # Start alert broadcaster for reminders
-    alert_task = asyncio.create_task(_alert_broadcaster())
-
     yield
 
-    alert_task.cancel()
     print("\nShutting down Alfred Brain API...")
     stop_ngrok()
 
@@ -223,21 +218,6 @@ async def broadcast_to_clients(message: dict):
     CONNECTED_CLIENTS.difference_update(disconnected)
 
 
-async def _alert_broadcaster():
-    """Periodically check for pending alerts and broadcast via WebSocket."""
-    try:
-        while True:
-            await asyncio.sleep(5)
-            alfred = get_alfred()
-            alerts = alfred.pop_alerts()
-            for alert in alerts:
-                await broadcast_to_clients(alert)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        print(f"[Alerts] Broadcaster error: {e}")
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time communication."""
@@ -313,8 +293,10 @@ async def api_command(data: Dict):
     result = await process_chat(message, session_id, approved_actions)
     return {
         "response": result.response,
+        "session_id": result.session_id,
         "thinking": result.thinking if hasattr(result, 'thinking') else [],
         "awaiting_approval": result.awaiting_approval if hasattr(result, 'awaiting_approval') else None,
+        "episode_path": result.episode_path,
     }
 
 
@@ -357,6 +339,18 @@ async def process_chat(
                     if len(updated) > 2000:
                         updated = updated[-2000:]
                     db.update_session(session_id, summary=updated)
+
+                    # Name the session after the FIRST thing the user said, set
+                    # once and then left alone -- a title that keeps changing to
+                    # the latest message makes the sidebar useless for finding
+                    # an old conversation.
+                    if not (session.get("session_name") or "").strip():
+                        title = " ".join(user_message.split())[:60]
+                        if len(" ".join(user_message.split())) > 60:
+                            title = title.rstrip() + "..."
+                        if title:
+                            db.update_session(session_id, session_name=title)
+
                     db.touch_session(session_id)
             except Exception:
                 pass
@@ -364,17 +358,14 @@ async def process_chat(
         return ChatResponse(
             response=response_text,
             status=AlfredStatus.IDLE,
-            phase=PhaseInfo(
-                current=result.get("phase", "completed"),
-                step=1,
-                total_steps=len(result.get("steps", [])),
-                message="",
-            ),
-            skill_used=result.get("skill_used", False),
-            skill_generated=result.get("skill_generated", False),
-            steps=result.get("steps", []),
             session_id=session_id,
             thinking=result.get("thinking", []),
+            tools_called=result.get("tools_called", []),
+            tool_results=result.get("tool_results", []),
+            episodes_saved=result.get("episodes_saved", 0),
+            episode_path=result.get("episode_path"),
+            skill_used=result.get("skill_used", False),
+            skill_generated=result.get("skill_generated", False),
             awaiting_approval=result.get("awaiting_approval"),
         )
 
@@ -383,6 +374,7 @@ async def process_chat(
             response=f"I encountered an error: {str(e)}",
             status=AlfredStatus.ERROR,
             session_id=session_id,
+            thinking=[f"[Error] {str(e)}"],
         )
 
 

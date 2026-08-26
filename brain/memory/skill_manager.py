@@ -25,7 +25,6 @@ VALID_TOOLS: set = {
     "chat", "calculator", "calendar", "email", "web_search", "web_fetch",
     "shell", "read_file", "write_file", "list_directory", "glob",
     "screenshot", "gws", "open_app", "time", "remember",
-    "set_reminder", "list_reminders", "delete_reminder",
     "memory_save", "memory_search", "weather", "run_code",
 }
 

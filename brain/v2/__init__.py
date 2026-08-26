@@ -6,7 +6,6 @@ Modules:
     context_manager  — Conversation token tracking and compression
     tool_executor    — Modular tool dispatch with guardrails and validation
     conversation     — Main LLM→tool→LLM loop with role alternation
-    heartbeat        — Cognitive heartbeat with proactive reasoning and cron
 
 Public API (preserves existing interface for brain_api/server.py):
     get_alfred()     — Returns the Alfred v2 singleton

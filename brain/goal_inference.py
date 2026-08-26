@@ -133,7 +133,6 @@ class GoalExpander:
             "tasks": "Show and manage task list",
             "weather in": "Get weather for specific location",
             "time": "Get the current time and date",
-            "remind me": "Set a reminder or show existing reminders",
             "remember": "Save or recall information from memory",
             "calculate": "Perform a mathematical calculation",
             "math": "Perform a mathematical calculation",
@@ -181,8 +180,6 @@ class GoalExpander:
             tools.append("read_file")
         if "time" in goal_lower:
             tools.append("time")
-        if "remind" in goal_lower:
-            tools.append("set_reminder")
         if "calculate" in goal_lower or "math" in goal_lower:
             tools.append("calculator")
         if "screenshot" in goal_lower:
