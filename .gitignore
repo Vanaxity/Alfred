@@ -145,3 +145,6 @@ config.local.json
 
 # Isolated test vault for the live suite (regenerated every run, not source)
 /build-system/.test_vault/
+
+# Graphify codebase knowledge graph (regenerated via `graphify update .`, not source)
+/graphify-out/
