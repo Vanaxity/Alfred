@@ -736,10 +736,23 @@ class FiveTierMemory:
         sanitized = _re.sub(r'\s+', ' ', sanitized).strip()
         if not sanitized:
             return []
+        # Wrap each term as its own FTS5 quoted phrase (doubling any internal
+        # double-quotes to escape them). A bare apostrophe -- e.g. "myself's",
+        # "user's" -- is not itself in the stripped character class above, but
+        # FTS5's own query-syntax parser (not just SQL string parsing, which
+        # the "?" binding already protects against) throws "syntax error near
+        # '\''" on an unquoted term containing one. Quoting each term forces
+        # FTS5 to treat it as a literal phrase instead of parsing it as query
+        # syntax, which sidesteps the crash while preserving the original
+        # implicit-AND-across-terms, order-independent matching. Confirmed
+        # live: "Send a test email to myself with subject 'Phase 1 Test'..."
+        # crashed memory_search before this fix.
+        terms = [t for t in sanitized.split(' ') if t]
+        fts_query = ' '.join('"' + t.replace('"', '""') + '"' for t in terms)
         cursor = self._t5_db.execute(
             "SELECT rowid, title, snippet(archive_fts, 1, '<mark>', '</mark>', '...', 32) "
             "FROM archive_fts WHERE archive_fts MATCH ? LIMIT ?",
-            (sanitized, max_results),
+            (fts_query, max_results),
         )
 
         results = []

@@ -343,7 +343,14 @@ class Alfred:
                 "params": {"pattern": "**/*.py"},
             },
             "screenshot": {
-                "description": "Take a screenshot.",
+                "description": (
+                    "Take a screenshot of the current screen right now — runs "
+                    "immediately, no approval needed. USE THIS directly for any "
+                    "'screenshot'/'what's on my screen' request. Do NOT reach for "
+                    "run_code to write a PyAutoGUI/PIL screenshot script — that "
+                    "needs human approval and stalls the conversation for "
+                    "something this tool already does in one call."
+                ),
                 "params": {},
             },
             "open_app": {
@@ -418,7 +425,13 @@ class Alfred:
                 "params": {"location": "City or 'auto'"},
             },
             "run_code": {
-                "description": "Execute Python or PowerShell safely.",
+                "description": (
+                    "Execute Python or PowerShell code for a task with no dedicated "
+                    "tool. Requires human approval before it runs, so a plan that "
+                    "starts with run_code stalls the conversation. Do NOT use this "
+                    "to take a screenshot (use screenshot — runs immediately, no "
+                    "approval) or for anything else a dedicated tool already covers."
+                ),
                 "params": {"code": "Code", "language": "python/shell"},
             },
         }

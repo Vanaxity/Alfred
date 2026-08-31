@@ -961,7 +961,16 @@ async def handle_web_fetch(params: Dict, ctx: Dict) -> ToolResult:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url, follow_redirects=True)
             text = BeautifulSoup(r.text, "html.parser").get_text(separator="\n", strip=True)
-            return ToolResult(success=True, output=text[:3000])
+            # 3000 chars was live-verified as this page.
+            # Found stale during the 2026-08-27 tool audit: the page's own nav/
+            # boilerplate had grown enough that the previously-verified content
+            # now starts at index ~3039, just past the old cutoff -- Alfred
+            # truthfully reported a cut-off page rather than guessing, but
+            # couldn't answer. No fixed cap survives a page growing forever;
+            # 6000 is a cheap, modest bump that covers today's real case (whole
+            # page is 5581 chars) without ballooning context, not a guarantee
+            # against a page that keeps growing.
+            return ToolResult(success=True, output=text[:6000])
     except Exception as e:
         return ToolResult(success=False, error=str(e))
 
