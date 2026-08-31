@@ -68,6 +68,17 @@ dated status entries for the full detail):
   need to be fully solved this week, but needs a real answer, not a guess.
 - Set up the autonomy system itself (see below) so weeks 2-5 can actually
   run semi-unattended.
+- **Phase 1 exit gate, manual, Sam only — not automated, not the cloud
+  routine's job:** a real pentest against the running app via
+  [Strix](https://github.com/usestrix/strix) (open-source AI pentesting,
+  59k★, Apache 2.0). Needs Docker locally, which isn't installed yet —
+  Sam's explicit call (2026-08-31): defer this to the last step before
+  Phase 1 is considered done, run it by hand rather than through Docker
+  install automation or Strix's managed cloud (which would mean sending
+  Alfred's code/running app to a third-party service). Q2's code-level
+  audit (missing-auth check on `/chat`/`/api/command`) still happens
+  earlier and separately — this is the dynamic, exploit-validated pass
+  on top of that, not a replacement for it.
 
 ### Week 2 (Sep 3 – 9): Phase 2 — MCP client + first real connectors
 

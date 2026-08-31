@@ -7,6 +7,20 @@ don't rewrite history — newest entries at the top.
 
 ---
 
+## 2026-08-31 — Strix pentesting slotted in as a Phase 1 exit gate
+
+- Sam surfaced [Strix](https://github.com/usestrix/strix) (open-source AI
+  pentesting, 59k★, real/legit, Apache 2.0) for dynamic pentesting of
+  Alfred. Verified: needs Docker locally, not installed on this machine.
+- Sam's decision: don't install Docker or use Strix's managed cloud (would
+  mean sending Alfred's code/running app to a third party) right now.
+  Added to `ROADMAP.md` as a **manual, Sam-only, Phase-1-exit-gate** item
+  instead — last step before Phase 1 is considered done, not something
+  the cloud routine or I do autonomously.
+- Q2's code-level audit (missing-auth check) is unaffected and separate —
+  still in progress via the cloud routine, still happens earlier than the
+  Strix gate.
+
 ## 2026-08-31 — Autonomy system wired up live
 
 - Researched loop-engineering principles (5 sources) before building, per
