@@ -122,6 +122,50 @@ def test_connect_all_with_no_config_file_is_a_safe_noop():
         mcp_client_module.CONFIG_PATH = original
 
 
+def test_connect_one_returns_empty_list_and_does_not_raise_on_spawn_failure():
+    """connect_all()'s per-server try/except was extracted into
+    connect_one() so a live install can target a single new server --
+    this checks the extraction kept the 'one bad server can't take down
+    Alfred' behavior."""
+    manager = MCPClientManager()
+    discovered = run(manager.connect_one(
+        "broken", {"command": "definitely-not-a-real-executable-xyz", "args": []},
+    ))
+    assert discovered == []
+
+
+def test_connect_all_delegates_to_connect_one_per_server(monkeypatch=None):
+    """connect_all() should now be a thin loop over connect_one() -- verify
+    it still aggregates results from multiple configured servers rather
+    than the refactor silently dropping the loop body."""
+    manager = MCPClientManager()
+    calls = []
+
+    async def fake_connect_one(name, spec):
+        calls.append(name)
+        return [(name, "some_tool", object())]
+
+    manager.connect_one = fake_connect_one
+    import brain.mcp_client as mcp_client_module
+    import json
+    import tempfile
+    import os as _os
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    _os.close(fd)
+    Path(path).write_text(json.dumps({"mcpServers": {"a": {"command": "x"}, "b": {"command": "y"}}}))
+    original = mcp_client_module.CONFIG_PATH
+    mcp_client_module.CONFIG_PATH = Path(path)
+    try:
+        discovered = run(manager.connect_all())
+    finally:
+        mcp_client_module.CONFIG_PATH = original
+        _os.remove(path)
+
+    assert sorted(calls) == ["a", "b"]
+    assert len(discovered) == 2
+
+
 def test_connect_all_is_idempotent():
     manager = MCPClientManager()
     manager._connected = True  # simulate already having connected

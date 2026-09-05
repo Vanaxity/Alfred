@@ -25,6 +25,53 @@ so far.
 
 ---
 
+## 2026-09-06 — Phase 2 stretch: find_mcp_server + live install shipped
+
+Closed the gap the generic client left: a human still had to know an
+exact npm package name and hand-edit `mcp_servers.json`. Now Alfred can
+find and add a server itself from a plain description.
+
+- `find_mcp_server` (read-only, no approval): searches the **official
+  MCP registry** (`registry.modelcontextprotocol.io`) — confirmed live
+  during planning that this now exists and has a real search API, so the
+  original plan's npm-heuristic fallback wasn't needed. Filters to npm
+  packages (the only kind `mcp_client.py` can stdio-spawn), returns up to
+  3 candidates with package name and required/secret env vars flagged.
+- `install_mcp_server` (approval-gated, same tier as `shell`/`run_code`):
+  writes the entry to `mcp_servers.json` and connects it **live, no
+  restart** — refactored `MCPClientManager.connect_all()`'s per-server
+  body into a reusable `connect_one()`/`_register_mcp_tool()` pair so a
+  single new server can be added without touching the startup-only path.
+- New system-prompt rule: never invent a value for a required/secret env
+  var `find_mcp_server` flagged — ask Sam first.
+- **Two real bugs found and fixed via live testing, not caught by mocks**:
+  1. A bad/typo'd command could block the event loop for 20-100+s before
+     failing — traced to a Windows OS command-resolution shim, not our
+     code. Fixed with a `shutil.which()` pre-check (fails in ~0.06s) plus
+     a 20s `asyncio.wait_for` as defense for a server that spawns but
+     hangs mid-handshake.
+  2. **The live-install path silently broke every session it created.**
+     Calling `connect_one()` from an HTTP request task (as opposed to the
+     app lifespan's own long-lived task) crashed with `RuntimeError:
+     Attempted to exit a cancel scope that isn't the current task's
+     current cancel scope` once the request finished — anyio ties a
+     cancel scope to the task that opened it. The install itself
+     reported success, but the very next tool call on that server failed
+     with "Connection closed." Fixed by routing every actual
+     spawn/connect/disconnect through one persistent worker task owned by
+     `MCPClientManager`, regardless of which task calls the public
+     methods — verified live: install → real tool call → real result,
+     twice, zero errors in the server log either time.
+- **Live-verified end-to-end for real**: real registry search against the
+  production API: real approval-gated install of
+  `@modelcontextprotocol/server-filesystem` under a new name; a real
+  follow-up tool call on the newly-installed server returned a real
+  directory listing, all in the same running process. Test episodes this
+  generated in the real Obsidian vault were archived out afterward — not
+  genuine user conversations.
+- 21 new mocked tests (`test_find_mcp_server.py` + additions to
+  `test_mcp_client.py`), full suite 119/119.
+
 ## 2026-09-05 — Phase 2: generic MCP client shipped and live-verified
 
 Sam's real ask, once we got past "which connector first": Alfred should

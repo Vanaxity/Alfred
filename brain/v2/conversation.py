@@ -167,25 +167,67 @@ class Alfred:
         client = get_mcp_client()
         discovered = await client.connect_all()
         for server_name, tool_name, tool in discovered:
-            full_name = f"{server_name}__{tool_name}"
-            handler = client.make_handler(server_name, tool_name)
-            # Default to require_approval: an arbitrary third-party MCP
-            # server is closer to shell/run_code in trust level than a
-            # built-in tool, at least until it's been used long enough to
-            # trust -- not something to skip past a human decision for a
-            # server nobody's vetted yet.
-            self._tool_executor.register(
-                full_name, handler, guardrails=Guardrails(require_approval=True),
-            )
-            self._mcp_tool_schemas[full_name] = {
-                "description": (tool.description or f"MCP tool from '{server_name}'.")
-                + " (Requires approval before running -- third-party MCP server.)",
-                "params": tool.input_schema or {},
-            }
+            self._register_mcp_tool(server_name, tool_name, tool)
+
+    def _register_mcp_tool(self, server_name: str, tool_name: str, tool: Any) -> str:
+        """Register one MCP-discovered tool through the same
+        ToolExecutor.register() every built-in tool uses, and add its
+        schema so it actually reaches the LLM (see _get_tool_descriptions).
+        Shared by connect_mcp_servers() (startup, all servers) and
+        install_mcp_server() (live, one new server). Returns the
+        registered tool's full name."""
+        from ..mcp_client import get_mcp_client
+        from .tool_executor import Guardrails
+
+        full_name = f"{server_name}__{tool_name}"
+        handler = get_mcp_client().make_handler(server_name, tool_name)
+        # Default to require_approval: an arbitrary third-party MCP
+        # server is closer to shell/run_code in trust level than a
+        # built-in tool, at least until it's been used long enough to
+        # trust -- not something to skip past a human decision for a
+        # server nobody's vetted yet.
+        self._tool_executor.register(
+            full_name, handler, guardrails=Guardrails(require_approval=True),
+        )
+        self._mcp_tool_schemas[full_name] = {
+            "description": (tool.description or f"MCP tool from '{server_name}'.")
+            + " (Requires approval before running -- third-party MCP server.)",
+            "params": tool.input_schema or {},
+        }
+        return full_name
 
     async def disconnect_mcp_servers(self) -> None:
         from ..mcp_client import get_mcp_client
         await get_mcp_client().disconnect_all()
+
+    async def install_mcp_server(
+        self,
+        name: str,
+        command: str,
+        args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        """The live-install path find_mcp_server's proposals feed into:
+        write a new entry to mcp_servers.json, spawn it immediately (no
+        Alfred restart), and register whatever tools it exposes. Returns
+        the list of newly-registered full tool names (empty on failure --
+        connect_one() already swallows and logs the underlying error)."""
+        from ..mcp_client import get_mcp_client, CONFIG_PATH
+
+        config: Dict[str, Any] = {"mcpServers": {}}
+        if CONFIG_PATH.exists():
+            try:
+                config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        spec: Dict[str, Any] = {"command": command, "args": args or []}
+        if env:
+            spec["env"] = env
+        config.setdefault("mcpServers", {})[name] = spec
+        CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+        discovered = await get_mcp_client().connect_one(name, spec)
+        return [self._register_mcp_tool(sn, tn, tool) for sn, tn, tool in discovered]
 
     # ------------------------------------------------------------------
     # Bootstrap
@@ -238,6 +280,7 @@ class Alfred:
             "CRITICAL: A standing or recurring fact about the user ('from now on...', 'permanently...', 'every week...', 'no longer...') is a `remember` call, not silent acknowledgement — always persist it.",
             "If the question contains a contradiction or impossible premise (e.g. a right triangle whose leg exceeds its hypotenuse, a date that doesn't exist), SAY SO and stop. Never silently reinterpret the numbers into something solvable — for homework, a confident answer to a broken question is worse than no answer.",
             "If a required detail is genuinely missing (a time, a name, a value), ASK for it. Never invent it and never quietly assume a default.",
+            "When find_mcp_server returns a candidate with required or secret environment variables, ASK Master Sam for the actual values before calling install_mcp_server — never invent a placeholder credential.",
             "Before you reply that something is done, check you finished EVERY part of it. If a request had two parts and you did one, say exactly which part is still outstanding — never describe a half-finished action as complete.",
             "Prefer calculator over run_code for anything calculator supports; run_code needs approval and is slower.",
             "Translate raw tool output into natural language — never dump JSON, IDs, or technical errors.",
@@ -482,6 +525,32 @@ class Alfred:
                 ),
                 "params": {"code": "Code", "language": "python/shell"},
             },
+            "find_mcp_server": {
+                "description": (
+                    "Search the official MCP registry for a server matching a plain "
+                    "description (e.g. 'slack', 'a music player', 'jira issues'). "
+                    "Returns up to 3 candidates with their package name and any "
+                    "required environment variables. Read-only — does not install "
+                    "or run anything, so it needs no approval."
+                ),
+                "params": {"query": "plain description of what to connect to"},
+            },
+            "install_mcp_server": {
+                "description": (
+                    "Add a new MCP server to mcp_servers.json and connect to it "
+                    "live (no restart needed), using a candidate returned by "
+                    "find_mcp_server. Requires human approval — this runs arbitrary "
+                    "third-party code via npx. Never invent a value for a "
+                    "required/secret env var find_mcp_server flagged; ask Master "
+                    "Sam for it first."
+                ),
+                "params": {
+                    "name": "short unique name for the server, e.g. 'slack'",
+                    "command": "usually 'npx'",
+                    "args": "e.g. ['-y', '<package-identifier>']",
+                    "env": "optional dict of environment variables the server needs",
+                },
+            },
         }
         # getattr, not self._mcp_tool_schemas directly: several existing
         # tests build a bare Alfred via object.__new__() to test one method
@@ -719,6 +788,7 @@ class Alfred:
             "db": self.db,
             "router": self._router,
             "bootstrap": self._bootstrap,
+            "install_mcp_server": self.install_mcp_server,
             "approved_actions": (context or {}).get("approved_actions") or [],
         }
 

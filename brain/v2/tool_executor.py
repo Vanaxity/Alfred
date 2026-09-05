@@ -180,6 +180,9 @@ TOOL_GUARDRAILS: Dict[str, Guardrails] = {
         deny_patterns=list(_DESTRUCTIVE_PATTERNS),
     ),
     "open_app": Guardrails(require_approval=True),
+    # Spawns arbitrary third-party code via npx -- same trust tier as
+    # shell/run_code, not the read-only find_mcp_server that proposes it.
+    "install_mcp_server": Guardrails(require_approval=True),
 }
 
 # Handler type: async function(params, context) -> ToolResult
@@ -1260,6 +1263,93 @@ async def handle_weather(params: Dict, ctx: Dict) -> ToolResult:
         return ToolResult(success=False, error=str(e))
 
 
+async def handle_find_mcp_server(params: Dict, ctx: Dict) -> ToolResult:
+    """Search the official MCP registry for a server matching a plain
+    description. Read-only -- installs nothing, so no guardrail entry."""
+    query = (params.get("query") or "").strip()
+    if not query:
+        return ToolResult(success=False, error="query required, e.g. 'slack' or 'a music player'")
+    try:
+        import requests
+        r = requests.get(
+            "https://registry.modelcontextprotocol.io/v0/servers",
+            params={"search": query, "limit": 5},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return ToolResult(success=False, error=f"MCP registry search failed: {e}")
+
+    candidates = []
+    for entry in data.get("servers", []):
+        server = entry.get("server", {})
+        # Only npm packages are installable today -- mcp_client.py's spawn
+        # model only knows command/args/env (stdio), matching what
+        # mcp_servers.json already expects. Docker/binary packages the
+        # registry may list can't be proposed without silently failing later.
+        npm_pkgs = [p for p in server.get("packages", []) if p.get("registryType") == "npm"]
+        if not npm_pkgs:
+            continue
+        pkg = npm_pkgs[0]
+        env_vars = pkg.get("environmentVariables", [])
+        candidates.append({
+            "name": server.get("name", "?"),
+            "description": server.get("description", ""),
+            "package": pkg.get("identifier", "?"),
+            "required_env": [v["name"] for v in env_vars if v.get("isRequired")],
+            "secret_env": [v["name"] for v in env_vars if v.get("isSecret")],
+        })
+        if len(candidates) >= 3:
+            break
+
+    if not candidates:
+        return ToolResult(success=False, error=f"No installable (npm-packaged) MCP server found for '{query}'")
+
+    lines = []
+    for c in candidates:
+        line = f"- {c['name']}: {c['description']} (package: {c['package']})"
+        if c["required_env"]:
+            line += f" -- needs env vars: {', '.join(c['required_env'])}"
+            if c["secret_env"]:
+                line += f" (secret: {', '.join(c['secret_env'])} -- ask Master Sam, never invent a value)"
+        lines.append(line)
+    return ToolResult(success=True, output="\n".join(lines))
+
+
+async def handle_install_mcp_server(params: Dict, ctx: Dict) -> ToolResult:
+    """Add a new MCP server to mcp_servers.json and connect it live. The
+    actual write+spawn+register logic lives on the Alfred instance
+    (install_mcp_server), reached here via ctx -- same pattern as
+    memory/router/bootstrap, since this handler has no instance access
+    of its own."""
+    install = ctx.get("install_mcp_server")
+    if install is None:
+        return ToolResult(success=False, error="MCP install is not available in this context")
+
+    name = (params.get("name") or "").strip()
+    command = (params.get("command") or "").strip()
+    args = params.get("args") or []
+    env = params.get("env") or None
+    if not name or not command:
+        return ToolResult(success=False, error="install_mcp_server needs at least 'name' and 'command'")
+
+    try:
+        new_tools = await install(name, command, args, env)
+    except Exception as e:
+        return ToolResult(success=False, error=f"Failed to install MCP server '{name}': {e}")
+
+    if not new_tools:
+        return ToolResult(
+            success=False,
+            error=f"Connected to '{name}' but it exposed no tools -- check the server actually started correctly",
+        )
+    return ToolResult(
+        success=True,
+        output=f"Installed '{name}' -- {len(new_tools)} tool(s) now available: {', '.join(new_tools)}",
+    )
+
+
 async def handle_run_code(params: Dict, ctx: Dict) -> ToolResult:
     """Execute Python or PowerShell safely."""
     code = params.get("code", "")
@@ -1403,6 +1493,8 @@ def create_tool_executor() -> ToolExecutor:
         "forget": handle_forget,
         "weather": handle_weather,
         "run_code": handle_run_code,
+        "find_mcp_server": handle_find_mcp_server,
+        "install_mcp_server": handle_install_mcp_server,
     }
 
     for name, handler in builtin_tools.items():
