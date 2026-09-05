@@ -80,22 +80,29 @@ dated status entries for the full detail):
   earlier and separately — this is the dynamic, exploit-validated pass
   on top of that, not a replacement for it.
 
-### Week 2 (Sep 3 – 9): Phase 2 — MCP client + first real connectors
+### Week 2 (Sep 3 – 9, started Sep 5): Phase 2 — MCP client + one real connector
+
+**Rescoped 2026-09-05** (Sam's call): Phase 2 is now already 2 days into a
+7-day window. Cut to what's actually tractable in what's left, push the
+rest to Phase 3 rather than let schedule slip get silently absorbed:
 
 - Build `brain/mcp_client.py`: reads `mcp_servers.json`, spawns servers,
   discovers tools via `tools/list`, registers them dynamically — no
   hardcoding, per the manifesto's own spec.
-- Ship 2-3 real connectors, prioritized by what Sam actually uses day to
-  day over "impressive but unused": Filesystem MCP (near-free, already
-  half-built via the existing safe-path file tools), then Sam's pick of
-  Google Drive/Sheets/Docs or one messaging platform (Slack/Discord/
-  Telegram/WhatsApp).
-- Proactive memory surfacing (the relocated heartbeat + GBrain's
-  confidence-gated push-context) — the manifesto already specs this as one
-  build, not two.
+- Ship the Filesystem MCP connector (near-free — the safe-path file tools
+  already exist server-side) plus **one** more real connector, Sam's pick.
+  Originally 2-3 connectors; cut to one beyond filesystem for this window.
+- **Moved to Phase 3**: proactive memory surfacing (the relocated
+  heartbeat + GBrain's confidence-gated push-context) and any further
+  connectors beyond the one above. This isn't wiring — it's new behavior
+  design with a feedback loop that has to calibrate over time, the part
+  of original Phase 2 most likely to have eaten the schedule if kept here.
 
-### Week 3 (Sep 10 – 16): Phase 3 — Tool Forge, self-audit, entity graph
+### Week 3 (Sep 10 – 16): Phase 3 — Tool Forge, self-audit, entity graph, proactive surfacing
 
+- **Carried over from Phase 2's rescoping**: proactive memory surfacing
+  (relocated heartbeat + GBrain's confidence-gated push-context) and any
+  MCP connectors beyond the one Week 2 ships.
 - Finish Tool Forge: the markdown-skill → executable-Python conversion path
   (skill used 3+ times → LLM-generated function → sandboxed validation →
   registered tool). `improve_skill()`'s wiring from this week is the down
