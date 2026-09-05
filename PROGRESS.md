@@ -7,6 +7,71 @@ don't rewrite history — newest entries at the top.
 
 ---
 
+## 2026-09-05 — Q8 speed audit: turn-latency instrumentation + one real parallelization win
+
+- **Cloud routine's GitHub write access is back.** The previous entry below
+  documented every write (`git push`, GitHub MCP write tools) 403ing from
+  this cloud sandbox. Tested it directly this run (throwaway branch push +
+  delete) before doing any real work: push succeeded cleanly. Something
+  changed since the last entry (presumably Sam granting the write scope
+  described there) — this run's branch/PR proves it end-to-end.
+- **Picked up Q8 (the Week 1 speed audit)** since Q2 is now closed and the
+  autonomy system is already live — next unblocked, code-only item on the
+  roadmap (hardware ordering and the Strix pentest are both explicitly
+  Sam-only/manual, not this routine's job).
+- **Instrumented `Alfred.execute()` in `brain/v2/conversation.py`** with
+  real wall-clock timing per phase, answering the roadmap's actual question
+  ("where does a turn's time go") instead of guessing: goal expansion,
+  skill matching, the T3 memory-snippet fetch, prompt building (summed
+  across turns), LLM calls (summed), tool execution (summed), mutation
+  verification (summed), compression (summed), and total. Returned as a new
+  `timings` dict on the response (additive — `brain_api/server.py`'s
+  `ChatResponse` schema untouched, nothing consumes it there yet) and also
+  appended as a one-line human-readable `[Timing] ...` entry in `thinking`,
+  so it's visible in the existing UI/logs with zero new plumbing.
+- **Found and fixed one genuine parallelization win while instrumenting**:
+  before the main loop, goal expansion (`goal_expander.expand`, an LLM call)
+  and skill matching ran sequentially, then `_get_memory_snippets` ran
+  *after* both — but the memory-snippet fetch only depends on the raw task
+  text, not on either of those, so it was paying its own wall-clock time
+  stacked on top for no reason. Now it starts concurrently
+  (`asyncio.to_thread` + `asyncio.create_task`) and is only awaited once
+  needed. `memory_snippets_wait_ms` in the new timing breakdown is the
+  actual regression guard here: it stays near zero when the overlap is
+  working and rises if the fetch ever becomes the new tail latency.
+- **Verified against the mocked suite only** (no live server, no real LLM
+  keys, no local vault — this is a cloud session, per the fail-safe rules).
+  New `build-system/test_speed_audit_timing.py` (4 tests, all passing) uses
+  fakes for the router/memory/skill-manager/goal-expander and: (1) asserts
+  the `timings` dict has the expected keys with non-negative values, (2)
+  proves the parallelization is real by injecting artificial delays into
+  the two independent paths and asserting the combined pre-loop time is
+  well under their sum (would fail if a future edit accidentally
+  re-serializes them), (3)/(4) confirm tool-execution and multi-turn LLM
+  timings accumulate correctly. Ran the full existing mocked suite too,
+  after installing this sandbox's missing runtime deps (`python-dotenv`,
+  `numpy`, `groq`, `openai`, `google-genai` — none were present at session
+  start): everything passes except `test_glob_rejects_unsafe_absolute_pattern`
+  in `test_tool_executor.py`, which I confirmed (via `git stash`) already
+  fails identically on `feature/day7-heartbeat` before this branch's
+  changes — pre-existing and unrelated, not something this PR touches or
+  should fix under its own scope.
+- **What still needs a live check from Sam or a local session**: the timing
+  numbers themselves are only proven correct in shape (keys present, math
+  adds up, concurrency actually overlaps) against fakes with artificial
+  delays — this cloud sandbox cannot make a real LLM call or hit the real
+  T3 vector index, so there's no real-world magnitude data yet (e.g.
+  whether `llm_call_ms` or `tool_execution_ms` actually dominates a typical
+  turn, whether the T3 hybrid search embedding step is slow enough to
+  matter). That real-world read is the actual point of Q8 and can only
+  come from running Alfred live and looking at the `[Timing]` lines it now
+  produces — this PR gives Sam the instrument, not the diagnosis.
+- **Open question for Sam**: once real numbers come back, worth deciding
+  whether `timings` should also flow through to `brain_api/server.py`'s
+  `ChatResponse` / the cockpit UI (e.g. a small perf readout), or stay
+  server-log-only via the `thinking` line. Left as a follow-up rather than
+  guessed at here since it touches the cockpit's TS side too.
+
 ## 2026-09-05 — Q2 fixed for real; cloud routine root-caused (not a prompt problem)
 
 - **Diagnosed why the autonomous cloud routine "kept failing"**: it never
