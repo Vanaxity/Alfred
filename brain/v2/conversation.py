@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -654,6 +655,8 @@ class Alfred:
             5. If reply → return.
             6. Max turns = 10.
         """
+        overall_start = time.perf_counter()
+        timings: Dict[str, float] = {}
         thinking: List[str] = []
         history = context.get("conversation_history", []) if context else []
 
@@ -692,14 +695,29 @@ class Alfred:
         # Only .expanded feeds skill-matching; conv.add_user()/task above and
         # T3 episode titles below keep using literal `task` so history stays
         # human-readable rather than showing Alfred's paraphrase of the user.
+        # _get_memory_snippets only depends on `task` -- it has no dependency
+        # on goal expansion or skill matching below, so it was previously
+        # paying for its own wall-clock time stacked strictly AFTER that
+        # chain finished (a real, measured Q8 finding: this is pure blocking
+        # DB/embedding work with nothing else to wait on). Kick it off now,
+        # in a thread so it doesn't block the event loop, and let it run
+        # concurrently with the expand-then-match chain instead.
+        pre_loop_start = time.perf_counter()
+        memory_snippets_task = asyncio.create_task(
+            asyncio.to_thread(self._get_memory_snippets, task)
+        )
+
         planning_text = task
+        _t0 = time.perf_counter()
         try:
             expanded = await self.goal_expander.expand(task)
             planning_text = expanded.expanded or task
         except Exception:
             pass
+        timings["goal_expansion_ms"] = (time.perf_counter() - _t0) * 1000.0
 
         matched_skill = None
+        _t0 = time.perf_counter()
         try:
             # search_ecosystem=False: this runs on every task, and the
             # ecosystem path can shell out to npx and install files with a
@@ -710,16 +728,29 @@ class Alfred:
             )
         except Exception:
             pass
+        timings["skill_matching_ms"] = (time.perf_counter() - _t0) * 1000.0
 
         # --- T3 memory snippets (once, before the loop) ---
         # task is fixed for the whole call, so recomputing this every turn was
         # a redundant embedding/DB round trip with an identical result each time.
-        memory_snippets = self._get_memory_snippets(task)
+        # memory_snippets_wait_ms is the part of the fetch that did NOT overlap
+        # with goal_expansion+skill_matching above -- near 0 means the
+        # parallelization fully hid its cost, a large value means it's still
+        # the tail latency even after overlapping.
+        _t0 = time.perf_counter()
+        try:
+            memory_snippets = await memory_snippets_task
+        except Exception:
+            memory_snippets = []
+        timings["memory_snippets_wait_ms"] = (time.perf_counter() - _t0) * 1000.0
+        timings["pre_loop_total_ms"] = (time.perf_counter() - pre_loop_start) * 1000.0
         memory_drop_logged = False
 
         for turn in range(self.MAX_TURNS):
             # --- Build prompt ---
+            _t0 = time.perf_counter()
             system, dropped_sections = self._build_system_prompt(memory_snippets, matched_skill)
+            timings["prompt_build_ms"] = timings.get("prompt_build_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
             if "memory" in dropped_sections and not memory_drop_logged:
                 thinking.append(
                     "  Memory dropped from prompt (token budget too tight to fit it)"
@@ -740,6 +771,7 @@ class Alfred:
             # too -- 3000 gives real headroom for verbose synthesis without
             # a large latency/cost jump (this is a ceiling, not a floor;
             # short replies don't suddenly cost more).
+            _t0 = time.perf_counter()
             resp = await self._router.call(
                 system_prompt=system,
                 user_message=task,
@@ -747,6 +779,7 @@ class Alfred:
                 max_tokens=3000,
                 temperature=0.1,
             )
+            timings["llm_call_ms"] = timings.get("llm_call_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
             if resp.provider:
                 note = f"[LLM provider={resp.provider}"
                 if resp.fallback_used:
@@ -865,7 +898,9 @@ class Alfred:
 
             # --- Execute tool ---
             thinking.append(f"[Turn {turn + 1}] Tool: {tool_name}")
+            _t0 = time.perf_counter()
             result = await self._tool_executor.execute(tool_name, tool_params, tool_ctx)
+            timings["tool_execution_ms"] = timings.get("tool_execution_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
 
             output = result.output if result.success else result.error or ""
             is_error = not result.success
@@ -914,9 +949,11 @@ class Alfred:
             # is_mutation() is action-aware: a calendar "agenda" read is not a
             # mutation even though "calendar" is in MUTATION_TOOLS.
             if result.success and self._tool_executor.is_mutation(tool_name, tool_params):
+                _t0 = time.perf_counter()
                 verify_result = await self._tool_executor.verify_mutation(
                     tool_name, tool_ctx, tool_params
                 )
+                timings["mutation_verify_ms"] = timings.get("mutation_verify_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
                 if verify_result:
                     verify_output = verify_result.output if verify_result.success else verify_result.error
                     conv.add_tool_result(
@@ -926,7 +963,9 @@ class Alfred:
                     thinking.append(f"  Verified: {tool_name}")
 
             # --- Compress if needed ---
+            _t0 = time.perf_counter()
             compressed = conv.compress_if_needed()
+            timings["compression_ms"] = timings.get("compression_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
             if compressed:
                 thinking.append(f"  Compressed {compressed} old messages")
 
@@ -1027,6 +1066,32 @@ class Alfred:
             t for t in self._pending_curation_tasks if not t.done()
         ]
 
+        # --- Q8 speed audit: where did this turn's time actually go? ---
+        # _curate_memory above is fire-and-forget and never awaited, so it's
+        # deliberately excluded -- it adds zero latency to this response.
+        timings["total_ms"] = (time.perf_counter() - overall_start) * 1000.0
+        timings["turns_used"] = turn + 1
+        thinking.append(
+            "[Timing] total={total_ms:.0f}ms | pre_loop={pre_loop_total_ms:.0f}ms "
+            "(goal_expansion={goal_expansion_ms:.0f}ms skill_matching={skill_matching_ms:.0f}ms "
+            "memory_snippets_wait={memory_snippets_wait_ms:.0f}ms) | "
+            "prompt_build={prompt_build_ms:.0f}ms | llm_calls={llm_call_ms:.0f}ms | "
+            "tool_exec={tool_execution_ms:.0f}ms | mutation_verify={mutation_verify_ms:.0f}ms | "
+            "compression={compression_ms:.0f}ms | turns={turns_used}".format(
+                total_ms=timings.get("total_ms", 0.0),
+                pre_loop_total_ms=timings.get("pre_loop_total_ms", 0.0),
+                goal_expansion_ms=timings.get("goal_expansion_ms", 0.0),
+                skill_matching_ms=timings.get("skill_matching_ms", 0.0),
+                memory_snippets_wait_ms=timings.get("memory_snippets_wait_ms", 0.0),
+                prompt_build_ms=timings.get("prompt_build_ms", 0.0),
+                llm_call_ms=timings.get("llm_call_ms", 0.0),
+                tool_execution_ms=timings.get("tool_execution_ms", 0.0),
+                mutation_verify_ms=timings.get("mutation_verify_ms", 0.0),
+                compression_ms=timings.get("compression_ms", 0.0),
+                turns_used=timings.get("turns_used", 0),
+            )
+        )
+
         return {
             "response": final_reply,
             "thinking": thinking,
@@ -1037,6 +1102,7 @@ class Alfred:
             "skill_used": matched_skill is not None,
             "skill_generated": skill_generated,
             "awaiting_approval": awaiting_approval,
+            "timings": timings,
         }
 
     # ------------------------------------------------------------------
