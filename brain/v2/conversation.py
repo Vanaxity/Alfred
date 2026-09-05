@@ -539,13 +539,48 @@ class Alfred:
         # output hit the token cap) would otherwise surface as
         # '{ "tool": "calculator", "expression": ...' in the chat window.
         if text.lstrip().startswith(("{", "[")):
+            # Before giving up: this is exactly the shape a truncated
+            # {"reply": "..."} takes when max_tokens cuts it off mid-string
+            # (no closing quote/brace, so every parse attempt above failed).
+            # Salvage whatever real reply text exists rather than throwing
+            # it away — a real, if incomplete, answer beats a generic "ask
+            # again" when the user asked a long research-style question and
+            # the model was mid-sentence when it ran out of budget. Confirmed
+            # live 2026-08-31: this was hit on a "research 5-6 sources"
+            # request that legitimately needed more than max_tokens allowed.
+            salvaged = self._salvage_truncated_reply(text)
+            if salvaged:
+                return (salvaged + "\n\n_(cut off — ran out of room, ask me to continue)_", None, None)
             return (
                 "I got a malformed response from the model on that one. "
                 "Could you ask again?",
                 None,
                 None,
             )
-        return (text[:500], None, None)
+        # Plain prose, no JSON wrapper at all -- confirmed live 2026-08-31
+        # this genuinely happens on later turns of a long multi-tool
+        # conversation (a "research 5-6 sources" task that used 8 web_fetch
+        # calls got a plain markdown reply on turn 9, not JSON), and the old
+        # hard [:500] slice truncated a real, complete answer mid-sentence
+        # for no reason related to max_tokens at all. 8000 is a runaway-
+        # output safety net, not a routine truncation point.
+        return (text[:8000], None, None)
+
+    @staticmethod
+    def _salvage_truncated_reply(text: str) -> Optional[str]:
+        """Best-effort extraction of a "reply" field's value from JSON that
+        got cut off mid-string before it could be closed. Not a real JSON
+        parse (there's nothing valid to parse) -- just enough to recover
+        real content instead of discarding it."""
+        match = re.search(r'"reply"\s*:\s*"', text)
+        if not match:
+            return None
+        raw = text[match.end():]
+        # Trim to the last complete-looking sentence/word rather than a
+        # half-escaped tail, and undo simple JSON string escapes.
+        raw = raw.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+        raw = raw.strip()
+        return raw if len(raw) > 20 else None
 
     @staticmethod
     def _reply_shaped_tool(obj: Dict[str, Any]) -> Optional[str]:
@@ -695,11 +730,21 @@ class Alfred:
             llm_messages = conv.to_llm_messages()
 
             # --- Call LLM ---
+            # 1200 -- confirmed live 2026-08-31 as too small: a "research
+            # from 5-6 sources" reply hit this cap mid-generation, which
+            # either truncated the visible answer mid-sentence or (worse)
+            # cut the JSON envelope off mid-string, surfacing as "malformed
+            # response, ask again" instead of the real (if incomplete)
+            # content. This is the shared budget for every turn, not just
+            # the final reply, so it has to cover the JSON wrapper overhead
+            # too -- 3000 gives real headroom for verbose synthesis without
+            # a large latency/cost jump (this is a ceiling, not a floor;
+            # short replies don't suddenly cost more).
             resp = await self._router.call(
                 system_prompt=system,
                 user_message=task,
                 messages=llm_messages,
-                max_tokens=1200,
+                max_tokens=3000,
                 temperature=0.1,
             )
             if resp.provider:

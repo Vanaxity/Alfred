@@ -224,6 +224,68 @@ def test_reply_is_not_truncated_at_500_chars():
     assert len(reply) > 500, f"reply was truncated to {len(reply)} chars"
 
 
+def test_truncated_json_salvages_partial_reply_instead_of_apologizing():
+    """Confirmed live 2026-08-31: a max_tokens cutoff mid-generation left an
+    unclosed {"reply": "..." with no closing quote/brace -- every real parse
+    path above fails on that, and it used to fall straight to a generic
+    "malformed response, ask again" that threw away real, if incomplete,
+    content the user could still read."""
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+        "_salvage_truncated_reply": Alfred.__dict__["_salvage_truncated_reply"],
+    })
+    truncated = '{"reply": "He chose chess as the test domain because it has an objective, measurable rating system'
+    reply, tool, params = Stub()._parse_llm_output(truncated)
+    assert tool is None
+    assert reply is not None
+    assert "chess as the test domain" in reply, f"real content was discarded: {reply!r}"
+    assert "malformed response" not in reply.lower()
+
+
+def test_truncated_json_too_short_to_salvage_still_apologizes():
+    """A cutoff with no real content yet (or none at all) has nothing worth
+    salvaging -- must still fall back to the honest apology, not a blank or
+    near-blank "answer"."""
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+        "_salvage_truncated_reply": Alfred.__dict__["_salvage_truncated_reply"],
+    })
+    reply, tool, params = Stub()._parse_llm_output('{"reply": "Sure')
+    assert tool is None
+    assert reply is not None
+    assert "malformed response" in reply.lower()
+
+
+def test_plain_prose_reply_with_no_json_wrapper_is_not_truncated_at_500():
+    """Confirmed live 2026-08-31: a long multi-tool research task's final
+    turn came back as plain markdown prose (no {"reply": ...} wrapper at
+    all), and the old hard text[:500] fallback slice cut a complete,
+    correct answer off mid-sentence -- unrelated to max_tokens, this was a
+    second, independent source of truncation on the exact same bug report."""
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+        "_salvage_truncated_reply": Alfred.__dict__["_salvage_truncated_reply"],
+    })
+    long_prose = "Here's what I found. " * 60  # ~1300 chars, well past the old 500-char cut
+    reply, tool, params = Stub()._parse_llm_output(long_prose)
+    assert tool is None
+    assert reply is not None
+    assert len(reply) > 500, f"plain-prose reply was truncated to {len(reply)} chars"
+    assert reply.rstrip().endswith("found."), "should end where the source text ends, not mid-sentence"
+
+
 def test_public_api_exported():
     assert ConversationHistory is not None
     assert Message is not None
