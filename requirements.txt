@@ -52,3 +52,6 @@ google-auth-httplib2
 python-dateutil>=2.8.0
 pytz>=2024.1
 croniter>=1.4.0
+
+# Alfred Brain - MCP client (Phase 2)
+mcp>=2.1.0

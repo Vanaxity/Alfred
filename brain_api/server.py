@@ -99,13 +99,18 @@ async def lifespan(app: FastAPI):
     
     # Start ngrok
     start_ngrok()
-    
+
+    # Phase 2: connect any MCP servers listed in mcp_servers.json. No-op
+    # if the file doesn't exist -- MCP is additive, not required to boot.
+    await alfred.connect_mcp_servers()
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 
     yield
 
     print("\nShutting down Alfred Brain API...")
+    await alfred.disconnect_mcp_servers()
     stop_ngrok()
 
 

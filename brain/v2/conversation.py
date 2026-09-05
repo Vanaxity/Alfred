@@ -147,6 +147,46 @@ class Alfred:
         # they aren't garbage-collected mid-flight; never awaited by a turn.
         self._pending_curation_tasks: List[Any] = []
 
+        # Phase 2: dynamically-discovered MCP tool schemas, merged into
+        # _get_tool_descriptions() once connect_mcp_servers() has run.
+        # Populated async (spawning a server + tools/list can't happen in
+        # this sync __init__), so this starts empty -- see
+        # connect_mcp_servers(), called once from brain_api/server.py's
+        # startup lifespan handler.
+        self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
+
+    async def connect_mcp_servers(self) -> None:
+        """Spawn every MCP server in mcp_servers.json, discover its tools,
+        and register each one through the same ToolExecutor.register()
+        every built-in tool uses -- no per-server integration code. Safe
+        to call with no config file present (no-op) or to call twice
+        (idempotent, see MCPClientManager.connect_all)."""
+        from ..mcp_client import get_mcp_client
+        from .tool_executor import Guardrails
+
+        client = get_mcp_client()
+        discovered = await client.connect_all()
+        for server_name, tool_name, tool in discovered:
+            full_name = f"{server_name}__{tool_name}"
+            handler = client.make_handler(server_name, tool_name)
+            # Default to require_approval: an arbitrary third-party MCP
+            # server is closer to shell/run_code in trust level than a
+            # built-in tool, at least until it's been used long enough to
+            # trust -- not something to skip past a human decision for a
+            # server nobody's vetted yet.
+            self._tool_executor.register(
+                full_name, handler, guardrails=Guardrails(require_approval=True),
+            )
+            self._mcp_tool_schemas[full_name] = {
+                "description": (tool.description or f"MCP tool from '{server_name}'.")
+                + " (Requires approval before running -- third-party MCP server.)",
+                "params": tool.input_schema or {},
+            }
+
+    async def disconnect_mcp_servers(self) -> None:
+        from ..mcp_client import get_mcp_client
+        await get_mcp_client().disconnect_all()
+
     # ------------------------------------------------------------------
     # Bootstrap
     # ------------------------------------------------------------------
@@ -252,8 +292,15 @@ class Alfred:
         return result.system, result.dropped_sections
 
     def _get_tool_descriptions(self) -> Dict[str, Dict[str, Any]]:
-        """Get tool descriptions for prompt injection."""
-        return {
+        """Get tool descriptions for prompt injection.
+
+        Merges in whatever connect_mcp_servers() discovered (empty if it
+        hasn't run, or no mcp_servers.json exists) -- otherwise an MCP
+        tool would be registered and callable via ToolExecutor but the
+        LLM would never know it exists, since this dict is what actually
+        reaches the prompt.
+        """
+        builtin = {
             "chat": {
                 "description": "Have a conversation or answer a question.",
                 "params": {"message": "Message to respond to"},
@@ -436,6 +483,12 @@ class Alfred:
                 "params": {"code": "Code", "language": "python/shell"},
             },
         }
+        # getattr, not self._mcp_tool_schemas directly: several existing
+        # tests build a bare Alfred via object.__new__() to test one method
+        # in isolation without running the real __init__ -- confirmed this
+        # broke test_speed_audit_timing.py live. An absent attribute means
+        # "no MCP servers connected yet," same as an empty dict would.
+        return {**builtin, **getattr(self, "_mcp_tool_schemas", {})}
 
     # ------------------------------------------------------------------
     # LLM output parser
