@@ -7,6 +7,46 @@ don't rewrite history — newest entries at the top.
 
 ---
 
+## 2026-09-05 — Q2 fixed for real; cloud routine root-caused (not a prompt problem)
+
+- **Diagnosed why the autonomous cloud routine "kept failing"**: it never
+  actually failed at the work. Read all 5 run logs directly. Every run
+  did genuinely good engineering (confirmed Q2's suspicion, designed a
+  real auth fix, wrote passing tests, even hand-verified against a real
+  FastAPI TestClient in its sandbox) but hit a hard wall at the very end:
+  `git push` and every GitHub MCP write tool returned 403 -- the cloud
+  environment's GitHub connection is read-only. Reads work, writes don't.
+  Not a prompt-engineering problem; revising the prompt wouldn't have
+  fixed it. Needs Sam to grant the Claude GitHub App write access to
+  `Vanaxity/Alfred` (github.com/apps/claude/installations/select_target
+  or reconnect at claude.ai/customize/connectors) before the routine can
+  ever land a PR on its own. Routine paused (`enabled: false`) until then.
+- **Implemented the Q2 fix locally instead**, using the routine's design
+  as a reference but building and verifying it myself -- with real
+  advantages the cloud sandbox didn't have: `brain_api/auth.py`
+  (stdlib-only shared secret, `ALFRED_API_KEY`), wired into HTTP
+  middleware + a separate WebSocket check, `/health` left public. 10 new
+  mocked tests, plus **live verification the cloud routine structurally
+  couldn't do**: restarted the real server, confirmed unauthenticated
+  `/api/command`/`/status` both 401, authenticated succeeds, WebSocket
+  rejects without `?key=` and connects with it, and the full chain works
+  through the actual live ngrok tunnel with the exact headers the
+  cockpit sends.
+- **The cockpit needed a matching fix or this would have broken it
+  outright** -- `alfred-cockpit`'s `brainApi.ts` now sends the key on
+  every request (`X-Alfred-Key` header, `?key=` for the WebSocket).
+  Vercel env `NEXT_PUBLIC_ALFRED_API_KEY` set as Config (Vercel itself
+  flagged the public-exposure tradeoff; accepted deliberately -- it
+  blocks blind hits on a leaked ngrok URL, which was the actual Q2
+  concern, not a determined attacker who's already found the cockpit and
+  reads its JS). Redeployed, aliased to production, verified live.
+- Also committed (from last night, previously verified but never pushed):
+  the reply-truncation fix (`max_tokens` + salvage + dropped 500-char
+  cap) and the cockpit's approval-gate UI. The approval flow's deeper
+  backend issue (exact-signature matching breaks when the model doesn't
+  regenerate identical params on retry) is still open, tracked
+  separately -- the UI fix alone isn't sufficient.
+
 ## 2026-08-31 — Strix pentesting slotted in as a Phase 1 exit gate
 
 - Sam surfaced [Strix](https://github.com/usestrix/strix) (open-source AI
