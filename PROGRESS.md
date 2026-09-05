@@ -7,45 +7,60 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## ⚡ ACTIVE MODE (2026-09-05, until Phase 1 is done) — read this first, before anything else below
+## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
 
-**Update 2026-09-05, same day:** switched to driving this from a local
-session instead (real server/live verification beats the cloud's
-mocked-only checks for what's left). **Cloud routine is disabled**
-(`trig_01U7DDqtuWKAsfWa6c2fU66E`, `enabled: false`) — don't expect it to
-fire. The back-to-back-manual-triggers approach below is paused, not
-abandoned; re-enable and resume it if local-session work stalls or Sam
-wants cloud+local running in parallel again.
+Phase 1's active-catch-up mode (was here, see git history if needed) is
+over — Q2 and Q8 both closed same-day via local-session work, on top of
+the earlier Q3/Q6 work. **Cloud routine stays disabled**
+(`trig_01U7DDqtuWKAsfWa6c2fU66E`) — local-session driving worked better
+for this than the cloud's mocked-only verification; re-enable only if
+that changes. Remaining Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9
+business questions) are explicitly manual/non-blocking per `ROADMAP.md`
+— not something a session should pick up and start working unprompted.
 
-Sam is behind schedule — Phase 1 was meant to close out by end of Week 1
-(Sep 2), it's Sep 5 and it isn't done. **Until Phase 1 is confirmed done,
-work the routine hard, not on its normal cadence** (only applies while
-the routine is actually enabled -- see update above):
-
-- The scheduled cron (`trig_01U7DDqtuWKAsfWa6c2fU66E`, currently hourly)
-  is a floor, not the pace. Whoever/whatever is driving this
-  (Claude session or Sam directly) should call `RemoteTrigger action:"run"`
-  on that trigger repeatedly, back-to-back — trigger, wait for it to
-  finish (`list_runs`/`get_run_log` to check), trigger the next one
-  immediately if it didn't hit a real decision point. Don't wait for the
-  next scheduled fire.
-- **Only stop the back-to-back loop for a real decision** — the routine's
-  own existing rules already define what that means (a genuine fork with
-  no default, something big enough to show the plan first, truly stuck
-  after real effort, or one of the standing hard boundaries). Routine
-  progress, successful PRs, and normal task-picking are NOT reasons to
-  pause and ask Sam — keep going.
-- **Once Phase 1's remaining open items are actually closed** (check this
-  file's own entries plus `ROADMAP.md`'s "Still open" list for what's
-  left), STOP this active-catch-up mode, revert to just letting the
-  scheduled cron run on its own normal cadence, and remove this section
-  (replace it with a dated note that Phase 1 closed and normal cadence
-  resumed) rather than leaving it here as stale instruction for later
-  sessions to misread as still active.
-- This section is intentionally at the very top, above the dated log
-  below, specifically so a cold session reads it before anything else.
+**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
+one connector this week, proactive surfacing and further connectors
+pushed to Phase 3. See the dated entry below for what's actually shipped
+so far.
 
 ---
+
+## 2026-09-05 — Phase 2: generic MCP client shipped and live-verified
+
+Sam's real ask, once we got past "which connector first": Alfred should
+plug into **any** MCP server the same way — Slack, Telegram, or
+literally "Nuclear music player MCP" all wire up through one client via
+config, not bespoke code per service. That's exactly the manifesto's
+original Phase 2 spec, not a reframing.
+
+- `brain/mcp_client.py`: reads `mcp_servers.json` (the same config shape
+  every MCP client already uses), spawns each server via the official
+  `mcp` SDK, discovers tools via `list_tools()`, wraps each into Alfred's
+  existing `ToolResult` shape. Registers through the same
+  `ToolExecutor.register()` every built-in tool uses — no new mechanism.
+- `_get_tool_descriptions()` merges in what got discovered — confirmed by
+  direct read that a tool registered with `ToolExecutor` alone would
+  never actually reach the LLM otherwise, since that method is what
+  builds the prompt. New MCP tools default to `require_approval=True` —
+  a third-party server is closer to `shell`/`run_code` in trust than a
+  built-in tool.
+- Shipped with the official Filesystem MCP server configured as the
+  proof connector (zero new credentials).
+- **Live-verified for real, not just mock-tested**: real `npx`-spawned
+  server connected, discovered 14 real tools; a direct handler call
+  returned a real directory listing; through the actual conversation
+  loop, the LLM discovered and correctly picked the MCP tool by natural
+  language, got gated for approval as designed, and executed for real
+  once approved — confirmed via the server's own `thinking` trace.
+- Found and fixed one real regression before it shipped: the merge broke
+  `test_speed_audit_timing.py`'s bare-`Alfred`-via-`object.__new__()`
+  pattern (no `_mcp_tool_schemas` attribute on a partial instance) —
+  fixed via `getattr(..., {})` rather than chasing every test file that
+  builds a partial instance.
+- 9 new mocked tests, full suite 107/107.
+- **Next real connector is Sam's call, whenever** — the whole point of a
+  generic client is that adding one is now a config entry + finding its
+  MCP server package, not a planned milestone requiring new code.
 
 ## 2026-09-05 — Q8 live-verified and merged (local session)
 
