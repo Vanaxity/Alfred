@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uvicorn
 
 # Add parent to path
@@ -205,6 +206,25 @@ app.add_middleware(
 )
 
 
+# ============ AUTH ============
+# Q2 (ROADMAP.md): the ngrok tunnel auto-starts on boot, so every route
+# needs a real check, not just /chat and /api/command. CORSMiddleware
+# above still runs first so browser preflight (OPTIONS) requests get their
+# CORS headers before this gate ever sees them -- an unauthenticated
+# preflight is not a data leak, and Starlette dispatches OPTIONS to
+# CORSMiddleware directly regardless of route auth.
+from brain_api.auth import is_authorized, is_public_path  # noqa: E402
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if request.method == "OPTIONS" or is_public_path(request.url.path):
+        return await call_next(request)
+    if not is_authorized(request.headers, request.query_params):
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid Alfred API key"})
+    return await call_next(request)
+
+
 # ============ WEBSOCKET HANDLING ============
 
 async def broadcast_to_clients(message: dict):
@@ -221,6 +241,13 @@ async def broadcast_to_clients(message: dict):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time communication."""
+    # The `http` middleware above never runs for a WebSocket upgrade, so
+    # /ws needs its own check -- see brain_api/auth.py. Browsers can't set
+    # custom headers on a WebSocket handshake, so this also accepts
+    # ?key=... on the connection URL.
+    if not is_authorized(websocket.headers, websocket.query_params):
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
     CONNECTED_CLIENTS.add(websocket)
 
