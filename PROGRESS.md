@@ -9,9 +9,18 @@ don't rewrite history — newest entries at the top.
 
 ## ⚡ ACTIVE MODE (2026-09-05, until Phase 1 is done) — read this first, before anything else below
 
+**Update 2026-09-05, same day:** switched to driving this from a local
+session instead (real server/live verification beats the cloud's
+mocked-only checks for what's left). **Cloud routine is disabled**
+(`trig_01U7DDqtuWKAsfWa6c2fU66E`, `enabled: false`) — don't expect it to
+fire. The back-to-back-manual-triggers approach below is paused, not
+abandoned; re-enable and resume it if local-session work stalls or Sam
+wants cloud+local running in parallel again.
+
 Sam is behind schedule — Phase 1 was meant to close out by end of Week 1
 (Sep 2), it's Sep 5 and it isn't done. **Until Phase 1 is confirmed done,
-work the routine hard, not on its normal cadence:**
+work the routine hard, not on its normal cadence** (only applies while
+the routine is actually enabled -- see update above):
 
 - The scheduled cron (`trig_01U7DDqtuWKAsfWa6c2fU66E`, currently hourly)
   is a floor, not the pace. Whoever/whatever is driving this
