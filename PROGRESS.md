@@ -7,6 +7,37 @@ don't rewrite history — newest entries at the top.
 
 ---
 
+## ⚡ ACTIVE MODE (2026-09-05, until Phase 1 is done) — read this first, before anything else below
+
+Sam is behind schedule — Phase 1 was meant to close out by end of Week 1
+(Sep 2), it's Sep 5 and it isn't done. **Until Phase 1 is confirmed done,
+work the routine hard, not on its normal cadence:**
+
+- The scheduled cron (`trig_01U7DDqtuWKAsfWa6c2fU66E`, currently hourly)
+  is a floor, not the pace. Whoever/whatever is driving this
+  (Claude session or Sam directly) should call `RemoteTrigger action:"run"`
+  on that trigger repeatedly, back-to-back — trigger, wait for it to
+  finish (`list_runs`/`get_run_log` to check), trigger the next one
+  immediately if it didn't hit a real decision point. Don't wait for the
+  next scheduled fire.
+- **Only stop the back-to-back loop for a real decision** — the routine's
+  own existing rules already define what that means (a genuine fork with
+  no default, something big enough to show the plan first, truly stuck
+  after real effort, or one of the standing hard boundaries). Routine
+  progress, successful PRs, and normal task-picking are NOT reasons to
+  pause and ask Sam — keep going.
+- **Once Phase 1's remaining open items are actually closed** (check this
+  file's own entries plus `ROADMAP.md`'s "Still open" list for what's
+  left), STOP this active-catch-up mode, revert to just letting the
+  scheduled cron run on its own normal cadence, and remove this section
+  (replace it with a dated note that Phase 1 closed and normal cadence
+  resumed) rather than leaving it here as stale instruction for later
+  sessions to misread as still active.
+- This section is intentionally at the very top, above the dated log
+  below, specifically so a cold session reads it before anything else.
+
+---
+
 ## 2026-09-05 — Q2 fixed for real; cloud routine root-caused (not a prompt problem)
 
 - **Diagnosed why the autonomous cloud routine "kept failing"**: it never
