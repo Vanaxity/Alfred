@@ -7,23 +7,93 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 + 2 engineering: closed. Phase 3: STOP — 6 open, unmerged, overlapping PRs need Sam's triage before any more code lands
 
-Phase 1's active-catch-up mode (was here, see git history if needed) is
-over — Q2 and Q8 both closed same-day via local-session work, on top of
-the earlier Q3/Q6 work. **Cloud routine re-enabled 2026-09-08**
-(`trig_01U7DDqtuWKAsfWa6c2fU66E`, hourly at :17) — was paused 2026-09-05
-in favor of local-session live testing for Phase 2; that testing is done
-(see the dated entry below), so it's back on autonomous duty, prompt
-refreshed to drop stale references to already-finished work. Remaining
-Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
-explicitly manual/non-blocking per `ROADMAP.md` — not something a
-session should pick up and start working unprompted.
+Phase 1 and Phase 2 are both done and live-verified (Q2/Q3/Q6/Q8, then the
+MCP client + filesystem connector — see dated entries below). **The cloud
+routine (`trig_01U7DDqtuWKAsfWa6c2fU66E`, hourly) has been firing on Phase 3
+since re-enabling earlier today and has produced 6 open, unmerged PRs
+against this branch, several of them duplicating each other**, because each
+firing branched from this same base commit and picked "the next unblocked
+item" without checking whether an earlier firing that same day had already
+opened a PR for it. This entry is a triage pass, not new feature work — see
+the dated entry directly below for the full breakdown and recommended
+resolution order. **No further Phase 3 code should be picked up by this
+routine until Sam has resolved (merged/closed/rebased) at least the
+overlapping pairs below** — every one of Phase 3's four roadmap items
+(proactive surfacing, Tool Forge's validation slice, self-audit loop, entity
+graph) already has an open PR claiming it; picking anything new right now
+can only add a 7th overlapping diff, not close a gap.
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+---
+
+## 2026-09-08 — PR pileup triage (cloud routine, no new feature code this run)
+
+**Why this run did triage instead of picking a new roadmap item**: every one
+of Phase 3's four items already has an open PR against `feature/day7-heartbeat`
+(base commit `4208193`), and two of the four are duplicated by a second,
+independent PR that doesn't reference the first. Opening an eighth diff on
+top of that would make the merge problem worse, not move the roadmap
+forward — this is exactly the "genuinely stuck / real fork with no
+clearly-better default" case the autonomy design in `ROADMAP.md` calls out
+for a check-in rather than a guess. Wrote this up instead of picking new
+work; no application code changed in this PR, only this file.
+
+**The full open-PR picture, checked directly against GitHub before writing
+anything** (all open, none merged, all still targeting the same base commit
+`4208193` unless noted):
+
+| PR | Title | Claims | Status |
+|----|-------|--------|--------|
+| #15 | relocate the cognitive heartbeat into brain/v2 | Proactive surfacing | Restores `reminders`/`scheduled_tasks` query methods + calendar/email snapshot; free-text `CONFIDENCE: high\|medium\|low` LLM parsing |
+| #21 | relocate cognitive heartbeat into v2 architecture | Proactive surfacing (**same item as #15, independent redo**) | No reminders/cron, no calendar/email (explicitly deferred as separate scope); structured-JSON LLM response instead of free text; adds a `GET /api/alerts` poll endpoint |
+| #16 | skill validation sandbox + SemVer versioning | Tool Forge (validation prerequisite only, not the code-gen half) | Self-contained, no overlap with any other open PR |
+| #17 | execution log — the self-audit loop's missing persistence layer | Self-audit loop prerequisite | `execution_log` table + `log_execution`/`get_recent_executions`/`get_execution_stats`; deliberately stopped short of the audit loop itself |
+| #18 | Self-Audit Loop — execution logging + weekly-review proposal | Self-audit loop (**full feature, independently re-implements #17's persistence layer with a different schema, same table name**) | Superset of #17: its own `execution_log`/`self_audit_log` schema (richer — captures nudge/approval/max-turns signals #17's doesn't) **plus** `brain/self_audit.py`, the `self_audit` tool, and 31 tests actually exercising it end-to-end |
+| #20 | entity graph & synthesis (GBrain-inspired) | Entity graph | Only Phase 3 item with no duplicate; this PR's own description already flagged the #15/#16/#17/#18 overlap (written before #21 existed, so it doesn't mention #21) |
+| #19 | Phase 1 + Phase 2: full sync to main (40 commits) | Unrelated — `main` catch-up | Base is `main`, not `feature/day7-heartbeat`; `mergeable_state: clean`; explicitly scoped to exclude the `auto/*` queue. Not part of the Phase 3 pileup, no action needed here. |
+
+**Recommended resolution, for Sam to decide (none of this executed by this
+run — closing/rebasing someone else's open PR isn't this run's call to
+make)**:
+1. **#17 vs #18**: #18 is a strict superset — same persistence idea, a
+   richer schema, and it's the one that actually ships and tests the
+   self-audit loop consumer #17 explicitly left as future work. Recommend
+   merging **#18** and closing **#17** as superseded, rather than trying to
+   reconcile two `execution_log` schemas under the same table name.
+2. **#15 vs #21**: a real design fork, not a clear-cut duplicate —
+   different scope (reminders/cron + calendar/email vs. neither) and
+   different response-parsing strategy (free-text confidence line vs.
+   structured JSON). No default here; needs Sam to pick one (or ask for a
+   merged design) rather than either being auto-selected.
+3. **#16** and **#20** have no conflicts with each other or with the
+   #17/#18 or #15/#21 pairs — safe to review/merge independently of how
+   the two forks above resolve.
+4. **#19** is independent of all of the above (targets `main`, already
+   flagged in its own description as excluding the `auto/*` queue) — no
+   blocking relationship either direction.
+
+**Process gap this surfaced, worth fixing regardless of how the pileup
+above resolves**: nothing in this routine's standing instructions tells a
+firing to check GitHub for already-open PRs before picking "the next
+unblocked item" — #20's own PR body did this check manually and caught the
+#15/#16/#17/#18 overlap, but #21 (opened after #20) still duplicated #15
+without checking. Worth adding "list open PRs against the base branch
+before picking work" as an explicit step in this routine's prompt, not just
+something an individual run happens to think of.
+
+**Verified**: no code changed, so nothing new to test — confirmed the
+existing mocked suite is still healthy on this base commit before writing
+this up (120/121 across all non-live `build-system/test_*.py` files; the
+lone failure is the same pre-existing `test_glob_rejects_unsafe_absolute_pattern`
+Linux-sandbox-vs-Windows-target difference every prior entry in this log
+has already documented and confirmed unrelated).
+
+**What this run needs from Sam**: a decision on the four numbered points
+above (or "figure it out yourself next time" if that's the actual
+preference) before the cloud routine resumes picking new Phase 3 work —
+otherwise the next firing has the same four already-claimed items to choose
+from and no fifth item to make real progress on.
 
 ---
 
