@@ -618,6 +618,18 @@ class Alfred:
                     "env": "optional dict of environment variables the server needs",
                 },
             },
+            "self_audit": {
+                "description": (
+                    "Review your own recent execution history (turn timing, tool "
+                    "errors, nudges you needed) and propose ONE concrete "
+                    "optimization to your own code or configuration. Use this when "
+                    "Master Sam asks you to review your own performance, reflect on "
+                    "recent runs, or check for patterns of inefficiency/errors. "
+                    "Read-only — proposes only, never edits anything itself, so it "
+                    "needs no approval."
+                ),
+                "params": {"days": "how many days of history to review (default 7)"},
+            },
         }
         # getattr, not self._mcp_tool_schemas directly: several existing
         # tests build a bare Alfred via object.__new__() to test one method
@@ -1468,6 +1480,37 @@ class Alfred:
         # deliberately excluded -- it adds zero latency to this response.
         timings["total_ms"] = (time.perf_counter() - overall_start) * 1000.0
         timings["turns_used"] = turn + 1
+
+        # --- Self-audit loop feed (ROADMAP.md Phase 3) ---
+        # A cheap synchronous sqlite insert, not a fire-and-forget task like
+        # _curate_memory above -- this has no LLM call on the hot path, so
+        # there's no latency to hide it from. Never allowed to break a real
+        # turn: the self-audit tool reading this back is best-effort by
+        # design, same as every other write in this method that isn't the
+        # user-facing reply itself.
+        try:
+            self.db.log_execution(
+                session_id=(context or {}).get("session_id", ""),
+                task_summary=task,
+                turns_used=timings.get("turns_used", 0),
+                total_ms=timings.get("total_ms", 0.0),
+                llm_call_ms=timings.get("llm_call_ms", 0.0),
+                tool_execution_ms=timings.get("tool_execution_ms", 0.0),
+                tools_called=tools_called,
+                tool_error_count=sum(1 for r in tool_results if not r.get("success")),
+                completion_claim_nudge=completion_claim_nudge_used,
+                time_mismatch_nudge=time_mismatch_nudge_used,
+                awaiting_approval=awaiting_approval is not None,
+                # turn is 0-indexed and this line runs regardless of whether the
+                # loop broke early or exhausted MAX_TURNS -- (turn + 1) >=
+                # MAX_TURNS is a slight over-count for the rare case where the
+                # very last turn also happens to produce the final reply, but
+                # that's an acceptable false positive for a diagnostic signal,
+                # not a claim this row is proof of a stall.
+                max_turns_hit=(turn + 1) >= self.MAX_TURNS,
+            )
+        except Exception:
+            pass
         await _emit(
             "[Timing] total={total_ms:.0f}ms | pre_loop={pre_loop_total_ms:.0f}ms "
             "(goal_expansion={goal_expansion_ms:.0f}ms skill_matching={skill_matching_ms:.0f}ms "

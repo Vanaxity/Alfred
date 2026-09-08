@@ -46,6 +46,37 @@ deliberately NOT in this — separate, security-sensitive, its own pass.
 
 ---
 
+## 2026-09-13 — Phase 3: self-audit loop merged
+
+Cloud routine's self-audit slice (originally #17/#18, fixed and
+consolidated as #32 -- see the 2026-09-09 pileup-triage entry below for
+that history), rebased onto main and merged after the Phase A/B
+reliability work landed. Per the manifesto's own spec ("a weekly cron
+job feeds Alfred's own execution logs back to itself... propose one
+concrete optimization"):
+
+- New `execution_log` table (`brain/local_db.py`) -- one row per turn
+  (turn count, total/LLM/tool-exec ms, tools called, tool-error count,
+  nudge flags, awaiting-approval/max-turns-hit), written from
+  `Alfred.execute()` right after the existing Q8 timing block.
+  Best-effort: wrapped in try/except, can't break a real turn.
+- `brain/self_audit.py`: `summarize_executions()` reduces raw rows into
+  stats; `run_self_audit(db, router, days=7)` sends that summary to the
+  LLM with the manifesto's review prompt, persists the proposal in a new
+  `self_audit_log` table so a later audit can say "still true" instead
+  of repeating itself.
+- Deliberately proposal-only, not self-modifying -- no sandbox
+  self-editing here, matches the discipline the log exists to enforce.
+- New `self_audit` tool (read-only, no approval gate), not a new HTTP
+  endpoint -- reuses `/api/command`'s existing auth.
+
+31 mocked tests (`build-system/test_self_audit.py`), plus the
+already-fixed shared-lock bug from the earlier pileup triage
+(`get_recent_executions`/`get_recent_self_audits` under
+`self._lock`). Full suite green on the rebased branch.
+
+---
+
 ## 2026-09-09 — Triaged and fixed the Phase 3 PR pileup; cloud routine disabled
 
 The cloud routine fired continuously through the night and produced a
