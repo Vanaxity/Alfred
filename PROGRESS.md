@@ -7,7 +7,7 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 engineering: closed (2026-09-05). Phase 2: closed (2026-09-08). Currently in: Phase 3
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is
 over — Q2 and Q8 both closed same-day via local-session work, on top of
@@ -20,10 +20,116 @@ Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
 explicitly manual/non-blocking per `ROADMAP.md` — not something a
 session should pick up and start working unprompted.
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+**Phase 2 shipped and live-tested 2026-09-08** (MCP client + filesystem
+connector + `find_mcp_server`/`install_mcp_server` stretch, see the dated
+entries below) — ROADMAP.md's Week 2 scope is done.
+
+**Now in Phase 3** (see `ROADMAP.md` Week 3): Tool Forge, self-audit loop,
+entity graph & synthesis, and the proactive-surfacing/extra-connector work
+carried over from Phase 2's rescoping. See the dated entry below for the
+first piece picked up.
+
+---
+
+## 2026-09-08 — Phase 3: skill validation sandbox + SemVer versioning (down payment on Tool Forge)
+
+Cloud routine's first Phase 3 pick, code-only. ROADMAP.md's Week 3 bullet
+groups "skill validation → sandboxed dry-run → SemVer" under "Finish Tool
+Forge," but the manifesto lists it as its own prerequisite step ("Skill
+Validation & Versioning," ahead of Tool Forge proper) — built it as that
+standalone, self-contained slice rather than also attempting the
+LLM-generates-and-registers-Python-code half of Tool Forge in the same run.
+Reasoning: Tool Forge's actual code-gen/live-registration piece is a much
+bigger, more security-sensitive surface (arbitrary generated code becoming
+a callable tool) and explicitly depends on skills already being trustworthy
+— doing that properly deserves its own focused pass, not being bundled in
+under time pressure.
+
+- Researched what already existed before writing anything (via a research
+  subagent, since this is a cloud session and re-deriving this by hand
+  would've cost most of the run): confirmed no execution-log/scheduler
+  infrastructure exists for the *self-audit loop* item specifically (that
+  one's a bigger lift than "one well-scoped unit" — see the open item
+  below) and confirmed `PROJECT_TRACKER.md` items 23/24 (skill validation
+  sandbox, SemVer) were still unchecked/unbuilt, so no conflict with
+  in-flight work.
+- **`SkillManager.validate_skill()`** (`brain/memory/skill_manager.py`):
+  before a skill is trusted to join the live T2 pool, checks (1) every
+  step's tool is a known tool, (2) required params are present for tools
+  whose params don't depend on an `action` sub-field (`web_search` needs
+  `query`, `write_file` needs `path`+`content`, etc. — mirrors what each
+  `tool_executor.py` handler itself requires, read handler-by-handler
+  rather than guessed), (3) `email`/`calendar` validated action-aware
+  separately (`send` needs `to`, `triage` needs nothing, etc., since a
+  flat required-params table would be wrong for these two), and (4) for
+  `calculator` only, actually **dry-runs the expression** through a small
+  self-contained safe AST evaluator (arithmetic + a handful of allowlisted
+  functions) — the one tool here that's pure/deterministic/no-I/O, so
+  genuinely safe to execute for real. Every other tool is checked
+  structurally, not executed, since dry-running `email`/`shell`/`calendar`
+  live would mean real side effects — not a safe dry run at all. Kept this
+  evaluator independent from `tool_executor.handle_calculator`'s (not
+  imported) to avoid a circular import: `brain.v2.tool_executor` pulls in
+  `brain.v2.__init__` → `conversation.py` → `SkillManager` itself.
+- **Drafts folder**: a skill that fails `validate_skill()` is now written
+  to `T2-Skills/drafts/` (with the failure reasons appended) instead of
+  either being silently discarded (the old behavior for the existing
+  `_is_low_quality_skill` gate) or saved live untested. `drafts/` is
+  outside `_load_skills_metadata()`'s glob, so a draft can never be matched
+  or executed until explicitly promoted. Added `list_draft_skills()` and
+  `promote_draft_skill(skill_id)` to round out that revision workflow.
+  Wired into both places a skill gets created: `generate_skill()` (the
+  live auto-skill path) and `_convert_skill_md_to_t2()` (the skills.sh
+  ecosystem-import path — imported skills come in with empty `params: {}`
+  today, so most non-trivial imports will now land in drafts pending real
+  param values, which is the intended effect of adding this gate, not a
+  regression).
+- **SemVer versioning**: `Skill.version` (default `"0.1.0"`), round-trips
+  through `to_markdown()`/`from_markdown()`. `improve_skill()` now bumps
+  the patch version on every call (`_bump_patch_version()`, falls back to
+  `0.1.1` for a pre-versioning skill with no clean `X.Y.Z` on disk) and
+  records the new version in the improvement-log section it already wrote.
+- **20 new mocked tests** (`build-system/test_skill_validation.py`):
+  unknown-tool rejection, missing-required-param rejection, the
+  email/calendar action-aware checks (both the pass and fail side), the
+  calculator dry run catching a real bad expression *and* accepting a
+  valid one (including an allowlisted function and rejecting an
+  `__import__`-style escape attempt), `generate_skill()` routing an
+  invalid skill to drafts and never populating the in-memory cache (so
+  `find_skill()` could never match it), a valid skill still saving live as
+  before, and the drafts round-trip
+  (`list_draft_skills`/`promote_draft_skill`). Full suite after this:
+  140/141 (existing suites all still green, plus these 20 new; the 1
+  failure is the same pre-existing `test_glob_rejects_unsafe_absolute_pattern`
+  Linux-sandbox-vs-Windows difference documented in the 2026-09-05 entry
+  below — confirmed unrelated, this branch never touches
+  `tool_executor.py`).
+- **What still needs a live check from Sam or a local session**: this is
+  entirely mocked-verified — no live server, no real skill-generation
+  flow, no real Obsidian vault. In particular: (1) whether the new
+  required-params table actually matches every real tool call shape Alfred
+  produces in practice (built from reading each `tool_executor.py` handler
+  directly, but a live skill going to drafts unexpectedly would mean a
+  handler's real param names differ from what I read), and (2) whether
+  routing skills.sh imports to drafts by default (since they arrive with
+  empty params) is the right call in practice or too aggressive — worth a
+  real look at what lands in `drafts/` after a week of normal use.
+- **Not attempted this run, left explicitly open**: the rest of Tool
+  Forge (skill-used-3+-times → LLM-generates-a-Python-function →
+  subprocess-sandbox-validates → registers as a live tool) and the
+  self-audit loop. On the self-audit loop specifically: the research pass
+  found there's currently **no durable, structured execution log to feed
+  it** — per-turn `timings`/tool-call outcomes/the untooled-completion-claim
+  nudge all die with the HTTP response today, nothing persists them for a
+  weekly rollup, and there's no scheduler running inside the live
+  `brain_api/server.py` process either (the only cron/heartbeat code that
+  exists is dead, sitting in the unimported legacy `brain/alfred.py` /
+  `brain/v2/alfred_v2.py`). Building the self-audit loop for real means
+  building that persistence + scheduling layer first — flagging it here
+  rather than bolting a hasty version onto this same PR, since that's a
+  separate, non-trivial unit of work in its own right and deserves its own
+  scoped pass (and a decision from Sam on whether it belongs in
+  `brain_api/server.py`'s lifespan or stays external, cron-triggered).
 
 ---
 
