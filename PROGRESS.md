@@ -27,6 +27,86 @@ so far.
 
 ---
 
+## 2026-09-08 — Execution log: the self-audit loop's missing persistence layer
+
+**Note on this run**: two other Phase 3 PRs (#15 relocated heartbeat/proactive
+surfacing, #16 skill validation + SemVer) were already open against this
+branch when this run started, both from earlier firings today. Checked both
+before picking work to avoid duplicating either. PR #16's own body names the
+exact gap this PR closes: *"there's currently no durable, structured
+execution log to feed [the self-audit loop] ... Building the self-audit loop
+for real means building that persistence + scheduling layer first."* This PR
+builds the **persistence** half only — durable storage for what a turn did,
+queryable in aggregate. The **scheduling** half (where a weekly pass would
+actually run — inside `brain_api/server.py`'s lifespan vs. external/cron) is
+still explicitly Sam's call, per PR #16, and this PR doesn't attempt it or
+assume an answer.
+
+- **`brain/local_db.py`**: new `execution_log` table (session_id,
+  task_summary truncated to 300 chars, `timings_json`, `tools_json`,
+  `turns_used`, `had_tool_error`, `created_at`) plus three methods:
+  - `log_execution(...)` — one row per turn.
+  - `get_recent_executions(limit=50)` — parsed rows, oldest-to-newest among
+    the most recent N (same convention as the existing `get_recent_context`).
+  - `get_execution_stats(limit=500)` — the actual thing a future self-audit
+    pass needs without re-deriving it from raw rows itself: overall
+    tool-error rate, per-phase average latency (reuses the Q8 `timings`
+    keys — `llm_call_ms`, `tool_execution_ms`, etc. — for free), and
+    per-tool call/failure counts.
+- **`brain/v2/conversation.py`**: `Alfred.execute()` now calls
+  `self.db.log_execution(...)` once per turn, right before building its
+  return dict — wrapped in `if self.db is not None: try/except: pass`, so a
+  logging failure (or the `db=None` shape several existing test fakes
+  already use, e.g. `test_speed_audit_timing.py`) can never break a live
+  turn. Deliberately fire-and-blocking (not fire-and-forget like memory
+  curation) since a plain local sqlite insert is cheap enough not to need
+  the same async-task treatment — confirmed via the full existing timing
+  test suite still passing unchanged.
+
+**Verified (mocked, this is a cloud session — no live server/vault/keys):**
+- New `build-system/test_execution_log.py`, 11 tests: `LocalDB` methods
+  against a real temp-file sqlite db (round-trip, tool-error flagging,
+  task-text truncation, ordering/limit, stats aggregation on empty and
+  populated logs with hand-checked expected numbers), plus `Alfred.execute()`
+  wiring against a spy DB (logs session_id/task/timings/tool_results/
+  turns_used correctly, defaults session_id to `"unknown"` when the caller's
+  context has none) and two negative cases: an `ExplodingDB` whose
+  `log_execution()` always raises still lets the turn complete normally, and
+  `db=None` never gets called at all (no `AttributeError`).
+- Full existing suite still green: 132/133 across all `test_*.py` files
+  (excluding `test_live_realistic.py`, which needs live LLM keys and
+  correctly aborts without them) — 121 pre-existing + this PR's 11 new. The
+  one failure is the same pre-existing, already-documented
+  `test_glob_rejects_unsafe_absolute_pattern` Linux-sandbox-vs-Windows-target
+  case from every earlier entry in this log; confirmed identical before and
+  after this branch's changes, and this branch never touches
+  `tool_executor.py`.
+- Installed this sandbox's missing runtime deps at session start
+  (`python-dotenv`, `numpy`, `groq`, `openai`, `google-genai`, `croniter`,
+  `mcp` — none were present), same gap earlier cloud-session entries in this
+  log also hit.
+
+**Still needs a live check from Sam or a local session:**
+- Whether writing one sqlite row synchronously per turn adds any perceptible
+  latency against the real vault/DB under real load — Q8's own finding was
+  that the LLM call dominates turn time (~85%) and everything else measured
+  was negligible, so a single local insert should be well inside that noise
+  floor, but this cloud sandbox has no real turn volume to confirm it against.
+- Whether `get_execution_stats()`'s shape (per-phase averages, per-tool
+  failure counts) is actually the right input for whatever the self-audit
+  loop's eventual LLM prompt looks like — this PR built the general-purpose
+  aggregate a reasonable person would want, not a self-audit-specific one,
+  since the self-audit loop itself (prompt design + the scheduling decision)
+  is still unbuilt.
+
+**Explicitly not attempted**: the self-audit loop itself (weekly cron
+proposing one concrete optimization) — this PR is its prerequisite, not the
+feature. Also left alone: PR #15's proactive-surfacing/heartbeat work and
+PR #16's skill-validation work, both already in flight and untouched by this
+diff (`brain/local_db.py`'s reminder/cron methods PR #15 added aren't present
+on this branch since #15 isn't merged yet — this PR's changes are additive
+and shouldn't conflict with either).
+
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
 Full offline+live pass over everything Phase 2 shipped (generic client,

@@ -89,6 +89,19 @@ class LocalDB:
 
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 
+            CREATE TABLE IF NOT EXISTS execution_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                task_summary TEXT DEFAULT '',
+                timings_json TEXT DEFAULT '{}',
+                tools_json TEXT DEFAULT '[]',
+                turns_used INTEGER DEFAULT 0,
+                had_tool_error INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_execution_log_created ON execution_log(created_at);
+
             INSERT OR IGNORE INTO user_state (id, mode) VALUES ('default', 'FOUNDER');
         """)
         conn.commit()
@@ -349,6 +362,105 @@ class LocalDB:
         with self._lock:
             conn.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
             conn.commit()
+
+    # ============ EXECUTION LOG (Phase 3 self-audit prerequisite) ============
+    # Per-turn timings + tool outcomes used to die with the HTTP response --
+    # nothing durable survived a turn to feed a future self-audit loop. This
+    # is that durable record. Writes are meant to be best-effort from the
+    # caller's side (conversation.py wraps log_execution() in a try/except)
+    # so a logging failure can never break a live turn.
+
+    def log_execution(
+        self,
+        session_id: str,
+        task: str,
+        timings: Dict[str, Any],
+        tool_results: List[Dict[str, Any]],
+        turns_used: int,
+    ) -> int:
+        conn = self._get_conn()
+        had_tool_error = any(not r.get("success", True) for r in tool_results)
+        tools_summary = [
+            {"tool": r.get("tool"), "success": bool(r.get("success", True))}
+            for r in tool_results
+        ]
+        with self._lock:
+            cur = conn.execute(
+                """
+                INSERT INTO execution_log
+                    (session_id, task_summary, timings_json, tools_json, turns_used, had_tool_error, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    session_id or "unknown",
+                    (task or "")[:300],
+                    json.dumps(timings),
+                    json.dumps(tools_summary),
+                    turns_used,
+                    1 if had_tool_error else 0,
+                ),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def get_recent_executions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM execution_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "task_summary": row["task_summary"],
+                "timings": json.loads(row["timings_json"]),
+                "tools": json.loads(row["tools_json"]),
+                "turns_used": row["turns_used"],
+                "had_tool_error": bool(row["had_tool_error"]),
+                "created_at": row["created_at"],
+            }
+            for row in reversed(rows)
+        ]
+
+    def get_execution_stats(self, limit: int = 500) -> Dict[str, Any]:
+        """Aggregate the most recent execution_log rows into what a weekly
+        self-audit pass would actually need: per-phase average latency,
+        overall tool-error rate, and which tools fail most -- instead of
+        making that pass re-derive it from raw rows itself."""
+        executions = self.get_recent_executions(limit=limit)
+        if not executions:
+            return {"count": 0, "error_rate": 0.0, "avg_phase_ms": {}, "tool_calls": {}, "tool_failures": {}}
+
+        count = len(executions)
+        error_count = sum(1 for e in executions if e["had_tool_error"])
+        phase_totals: Dict[str, float] = {}
+        phase_counts: Dict[str, int] = {}
+        tool_calls: Dict[str, int] = {}
+        tool_failures: Dict[str, int] = {}
+
+        for e in executions:
+            for key, val in e["timings"].items():
+                if key == "turns_used" or not isinstance(val, (int, float)):
+                    continue
+                phase_totals[key] = phase_totals.get(key, 0.0) + float(val)
+                phase_counts[key] = phase_counts.get(key, 0) + 1
+            for t in e["tools"]:
+                name = t.get("tool") or "unknown"
+                tool_calls[name] = tool_calls.get(name, 0) + 1
+                if not t.get("success", True):
+                    tool_failures[name] = tool_failures.get(name, 0) + 1
+
+        avg_phase_ms = {key: phase_totals[key] / phase_counts[key] for key in phase_totals}
+
+        return {
+            "count": count,
+            "error_rate": error_count / count,
+            "avg_phase_ms": avg_phase_ms,
+            "tool_calls": tool_calls,
+            "tool_failures": tool_failures,
+        }
 
     # ============ SCHEDULED TASKS (legacy v1 path only — see local_db.py) ============
 

@@ -1231,6 +1231,22 @@ class Alfred:
             )
         )
 
+        # Persist this turn to the durable execution log (Phase 3 self-audit
+        # prerequisite -- see local_db.log_execution). Best-effort: a logging
+        # failure must never surface as a broken turn, and self.db is None in
+        # some test/bootstrap paths.
+        if self.db is not None:
+            try:
+                self.db.log_execution(
+                    session_id=(context or {}).get("session_id") or "unknown",
+                    task=task,
+                    timings=timings,
+                    tool_results=tool_results,
+                    turns_used=timings.get("turns_used", 0),
+                )
+            except Exception:
+                pass
+
         return {
             "response": final_reply,
             "thinking": thinking,
