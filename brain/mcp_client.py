@@ -39,7 +39,17 @@ CONFIG_PATH = Path(__file__).parent.parent / "mcp_servers.json"
 # install_mcp_server) is inherently less vetted than one hand-configured
 # at startup. Bound the whole spawn+handshake so a bad or unresponsive
 # server can't stall the conversation turn that's waiting on it.
-CONNECT_TIMEOUT_SECONDS = 20
+#
+# That bad-command case is now actually caught by the shutil.which
+# precheck below, in milliseconds -- this timeout only ever bounds a
+# command that DOES exist but is slow or hung. 20s turned out too tight
+# for that: live-reproduced 2026-09-08, a cold `npx -y @modelcontextprotocol/
+# server-filesystem` legitimately takes ~20s just to resolve/launch on this
+# machine, before the MCP handshake (initialize + list_tools) even starts --
+# so the already-configured, working filesystem server was losing the race
+# against its own timeout at every startup. 45s leaves real headroom for a
+# slow-but-working npx spawn while still bounding a truly hung server.
+CONNECT_TIMEOUT_SECONDS = 45
 
 
 class MCPClientManager:

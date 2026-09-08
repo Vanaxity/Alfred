@@ -46,6 +46,22 @@ _COMPLETION_CLAIM_PHRASES = (
     "i've updated", "i have updated", "has been updated",
     "i'll remember that", "i will remember that", "i've remembered",
     "all set for", "done and saved",
+    # A second, distinct shape of the same defect: instead of claiming
+    # something is already done, the reply narrates that it's *about to*
+    # run a gated tool and is waiting on the user's go-ahead -- without
+    # ever actually calling that tool. Live-caught 2026-09-08 testing the
+    # MCP approval flow: the real gate (awaiting_approval + a signature the
+    # client can approve) never fires in this case, so the user is left
+    # approving a request that doesn't exist -- worse than an honest
+    # non-completion, since it looks like the real approval UI should
+    # appear and won't. Same fix as the claims-done case: nudge the model
+    # to actually call the tool so the real gate has something to attach to.
+    "i need your approval", "i need your permission",
+    "requires your approval", "needs your approval",
+    "still need your approval", "still need your permission",
+    "confirm and i'll proceed", "confirm and i will proceed",
+    "confirm, and i'll", "confirm, and i will",
+    "waiting for your approval", "waiting for your confirmation",
 )
 
 # Cues that this is a legitimate refusal/limitation reply, not a false

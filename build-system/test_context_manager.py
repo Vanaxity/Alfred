@@ -286,6 +286,38 @@ def test_plain_prose_reply_with_no_json_wrapper_is_not_truncated_at_500():
     assert reply.rstrip().endswith("found."), "should end where the source text ends, not mid-sentence"
 
 
+def test_untooled_approval_narration_is_caught_as_a_claim():
+    """Live-caught 2026-09-08 testing the MCP approval flow: a multi-turn
+    conversation (incomplete tool request -> Alfred asks a clarifying
+    question -> user answers) sometimes produced a reply narrating "I need
+    your approval before running X. Confirm and I'll proceed." WITHOUT
+    actually calling the tool -- so no real approval gate (awaiting_approval
+    + signature) ever fired. The user is left approving a request that
+    doesn't exist. This is the same defect class as the claims-done case
+    (_is_untooled_completion_claim already covers "has been saved" etc.)
+    just phrased as "about to act" instead of "already acted" -- must be
+    caught by the same detector so the existing nudge-and-retry fires."""
+    from brain.v2.conversation import Alfred
+    is_claim = Alfred.__dict__["_is_untooled_completion_claim"].__func__
+    assert is_claim("I need your approval before running memory__create_entities. Confirm and I'll proceed.")
+    assert is_claim("This requires your approval before I can continue.")
+    assert is_claim("Waiting for your confirmation to proceed.")
+    # A second live-caught paraphrase (trial 3 of the same 2026-09-08 repro
+    # run) that dodged the first phrase list entirely -- confirms this is
+    # genuinely open-ended paraphrasing, not a one-off wording.
+    assert is_claim("I still need your approval to create the entity. Confirm, and I'll create Trial3 as type \"test\".")
+
+
+def test_untooled_approval_narration_detection_does_not_flag_questions_or_refusals():
+    """The new approval-claim phrases must respect the same guards as the
+    existing completion-claim ones: a genuine clarifying question, or an
+    honest refusal, must never be nudged."""
+    from brain.v2.conversation import Alfred
+    is_claim = Alfred.__dict__["_is_untooled_completion_claim"].__func__
+    assert not is_claim("Do you want me to ask for your approval before running this?")
+    assert not is_claim("I can't get your approval right now since the approval system isn't connected.")
+
+
 def test_public_api_exported():
     assert ConversationHistory is not None
     assert Message is not None
