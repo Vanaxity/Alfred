@@ -19,7 +19,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -171,6 +171,16 @@ class Alfred:
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
+        # Phase 3: cognitive heartbeat (see .heartbeat.CognitiveHeartbeat).
+        # Never started here -- constructing an Alfred() must never spin up
+        # a background task nobody asked for (every build-system/test_*.py
+        # that builds one via Alfred.__new__() or a real Alfred() would
+        # otherwise leak a task). start_heartbeat() is called explicitly by
+        # brain_api/server.py's lifespan, same pattern as connect_mcp_servers().
+        self._heartbeat: Any = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_on_alert: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
         and register each one through the same ToolExecutor.register()
@@ -215,6 +225,65 @@ class Alfred:
     async def disconnect_mcp_servers(self) -> None:
         from ..mcp_client import get_mcp_client
         await get_mcp_client().disconnect_all()
+
+    # ------------------------------------------------------------------
+    # Phase 3: cognitive heartbeat
+    # ------------------------------------------------------------------
+
+    def start_heartbeat(
+        self,
+        interval_seconds: float = 7200.0,
+        on_alert: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> None:
+        """Start the background cognitive-heartbeat loop. No-op if already
+        running. Must be called explicitly (from brain_api/server.py's
+        lifespan) -- never from __init__, see the comment there.
+
+        on_alert, if given, is awaited with a dict (HeartbeatEntry.to_dict())
+        for every "nudge" or "proposal" cycle -- e.g. brain_api/server.py's
+        broadcast_to_clients, to push it to the cockpit over WebSocket. Idle/
+        observation/error cycles are logged (get_heartbeat_log()) but not
+        pushed -- most cycles should find nothing, and pushing that "nothing"
+        every interval would just be noise.
+        """
+        if self._heartbeat_task is not None:
+            return
+        from .heartbeat import CognitiveHeartbeat
+
+        self._heartbeat = CognitiveHeartbeat(self.memory, self._router)
+        self._heartbeat_on_alert = on_alert
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(interval_seconds))
+
+    async def stop_heartbeat(self) -> None:
+        task = self._heartbeat_task
+        if task is None:
+            return
+        self._heartbeat_task = None
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _heartbeat_loop(self, interval_seconds: float) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                entry = await self._heartbeat.run_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[Alfred] Heartbeat cycle error: {e}")
+                continue
+
+            if entry.type in ("nudge", "proposal") and self._heartbeat_on_alert:
+                try:
+                    await self._heartbeat_on_alert(entry.to_dict())
+                except Exception as e:
+                    print(f"[Alfred] Heartbeat alert callback failed: {e}")
+
+    def get_heartbeat_log(self, limit: int = 20) -> List[Dict[str, Any]]:
+        return self._heartbeat.get_log(limit) if self._heartbeat else []
 
     async def install_mcp_server(
         self,

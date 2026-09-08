@@ -27,6 +27,122 @@ so far.
 
 ---
 
+## 2026-09-08 — Phase 3: cognitive heartbeat built for the live architecture (cloud routine, code-only)
+
+Picked the next unblocked Week 3 item off `ROADMAP.md` ("proactive memory
+surfacing (relocated heartbeat + GBrain's confidence-gated push-context)",
+carried over from Phase 2's rescoping). Branch: `auto/cognitive-heartbeat-20260908`
+off `feature/day7-heartbeat`.
+
+- **Real gap found before writing anything**: "relocated heartbeat" assumes
+  a heartbeat already exists somewhere and just needs moving. It doesn't —
+  `brain/v2/conversation.py`'s `Alfred` (the actual live architecture;
+  `brain/__init__.py` and `brain_api/server.py` both import it) has zero
+  heartbeat/proactive code. The only heartbeat in this repo lives in
+  `brain/alfred.py` and its byte-for-byte duplicate `brain/v2/alfred_v2.py`
+  — confirmed via grep that neither `_start_heartbeat`/`_heartbeat_loop`/
+  `_execute_heartbeat` has any live caller; `brain/alfred.py` used to be the
+  real v1 entrypoint but is now dead weight sitting alongside the shim of
+  the same name that superseded it (`brain/alfred_v2.py`, which just
+  re-exports `brain.v2.conversation.Alfred`). It's also just a cron (calendar
+  + email + a canned briefing), not the manifesto's actual spec — the
+  manifesto itself calls this out as the known gap to close ("The heartbeat
+  is a simple cron, not a cognitive loop"). Didn't touch/delete the dead
+  pair — out of scope for this change, flagged below as a cleanup candidate.
+- **Built `brain/v2/heartbeat.py`** (`CognitiveHeartbeat`): one LLM call per
+  cycle over T1+T3+T4 context (`memory.get_context_for_llm()`, the same
+  context-building method the chat path already uses — no new goal-storage
+  format invented), asking for the confidence-gated JSON the manifesto
+  spec'd (`gap_found`, `confidence`, `observation`, `suggested_action`).
+  Skips the LLM call entirely when there's no T4 profile yet (a fresh
+  install shouldn't burn a call asking a model to invent a goal from
+  nothing). Confidence gating:
+  - **high** → builds a tool+params proposal (same `_action_signature`
+    canonicalization `tool_executor.py`'s approval gate already uses) but
+    **does not auto-execute it**. Deliberate scope-narrowing from the
+    manifesto's literal "execute the corrective action": nobody is watching
+    an unattended cycle to catch a wrong guess, so auto-running a mutating
+    tool (send an email, delete a calendar event) off one heartbeat's
+    confidence is a bigger risk than the one-line spec accounts for. A
+    "high" verdict with no concrete `suggested_action` downgrades to medium
+    rather than being dropped or fabricated.
+  - **medium** → logged as a nudge, handed to an `on_alert` callback.
+  - **low** / no gap → logged as a plain observation, no callback.
+  - Malformed JSON, an LLM-call exception, or a memory-context exception all
+    become a logged "error" entry — `run_cycle()` never raises, so a bad
+    cycle can't crash the loop driving it.
+- **Wired into `Alfred`** (`brain/v2/conversation.py`): `start_heartbeat()`
+  / `stop_heartbeat()` / `get_heartbeat_log()`. Explicitly NOT auto-started
+  from `__init__` — every existing `build-system/test_*.py` constructs an
+  `Alfred()` via `__new__()` or the real constructor with no idea this loop
+  exists, and an auto-started background task would leak into all of them.
+  Same explicit-call pattern `connect_mcp_servers()` already uses.
+- **Wired into `brain_api/server.py`'s lifespan**: `alfred.start_heartbeat()`
+  on startup (default 7200s interval, matching the old dead heartbeat's
+  heavy-task cadence rather than inventing a new number), `on_alert` set to
+  a new `_broadcast_heartbeat_alert()` that pushes nudge/proposal cycles to
+  connected cockpit WebSocket clients as `{"type": "heartbeat", ...}`.
+  `await alfred.stop_heartbeat()` added to shutdown. Gated behind
+  `ALFRED_HEARTBEAT_ENABLED` (default on) as an explicit kill switch — this
+  cloud sandbox cannot live-verify a background asyncio loop against a real
+  server process, so a way to turn it off without a code change felt like
+  the right default for a first pass.
+- **16 new mocked tests**, `build-system/test_heartbeat.py`: all four
+  confidence branches plus the high-without-action downgrade, no-gap-found
+  short-circuit, three failure modes (malformed reply / LLM exception /
+  memory exception) each becoming a clean "error" entry, log accumulation,
+  the actual system-prompt content sent to the router, and the `Alfred`
+  lifecycle (never auto-starts, runs a cycle and fires `on_alert` once
+  started, idle cycles don't fire `on_alert`, double-start is a no-op,
+  stop-before-start is a safe no-op). Full existing suite re-run clean
+  after installing this sandbox's still-missing runtime deps
+  (`python-dotenv`, `numpy`, `groq`, `openai`, `google-genai` — same gap
+  the 2026-09-05 speed-audit entry hit, not newly introduced): every
+  `build-system/test_*.py` passes except the same two pre-existing,
+  unrelated gaps already on record — `test_glob_rejects_unsafe_absolute_pattern`
+  (Linux-sandbox-vs-real-Windows-target difference, logged 2026-09-05) and
+  `test_mcp_client.py` (the `mcp` PyPI package itself isn't installed in
+  this sandbox; untouched by this change).
+- **What still needs a live check from Sam or a local session** (this is
+  entirely code+mocks, per the fail-safe rules):
+  1. **The prompt itself was never run against a real model.** The JSON
+     contract is enforced by the parser, but whether a real LLM actually
+     returns well-formed `{"gap_found":..., "confidence":..., ...}` JSON on
+     the first try, or needs the same salvage/repair treatment
+     `conversation.py`'s main loop already has for tool-call JSON, is
+     unverified. If it turns out to need that, `_extract_json_object` in
+     `heartbeat.py` is the place to add it (mirrors, but doesn't share code
+     with, `tool_executor.py`'s helper of the same name/shape, and
+     `conversation.py`'s own `_loads_lenient`/`_salvage_truncated_reply`).
+  2. **"High" proposals aren't reachable from the cockpit yet.** The
+     signature scheme matches `tool_executor.py`'s approval gate, but
+     nothing today feeds a heartbeat proposal into a live chat session's
+     `approved_actions` flow — a real Approve click on one would need new
+     plumbing (probably a way to start/continue a "session" from a
+     heartbeat proposal rather than a user message). Left as its own
+     follow-up rather than guessed at here, since it touches the session/
+     WebSocket machinery this cloud sandbox can't exercise live.
+  3. **No cockpit-side handler exists yet** for the new
+     `{"type": "heartbeat", ...}` WebSocket message
+     `_broadcast_heartbeat_alert` sends — it will currently just be an
+     unhandled message type in the browser client (`alfred-cockpit`, a
+     separate repo). Needs a matching UI change there before nudges are
+     actually visible to Sam.
+  4. **Interval + default-on is a judgment call, not a measured one.** 7200s
+     matches the old dead code's number by convention, not by any real data
+     on how often a proactive check is actually useful vs. noisy — worth
+     Sam's opinion once he's seen a few real cycles' output.
+- **Open question for Sam**: whether `brain/alfred.py` +
+  `brain/v2/alfred_v2.py` (the dead, duplicate pre-rebuild pair found while
+  investigating this) are safe to delete outright, or whether something
+  still expects them to exist (e.g. an external script, or a debug tool
+  outside this repo). `build-system/debug_prompt2.py`,
+  `debug_llm_direct.py`, and `brain/loop_tests.py` still import
+  `brain.alfred.Alfred` directly (not `brain.alfred_v2` — the shim) so
+  removing `brain/alfred.py` isn't a no-op cleanup; didn't touch it this
+  run since it's unrelated to the heartbeat and not a code-only decision to
+  make unprompted.
+
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
 Full offline+live pass over everything Phase 2 shipped (generic client,

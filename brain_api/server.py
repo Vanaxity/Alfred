@@ -104,12 +104,26 @@ async def lifespan(app: FastAPI):
     # if the file doesn't exist -- MCP is additive, not required to boot.
     await alfred.connect_mcp_servers()
 
+    # Phase 3: cognitive heartbeat. Never live-verified from this cloud
+    # sandbox (no real LLM keys, no real server) -- ALFRED_HEARTBEAT_ENABLED
+    # is an explicit kill switch for Sam to flip off without a code change
+    # if a live run turns up a problem this mocked pass couldn't catch.
+    # Default interval matches the old dead heartbeat's heavy-task cadence
+    # (7200s / 2h) rather than inventing a new number.
+    if os.environ.get("ALFRED_HEARTBEAT_ENABLED", "true").lower() not in ("0", "false", "no"):
+        interval = float(os.environ.get("ALFRED_HEARTBEAT_INTERVAL_SECONDS", "7200"))
+        alfred.start_heartbeat(interval_seconds=interval, on_alert=_broadcast_heartbeat_alert)
+        print(f"  Cognitive heartbeat started (interval: {interval:.0f}s)")
+    else:
+        print("  Cognitive heartbeat disabled (ALFRED_HEARTBEAT_ENABLED)")
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 
     yield
 
     print("\nShutting down Alfred Brain API...")
+    await alfred.stop_heartbeat()
     await alfred.disconnect_mcp_servers()
     stop_ngrok()
 
@@ -241,6 +255,16 @@ async def broadcast_to_clients(message: dict):
         except:
             disconnected.add(client)
     CONNECTED_CLIENTS.difference_update(disconnected)
+
+
+async def _broadcast_heartbeat_alert(entry: dict):
+    """on_alert callback for Alfred.start_heartbeat() -- pushes a "nudge" or
+    "proposal" cognitive-heartbeat cycle to every connected cockpit client.
+    Wrapped in its own message type ("heartbeat") rather than reusing "chat"
+    so the cockpit UI can render it distinctly (no session_id -- this isn't
+    a reply to anything Sam sent). No cockpit-side handler for this message
+    type exists yet as of this change -- see PROGRESS.md."""
+    await broadcast_to_clients({"type": "heartbeat", **entry})
 
 
 @app.websocket("/ws")
