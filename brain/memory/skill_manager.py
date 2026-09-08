@@ -527,6 +527,31 @@ class SkillManager:
             print(f"[SkillManager] Failed to generate skill: {e}")
             return None
 
+    def record_skill_use(self, skill_id: str, success: bool) -> bool:
+        """Bump success_count/failure_count for a skill actually used this
+        turn and persist it to both disk and the cache.
+
+        Previously these counters were only ever set once, at creation
+        time in generate_skill() (1/0 or 0/1) -- nothing incremented them
+        on subsequent matches via find_skill(), so a skill's displayed
+        success rate stayed frozen forever and Tool Forge's "used
+        successfully more than 3 times" trigger had no real signal to
+        fire on. This is the actual usage-tracking half of that gap.
+        """
+        skill = self._skills_cache.get(skill_id)
+        if not skill:
+            return False
+        if success:
+            skill.success_count += 1
+        else:
+            skill.failure_count += 1
+        try:
+            Path(skill.path).write_text(skill.to_markdown(), encoding="utf-8")
+        except Exception:
+            pass
+        self._skills_cache[skill_id] = skill
+        return True
+
     def improve_skill(
         self, skill_id: str, improvement_note: str, new_steps: List[Dict] = None
     ) -> bool:

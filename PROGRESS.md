@@ -7,7 +7,7 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 + Phase 2 engineering: closed (2026-09-08). Currently in: Phase 3
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is
 over — Q2 and Q8 both closed same-day via local-session work, on top of
@@ -20,12 +20,108 @@ Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
 explicitly manual/non-blocking per `ROADMAP.md` — not something a
 session should pick up and start working unprompted.
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+Phase 2 (MCP client + filesystem connector + find/install_mcp_server) is
+also done and live-tested per the 2026-09-08 entry below.
+
+**Now in Phase 3** (per `ROADMAP.md`): Tool Forge, self-audit loop, entity
+graph & synthesis, proactive memory surfacing carried over from Phase 2's
+rescoping. See the dated entries below for what's actually shipped so far
+— Tool Forge's first slice (skill usage tracking + the forge pipeline
+itself) landed 2026-09-08, code-only/cloud, not yet live-verified.
 
 ---
+
+## 2026-09-08 — Phase 3: Tool Forge pipeline shipped (cloud, code-only)
+
+Picked up the next unblocked, code-only Phase 3 item off `ROADMAP.md`:
+"Finish Tool Forge... `improve_skill()`'s wiring from this week is the
+down payment; this is the rest of it." Cloud session — no live server, no
+real LLM calls, no local vault; verified against the mocked suite only.
+
+- **Found the actual prerequisite gap first**: `Skill.success_count` /
+  `failure_count` were only ever set once, at creation time in
+  `generate_skill()` — nothing in the live conversation loop incremented
+  them on later matches via `find_skill()`. Tool Forge's own trigger
+  ("used successfully more than 3 times") had no real counter to read.
+  Added `SkillManager.record_skill_use(skill_id, success)` (increments
+  the right counter, persists `to_markdown()` to disk, updates the
+  cache — same disk+cache-consistency discipline as this week's
+  `improve_skill()` fix) and wired it into `conversation.py`: every turn
+  that used a matched skill now calls it before the existing
+  improve-on-failure path runs.
+- **`brain/tool_forge.py`** — the three-stage pipeline the manifesto
+  specifies:
+  1. `build_forge_prompt()` / `extract_code()` — ask the LLM (via the
+     existing `LLMRouter.call()`, no new call surface) for one
+     self-contained `def run(params: dict) -> dict`, pull it out of a
+     fenced code block.
+  2. `check_invariants()` — the manifesto's "invariant checker," AST-based
+     and static (runs before anything executes): exactly one top-level
+     `run(params)` function, imports restricted to a small stdlib
+     allowlist (math/re/json/datetime/statistics/itertools/collections/
+     string/textwrap), no eval/exec/compile/`__import__`/open/getattr-
+     family calls, no dunder attribute access (blocks the classic
+     `().__class__.__bases__` sandbox-escape idiom).
+  3. `validate_in_sandbox()` — actually runs the candidate function once,
+     for real, in a timeout-bounded subprocess (mirrors `handle_run_code`'s
+     existing isolation model) before it's trusted at all.
+  Only code that clears all three gets written to disk (Sam's Obsidian
+  vault, `Memory/ForgedTools/`, alongside T2 skills/T3 episodes/the T4
+  profile — generated per-installation state, not something to commit
+  into this repo, same reasoning as why T2 skills already live outside
+  it) and handed back to `conversation.py`, which registers it through
+  the *same* `ToolExecutor.register()` every built-in and MCP tool
+  already uses — `require_approval=True`, the same trust tier as
+  `shell`/`run_code`/`install_mcp_server`, since this is LLM-generated
+  code, not a vetted built-in. A forged tool's handler re-runs it through
+  the sandbox on every actual call too, not just at forge time.
+  Previously-forged tools re-register on process restart
+  (`load_forged_tools()`) without repeating the LLM/sandbox pipeline.
+- Failed forge attempts are tracked per skill_id (`forged_tools.json` next
+  to the code) so a skill that keeps failing to forge doesn't re-run the
+  LLM call + sandbox on every single turn it's matched — caps at 2
+  attempts, then leaves it alone.
+- **32 new mocked tests** (`test_tool_forge.py`) plus 3 more in
+  `test_skill_manager.py` for `record_skill_use`. The invariant-checker
+  and sandbox tests aren't LLM-mocked at all — `validate_in_sandbox()` is
+  pure local subprocess execution (spawns real `python`, no network/
+  credentials), so those tests really do spawn a subprocess and confirm
+  it: accepts clean code, rejects a disallowed import, rejects a call
+  that raises, and enforces its timeout on an infinite loop. The LLM
+  itself is the only thing faked (a `FakeRouter`), same pattern as every
+  other test file here. Full suite after this branch's changes: every
+  file passes except `test_glob_rejects_unsafe_absolute_pattern`, the
+  same pre-existing Linux-sandbox-vs-real-Windows-target failure already
+  documented in the 2026-09-05 Q8 entry below — confirmed unrelated
+  (untouched by this branch, same failure shape).
+- **What still needs a live check from Sam or a local session** (this is
+  the part a cloud sandbox genuinely cannot verify):
+  - Whether a *real* LLM actually produces usable `run(params)` code for
+    a real skill's steps often enough to be worth the pipeline — every
+    test here uses a canned fake response. A real skill also often
+    encodes calling other tools (calendar, email, web_search), which
+    this design deliberately can't convert (the prompt tells the LLM to
+    return `{"error": "requires <tool>, not convertible to pure code"}`
+    for those rather than fake success) — so in practice this may mostly
+    forge pure-computation skills (calculator-shaped tasks) rather than
+    the general case. That's a real design question, not a bug: worth
+    Sam's read on whether narrowing "Tool Forge" to compute-only skills
+    is the right scope or whether it should eventually shell out to
+    other tools too (which would need a very different sandbox/trust
+    model).
+  - No live turn has actually crossed the new success_count > 3 threshold
+    for a real skill yet — the whole path (record_skill_use accumulating
+    across real turns, should_forge firing, a real LLM call, real
+    sandbox validation, the tool actually showing up and being callable
+    in a live conversation) is unverified end-to-end outside mocks.
+  - `Memory/ForgedTools/` as a location is new; hasn't been confirmed to
+    not collide with anything else Sam has in that vault path.
+- **Open question for Sam**: should a forged tool ever be allowed to
+  supersede/replace the skill it came from (skip skill-matching entirely
+  once a tool exists), or should the skill stay as a fallback if the
+  forged tool's sandboxed call fails at runtime? Left unforged (pun
+  intended) — both the skill and the tool coexist for now, whichever the
+  LLM picks each turn.
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 

@@ -159,6 +159,16 @@ class Alfred:
         # Bootstrap (AGENTS.md, SOUL.md, etc.)
         self._bootstrap = self._load_bootstrap()
 
+        # Phase 3: Tool Forge — skills used successfully enough times get
+        # converted into real registered tools (see brain/tool_forge.py).
+        # Schemas of anything it forged (this run or a previous one) merge
+        # into _get_tool_descriptions() the same way MCP tools do.
+        from ..tool_forge import ToolForge
+
+        self._tool_forge = ToolForge(router=self._router)
+        self._forged_tool_schemas: Dict[str, Dict[str, Any]] = {}
+        self._register_previously_forged_tools()
+
         # Post-turn memory curation tasks (fire-and-forget) -- kept here so
         # they aren't garbage-collected mid-flight; never awaited by a turn.
         self._pending_curation_tasks: List[Any] = []
@@ -215,6 +225,30 @@ class Alfred:
     async def disconnect_mcp_servers(self) -> None:
         from ..mcp_client import get_mcp_client
         await get_mcp_client().disconnect_all()
+
+    def _register_previously_forged_tools(self) -> None:
+        """Re-register every tool a previous run's Tool Forge already
+        validated and wrote to forged_tools/ -- a restart shouldn't lose
+        capabilities that already cleared the invariant check + sandbox
+        once, and re-forging (another LLM call + validation) would be
+        pure waste for something already on disk."""
+        for entry in self._tool_forge.load_forged_tools():
+            self._register_forged_tool(
+                entry["tool_name"], entry["code_path"], entry.get("description", ""),
+            )
+
+    def _register_forged_tool(self, tool_name: str, code_path: str, description: str) -> None:
+        """Registers through the same ToolExecutor.register() every
+        built-in and MCP tool already uses, and adds its schema so the
+        LLM actually knows it exists (see _get_tool_descriptions)."""
+        self._tool_forge.register_forged_tool(self._tool_executor, tool_name, code_path)
+        self._forged_tool_schemas[tool_name] = {
+            "description": (
+                (description or "Auto-forged tool from a learned skill.")
+                + " (Requires approval before running -- LLM-generated code.)"
+            ),
+            "params": {"params": "dict of parameters matching the original skill's step params"},
+        }
 
     async def install_mcp_server(
         self,
@@ -568,12 +602,17 @@ class Alfred:
                 },
             },
         }
-        # getattr, not self._mcp_tool_schemas directly: several existing
-        # tests build a bare Alfred via object.__new__() to test one method
-        # in isolation without running the real __init__ -- confirmed this
-        # broke test_speed_audit_timing.py live. An absent attribute means
-        # "no MCP servers connected yet," same as an empty dict would.
-        return {**builtin, **getattr(self, "_mcp_tool_schemas", {})}
+        # getattr, not self._mcp_tool_schemas/_forged_tool_schemas directly:
+        # several existing tests build a bare Alfred via object.__new__() to
+        # test one method in isolation without running the real __init__ --
+        # confirmed this broke test_speed_audit_timing.py live. An absent
+        # attribute means "none connected/forged yet," same as an empty
+        # dict would.
+        return {
+            **builtin,
+            **getattr(self, "_mcp_tool_schemas", {}),
+            **getattr(self, "_forged_tool_schemas", {}),
+        }
 
     # ------------------------------------------------------------------
     # LLM output parser
@@ -1172,23 +1211,48 @@ class Alfred:
             except Exception as e:
                 thinking.append(f"  Skill generation failed: {e}")
 
-        # --- Maybe improve skill ---
-        # A matched skill was used to shape this turn and something in it
-        # still failed -- the recipe was wrong, patch it, mirroring Hermes
-        # Agent's skill self-improvement loop. Same gate shape as skill
-        # generation above, inverted (that one requires no failures; this one
-        # requires a failure plus a skill actually having been in play).
-        if matched_skill is not None and any(
-            tr.get("success") is False for tr in tool_results
-        ):
-            failed = next((tr for tr in tool_results if tr.get("success") is False), {})
-            failure_detail = failed.get("output") or failed.get("error") or "unknown"
-            note = f"Used for '{task[:80]}' and a step failed: {str(failure_detail)[:150]}"
+        # --- Record skill outcome; improve on failure, maybe forge on success ---
+        # A matched skill was used to shape this turn -- track whether it
+        # worked (record_skill_use), mirroring Hermes Agent's skill
+        # self-improvement loop on failure, and feeding Tool Forge's own
+        # "used successfully more than 3 times" trigger on success.
+        if matched_skill is not None:
+            turn_failed = any(tr.get("success") is False for tr in tool_results)
             try:
-                self.skill_manager.improve_skill(matched_skill.skill_id, note)
-                thinking.append(f"  Flagged skill '{matched_skill.title}' for improvement")
+                self.skill_manager.record_skill_use(matched_skill.skill_id, success=not turn_failed)
             except Exception as e:
-                thinking.append(f"  Skill improvement failed: {e}")
+                thinking.append(f"  Skill usage recording failed: {e}")
+
+            if turn_failed:
+                failed = next((tr for tr in tool_results if tr.get("success") is False), {})
+                failure_detail = failed.get("output") or failed.get("error") or "unknown"
+                note = f"Used for '{task[:80]}' and a step failed: {str(failure_detail)[:150]}"
+                try:
+                    self.skill_manager.improve_skill(matched_skill.skill_id, note)
+                    thinking.append(f"  Flagged skill '{matched_skill.title}' for improvement")
+                except Exception as e:
+                    thinking.append(f"  Skill improvement failed: {e}")
+            else:
+                forge = getattr(self, "_tool_forge", None)
+                try:
+                    if forge is not None and forge.should_forge(matched_skill):
+                        forge_result = await forge.forge_from_skill(matched_skill)
+                        if forge_result.ok:
+                            self._register_forged_tool(
+                                forge_result.tool_name, forge_result.code_path,
+                                matched_skill.description,
+                            )
+                            thinking.append(
+                                f"  Tool Forge: '{matched_skill.title}' converted to new "
+                                f"tool '{forge_result.tool_name}'"
+                            )
+                        else:
+                            thinking.append(
+                                f"  Tool Forge attempt on '{matched_skill.title}' failed: "
+                                f"{forge_result.error}"
+                            )
+                except Exception as e:
+                    thinking.append(f"  Tool Forge error: {e}")
 
         # --- Post-turn memory curation (fire-and-forget) ---
         # A second, independent look at this exchange, restricted to
