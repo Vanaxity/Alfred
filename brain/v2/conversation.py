@@ -171,6 +171,41 @@ class Alfred:
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
+        # Phase 3: proactive cognitive heartbeat (see brain/v2/heartbeat.py).
+        # Alerts it generates land here regardless of whether a Heartbeat is
+        # running yet, so get_and_clear_alerts() is always safe to poll.
+        self._pending_alerts: List[Dict[str, Any]] = []
+        self._heartbeat = None
+
+    def start_heartbeat(self, interval_seconds: Optional[int] = None, on_alert=None) -> None:
+        """Start the background cognitive-pulse loop. Safe to call more than
+        once (no-op past the first call) and safe to call with no event loop
+        running yet -- see Heartbeat.start(). Called from brain_api/server.py's
+        startup lifespan, same as connect_mcp_servers()."""
+        from .heartbeat import Heartbeat, DEFAULT_INTERVAL_SECONDS
+
+        if self._heartbeat is not None:
+            return
+        self._heartbeat = Heartbeat(
+            self,
+            interval_seconds=interval_seconds or DEFAULT_INTERVAL_SECONDS,
+            on_alert=on_alert,
+        )
+        self._heartbeat.start()
+
+    def stop_heartbeat(self) -> None:
+        if self._heartbeat is not None:
+            self._heartbeat.stop()
+            self._heartbeat = None
+
+    def get_and_clear_alerts(self) -> List[Dict[str, Any]]:
+        """Pending heartbeat alerts (nudges / action proposals), for polling
+        endpoints or a reconnecting WebSocket client that missed the live
+        broadcast. Clears the queue -- each alert is returned exactly once."""
+        alerts = list(self._pending_alerts)
+        self._pending_alerts.clear()
+        return alerts
+
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
         and register each one through the same ToolExecutor.register()

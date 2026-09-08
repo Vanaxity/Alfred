@@ -104,12 +104,18 @@ async def lifespan(app: FastAPI):
     # if the file doesn't exist -- MCP is additive, not required to boot.
     await alfred.connect_mcp_servers()
 
+    # Phase 3: proactive cognitive heartbeat (brain/v2/heartbeat.py). Alerts
+    # broadcast live to whatever's connected over /ws; get_and_clear_alerts()
+    # below covers a client that reconnects and missed one.
+    alfred.start_heartbeat(on_alert=broadcast_to_clients)
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 
     yield
 
     print("\nShutting down Alfred Brain API...")
+    alfred.stop_heartbeat()
     await alfred.disconnect_mcp_servers()
     stop_ngrok()
 
@@ -476,6 +482,16 @@ async def get_tasks():
 
 
 # ============ LOCAL DB ENDPOINTS (Replaces Supabase) ============
+
+@app.get("/api/alerts")
+async def get_alerts():
+    """Pending heartbeat alerts (nudges / high-confidence action proposals)
+    the cognitive pulse generated since the last poll. Alerts also broadcast
+    live over /ws as they're generated -- this is the catch-up path for a
+    client that was disconnected when one fired. Clears the queue."""
+    alfred = get_alfred()
+    return {"alerts": alfred.get_and_clear_alerts()}
+
 
 @app.get("/api/state")
 async def get_state():

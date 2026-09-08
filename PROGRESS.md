@@ -27,6 +27,91 @@ so far.
 
 ---
 
+## 2026-09-08 — Phase 3: relocated the cognitive heartbeat into v2 (cloud routine, code-only)
+
+Picked up ROADMAP.md's Week 3 item "proactive memory surfacing (the
+relocated heartbeat + GBrain's confidence-gated push-context)" — the next
+unblocked, code-only item once Phase 1/2 closed. Branch:
+`auto/relocated-heartbeat-20260908`, off `feature/day7-heartbeat`.
+
+- **Confirmed the v1 heartbeat is dead code, not something to copy.**
+  `brain/alfred.py` / `brain/v2/alfred_v2.py` still have a full
+  `_execute_heartbeat()`, but `brain/__init__.py` → `brain/alfred_v2.py`
+  (the shim) resolves `get_alfred()` to `brain.v2.conversation.Alfred`
+  instead — confirmed by reading the shim's own docstring. v1's heartbeat
+  calls `memory.t3_search()` and `db.get_due_reminders()`, neither of
+  which exist on the current `FiveTierMemory`/`LocalDB` (`t3_find_episodes`
+  and no reminders table at all) — it would crash immediately if wired in
+  as-is. This needed a fresh port, not a relocation of working code.
+- **New `brain/v2/heartbeat.py`**: `run_cognitive_pulse(alfred)` builds a
+  prompt from T4 profile/goals (`memory.get_context_for_llm()`) + recent
+  T3 episodes (`memory.t3_find_episodes`), asks the LLM router to name a
+  concrete gap and self-rate confidence (high/medium/low), per the
+  manifesto's own "Cognitive Heartbeat" spec (`docs/MANIFESTO_V5.md` §3).
+  `Heartbeat` class wraps it in a periodic loop (default 1h, skips outside
+  7am-11pm same as v1's window), started/stopped explicitly via
+  `Alfred.start_heartbeat()`/`stop_heartbeat()` — mirrors the
+  `connect_mcp_servers()` pattern since spawning the loop task needs a
+  running event loop that isn't available in Alfred's sync `__init__`.
+- **Deliberate scope decision, flagged as an open question below, not
+  guessed past**: the manifesto's own wording says a high-confidence gap
+  should "execute the corrective action" autonomously. This implementation
+  does **not** do that — high confidence produces a `heartbeat_action_proposal`
+  alert with a `proposed_action` field, surfaced but never run. Every other
+  mutating capability shipped this project (MCP tools default
+  `require_approval=True`, `shell`/`run_code`) is gated behind an explicit
+  human approval specifically because unsupervised model action is the
+  failure mode Q2's security work targeted — a background loop with no
+  live conversation to attach an approval prompt to seemed like exactly
+  the wrong place to be the first exception. Went with the safer default
+  rather than silently picking the riskier literal reading.
+- **Alerts surface two ways**: live over the existing `/ws` broadcast
+  (`alfred.start_heartbeat(on_alert=broadcast_to_clients)`, wired into
+  `brain_api/server.py`'s startup lifespan, mirrors how mode-change events
+  already broadcast) and via a new `GET /api/alerts` poll endpoint for a
+  client that reconnects and missed the live push. No cockpit UI for
+  either — that's frontend work in a different repo, out of scope here.
+- No email/calendar integration in this slice (that's
+  `brain/tools/gws_client.py`'s existing, separate concern) — the pulse
+  reasons only over T4/T3, which is what "memory surfacing" in the roadmap
+  item's own name refers to.
+- **20 new mocked tests** (`build-system/test_heartbeat.py`): JSON
+  extraction from a prose-wrapped reply, the "nothing to reason about yet"
+  skip (no LLM call spent when there's no profile/episodes at all),
+  confidence parsing and gating (low/medium/high → no-alert/nudge/action-
+  proposal), silent-failure behavior when the router or memory raises
+  (must never crash the loop), `Heartbeat.tick()`'s alert-queueing and
+  `on_alert` callback (including the callback itself raising — must not
+  break the tick), active-hours skip not counting as a real pulse,
+  start/stop lifecycle and idempotent `start()`, and `Alfred.start_heartbeat()`/
+  `stop_heartbeat()`/`get_and_clear_alerts()` integration. Full existing
+  suite re-run clean: `test_mcp_client.py` needed the sandbox's `mcp`
+  package installed first (pre-existing gap, unrelated to this change —
+  the module import fails identically on a clean checkout of this
+  branch's parent), then 11/11; `test_tool_executor.py` 46/47 with the
+  same pre-existing `test_glob_rejects_unsafe_absolute_pattern` failure
+  already documented above (Linux-sandbox-vs-real-Windows-target
+  difference, confirmed unrelated by inspection — this branch doesn't
+  touch `tool_executor.py`); every other suite green, `test_live_realistic.py`
+  correctly preflight-aborts with no provider keys in this cloud sandbox.
+- **What still needs a live check from Sam or a local session** (this is
+  a cloud run — no real LLM keys, no real vault, no real event loop
+  running for hours at a time): (1) whether the pulse prompt actually gets
+  useful, non-generic gap detection out of a real model against Sam's real
+  T4 profile and T3 episodes, or needs prompt tuning — only tested here
+  against scripted fake replies; (2) whether 1-hour is the right interval
+  in practice (too chatty vs. too quiet) — no real usage data yet; (3) the
+  `/ws` broadcast path has no live test — `broadcast_to_clients` itself
+  isn't touched, but the actual JSON shape reaching a real connected
+  cockpit client was never opened in a browser this run.
+- **Open question for Sam**: should high-confidence heartbeat proposals
+  eventually route through the same approval-gate UI the MCP/shell tools
+  use (the Approve/Deny buttons confirmed working in the 2026-09-08 entry
+  above), or would that need its own surface since there's no live
+  conversation turn to attach it to? Left unresolved rather than guessed
+  at — this PR only stops short of auto-executing, it doesn't design the
+  eventual approval path.
+
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
 Full offline+live pass over everything Phase 2 shipped (generic client,
