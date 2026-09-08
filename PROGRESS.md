@@ -30,6 +30,22 @@ questions) are explicitly manual/non-blocking per `ROADMAP.md`.
 
 ---
 
+## 2026-09-10 — Phase 3: skill validation sandbox + SemVer versioning merged
+
+Cloud routine's skill-validation slice (originally filed 2026-09-08),
+rebased onto main and merged manually after the Phase A reliability work
+landed. `SkillManager.validate_skill()` gates a skill before it joins the
+live T2 pool (known tools, required params, action-aware email/calendar
+checks, a real dry-run for `calculator`); failures go to
+`T2-Skills/drafts/` instead of being discarded or saved untested, with
+`list_draft_skills()`/`promote_draft_skill()` to review them. `Skill.version`
+(SemVer, default 0.1.0) round-trips through markdown; `improve_skill()`
+bumps the patch. 20 mocked tests in `build-system/test_skill_validation.py`.
+The heavier LLM-generates-and-registers-code half of Tool Forge is
+deliberately NOT in this — separate, security-sensitive, its own pass.
+
+---
+
 ## 2026-09-09 — Triaged and fixed the Phase 3 PR pileup; cloud routine disabled
 
 The cloud routine fired continuously through the night and produced a

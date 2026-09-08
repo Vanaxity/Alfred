@@ -8,9 +8,11 @@ Handles:
 - Ecosystem search: falls back to skills.sh when local skills don't match
 """
 
+import ast
 import hashlib
 import json
 import math
+import operator as op
 import re as _re
 import subprocess
 import time
@@ -63,6 +65,118 @@ STOP_WORDS: set = {
 }
 
 
+def _bump_patch_version(version: str) -> str:
+    """SemVer patch bump for a skill improvement. Falls back to a fresh
+    patch-1 version if the stored string isn't a clean X.Y.Z (e.g. a skill
+    saved before versioning existed)."""
+    parts = version.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return "0.1.1"
+    major, minor, patch = parts
+    return f"{major}.{minor}.{int(patch) + 1}"
+
+
+# Params a step must supply unconditionally for the handler to do anything
+# useful — mirrors the required-field checks each brain/v2/tool_executor.py
+# handler makes itself (e.g. handle_web_fetch rejects a missing/non-http
+# `url` before it ever touches the network). Tools whose requirements
+# depend on an `action` sub-param (email, calendar) are validated
+# separately in _validate_email_step/_validate_calendar_step instead of
+# living in this flat table.
+REQUIRED_STEP_PARAMS: Dict[str, List[str]] = {
+    "calculator": ["expression"],
+    "web_search": ["query"],
+    "web_fetch": ["url"],
+    "shell": ["command"],
+    "run_code": ["code"],
+    "read_file": ["path"],
+    "write_file": ["path", "content"],
+    "open_app": ["app_name"],
+    "remember": ["key", "value"],
+    "memory_save": ["content"],
+    "memory_search": ["query"],
+}
+
+
+def _missing_required_params(tool: str, params: dict) -> List[str]:
+    return [p for p in REQUIRED_STEP_PARAMS.get(tool, []) if not params.get(p)]
+
+
+def _validate_email_step(params: dict) -> Optional[str]:
+    action = params.get("action", "triage")
+    if action == "send" and not params.get("to"):
+        return "email action 'send' needs 'to'"
+    if action == "read" and not (params.get("query") or params.get("email_id")):
+        return "email action 'read' needs 'email_id'"
+    return None
+
+
+def _validate_calendar_step(params: dict) -> Optional[str]:
+    action = params.get("action", "agenda")
+    if action == "create" and not (params.get("summary") or params.get("title")):
+        return "calendar action 'create' needs 'summary'/'title'"
+    if action == "delete" and not (params.get("summary") or params.get("query")):
+        return "calendar action 'delete' needs 'summary'/'query'"
+    return None
+
+
+# Deliberately a smaller allowlist than tool_executor.handle_calculator's --
+# this only needs to catch a garbage/unevaluable expression before a skill
+# is trusted, not reproduce the real calculator tool. Not imported from
+# tool_executor: that module lives under brain/v2, whose package __init__
+# imports conversation.py, which imports SkillManager -- importing it from
+# here would be a circular import at module-load time.
+_CALC_SAFE_OPS = {
+    ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
+    ast.Div: op.truediv, ast.Pow: op.pow,
+    ast.USub: op.neg, ast.UAdd: op.pos,
+    ast.FloorDiv: op.floordiv, ast.Mod: op.mod,
+}
+_CALC_SAFE_FUNCS = {
+    "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "log": math.log, "log10": math.log10, "exp": math.exp, "abs": abs,
+}
+_CALC_SAFE_NAMES = {"pi": math.pi, "e": math.e}
+
+
+def _dry_run_calculator(expression: str) -> Optional[str]:
+    """Safely evaluate a calculator expression for skill validation.
+
+    Returns None if it evaluates to a real number, else an error string.
+    Pure arithmetic on literals — no I/O, no side effects, so this is the
+    one tool this module actually dry-runs rather than checking structurally.
+    """
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _CALC_SAFE_OPS:
+            return _CALC_SAFE_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _CALC_SAFE_OPS:
+            return _CALC_SAFE_OPS[type(node.op)](_eval(node.operand))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _CALC_SAFE_FUNCS:
+            return _CALC_SAFE_FUNCS[node.func.id](*[_eval(a) for a in node.args])
+        if isinstance(node, ast.Name) and node.id in _CALC_SAFE_NAMES:
+            return _CALC_SAFE_NAMES[node.id]
+        raise ValueError(f"unsupported expression element: {type(node).__name__}")
+
+    try:
+        result = _eval(ast.parse(expression, mode="eval"))
+        if not isinstance(result, (int, float)) or isinstance(result, bool):
+            return "non-numeric result"
+        return None
+    except Exception as e:
+        return str(e)
+
+
+@dataclass
+class SkillValidation:
+    valid: bool
+    reasons: List[str]
+
+
 @dataclass
 class Skill:
     skill_id: str
@@ -74,6 +188,7 @@ class Skill:
     success_count: int = 0
     failure_count: int = 0
     path: str = ""
+    version: str = "0.1.0"
 
     def to_markdown(self) -> str:
         steps_md = "\n\n".join(
@@ -91,6 +206,7 @@ class Skill:
         return f"""# Learned Skill: {self.title}
 
 **Skill ID:** `{self.skill_id}`
+**Version:** {self.version}
 **Created:** {datetime.now().strftime("%Y-%m-%d %H:%M")}
 **Complexity:** {self.complexity}
 **Success Rate:** {rate}
@@ -117,6 +233,7 @@ class Skill:
         title = ""
         description = ""
         complexity = "moderate"
+        version = "0.1.0"
         tags = []
         steps = []
 
@@ -133,6 +250,10 @@ class Skill:
                 parts = line.split("**Complexity:**")
                 if len(parts) > 1:
                     complexity = parts[1].strip()
+            elif "**Version:**" in line:
+                parts = line.split("**Version:**")
+                if len(parts) > 1:
+                    version = parts[1].strip()
 
         current_step = {}
         for line in lines:
@@ -163,6 +284,7 @@ class Skill:
             tags=tags,
             complexity=complexity,
             path=path,
+            version=version,
         )
 
 
@@ -304,6 +426,105 @@ class SkillManager:
 
         return not has_non_chat_step
 
+    def validate_skill(self, skill: Skill) -> SkillValidation:
+        """Structural + (where safe) live dry-run check before a skill is
+        trusted enough to join the live T2 pool.
+
+        Manifesto Phase 3, "Skill Validation & Versioning": "Before saving
+        a T2 skill, Alfred runs a dry-run test in a sandbox (if safe). If
+        the skill fails validation, it's stored in a drafts/ folder for
+        revision, not deployed." Only calculator expressions are actually
+        executed here (pure, deterministic, no I/O) — every other tool is
+        checked structurally (known tool, required params present for the
+        requested action), since dry-running email/shell/calendar/etc.
+        live would mean real side effects or network calls, not a safe
+        dry run at all.
+        """
+        if not skill.steps:
+            return SkillValidation(valid=False, reasons=["skill has no steps"])
+
+        reasons: List[str] = []
+        for i, step in enumerate(skill.steps, start=1):
+            tool = step.get("tool", "")
+            if tool not in VALID_TOOLS:
+                reasons.append(f"step {i}: unknown tool '{tool}'")
+                continue
+
+            params = step.get("params")
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                reasons.append(f"step {i}: '{tool}' params is not an object")
+                continue
+
+            if tool == "email":
+                err = _validate_email_step(params)
+            elif tool == "calendar":
+                err = _validate_calendar_step(params)
+            else:
+                missing = _missing_required_params(tool, params)
+                err = f"'{tool}' missing required params {missing}" if missing else None
+            if err:
+                reasons.append(f"step {i}: {err}")
+                continue
+
+            if tool == "calculator":
+                calc_err = _dry_run_calculator(str(params.get("expression", "")))
+                if calc_err:
+                    reasons.append(f"step {i}: calculator dry run failed: {calc_err}")
+
+        return SkillValidation(valid=not reasons, reasons=reasons)
+
+    def _save_as_draft(self, skill: Skill, reasons: List[str]) -> Path:
+        """Persist a skill that failed validate_skill() to a drafts/
+        subfolder instead of discarding it outright, per the manifesto's
+        "stored in a drafts/ folder for revision, not deployed." Not glob'd
+        by _load_skills_metadata() (non-recursive `T2_SKILLS_DIR.glob("*.md")`),
+        so a draft never gets matched or executed until promote_draft_skill()
+        moves it into the live folder."""
+        drafts_dir = T2_SKILLS_DIR / "drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        safe_title = _re.sub(r'[^a-zA-Z0-9 ]', '', skill.title).strip().replace(' ', '-') or "skill"
+        out_path = drafts_dir / f"{safe_title}-{skill.skill_id}.md"
+        reasons_md = "\n".join(f"- {r}" for r in reasons)
+        content = skill.to_markdown() + f"\n## Validation Failed\n{reasons_md}\n"
+        out_path.write_text(content, encoding="utf-8")
+        skill.path = str(out_path)
+        return out_path
+
+    def list_draft_skills(self) -> List[Skill]:
+        drafts_dir = T2_SKILLS_DIR / "drafts"
+        if not drafts_dir.exists():
+            return []
+        drafts = []
+        for f in sorted(drafts_dir.glob("*.md")):
+            try:
+                drafts.append(Skill.from_markdown(str(f), f.read_text(encoding="utf-8")))
+            except Exception as e:
+                print(f"[SkillManager] Error loading draft {f}: {e}")
+        return drafts
+
+    def promote_draft_skill(self, skill_id: str) -> bool:
+        """Move a drafted skill into the live T2 pool once it's been
+        revised/reviewed, adding it to the in-memory cache so find_skill()
+        can match it without a full metadata reload."""
+        drafts_dir = T2_SKILLS_DIR / "drafts"
+        if not drafts_dir.exists():
+            return False
+        for f in drafts_dir.glob("*.md"):
+            try:
+                skill = Skill.from_markdown(str(f), f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if skill.skill_id != skill_id:
+                continue
+            new_path = T2_SKILLS_DIR / f.name
+            f.rename(new_path)
+            skill.path = str(new_path)
+            self._skills_cache[skill_id] = skill
+            return True
+        return False
+
     def _convert_skill_md_to_t2(self, md_path: Path) -> Optional[Skill]:
         content = md_path.read_text(encoding="utf-8")
         lines = content.split("\n")
@@ -372,6 +593,12 @@ class SkillManager:
 
         if self._is_low_quality_skill(skill):
             print(f"[SkillManager] Rejected low-quality skill: {name}", flush=True)
+            return None
+
+        validation = self.validate_skill(skill)
+        if not validation.valid:
+            self._save_as_draft(skill, validation.reasons)
+            print(f"[SkillManager] '{name}' failed validation, stored as draft: {validation.reasons}", flush=True)
             return None
 
         safe_name = _re.sub(r'[^a-zA-Z0-9 ]', '', name).strip().replace(' ', '-')[:60]
@@ -512,6 +739,12 @@ class SkillManager:
                 print(f"[SkillManager] Rejected low-quality auto-skill: {title}", flush=True)
                 return None
 
+            validation = self.validate_skill(skill)
+            if not validation.valid:
+                self._save_as_draft(skill, validation.reasons)
+                print(f"[SkillManager] '{title}' failed validation, stored as draft: {validation.reasons}", flush=True)
+                return None
+
             safe_title = _re.sub(r'[^a-zA-Z0-9 ]', '', title).strip().replace(' ', '-')
             filename = f"{safe_title}-{skill_id}.md"
             filepath = T2_SKILLS_DIR / filename
@@ -548,10 +781,13 @@ class SkillManager:
         if new_steps:
             skill.steps = new_steps
 
+        skill.version = _bump_patch_version(skill.version)
+
         improvement_section = f"""
 
 ## Skill Improvement Log
 **Updated:** {datetime.now().strftime("%Y-%m-%d %H:%M")}
+**Version:** {skill.version}
 **Note:** {improvement_note}
 """
         updated_content = skill.to_markdown() + improvement_section
