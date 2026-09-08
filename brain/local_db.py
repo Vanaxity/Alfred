@@ -350,7 +350,98 @@ class LocalDB:
             conn.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
             conn.commit()
 
-    # ============ SCHEDULED TASKS (legacy v1 path only — see local_db.py) ============
+    # ============ REMINDERS ============
+
+    def add_reminder(self, text: str, due_at: str, category: str = "general") -> int:
+        conn = self._get_conn()
+        with self._lock:
+            cur = conn.execute(
+                "INSERT INTO reminders (text, due_at, category) VALUES (?, ?, ?)",
+                (text, due_at, category),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def get_due_reminders(self) -> List[Dict]:
+        """Unfired reminders whose due_at has passed, oldest first."""
+        conn = self._get_conn()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM reminders WHERE fired = 0 AND due_at <= datetime('now') "
+                "ORDER BY due_at ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_reminder_fired(self, reminder_id: int) -> None:
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute("UPDATE reminders SET fired = 1 WHERE id = ?", (reminder_id,))
+            conn.commit()
+
+    # ============ SCHEDULED TASKS ============
+    # (the `update_last_run` helper below predates this section — it was the
+    # only piece of scheduled-task DB support that actually existed; the
+    # CRUD + due-task lookup the old brain/alfred.py heartbeat called
+    # (`get_due_scheduled_tasks`) never existed anywhere in this codebase,
+    # confirmed by grep — that heartbeat path was dead code even before it
+    # was superseded by brain/v2. Added here for the real CognitiveHeartbeat.)
+
+    def add_scheduled_task(self, task: str, cron_expr: str) -> int:
+        conn = self._get_conn()
+        with self._lock:
+            cur = conn.execute(
+                "INSERT INTO scheduled_tasks (task, cron_expr) VALUES (?, ?)",
+                (task, cron_expr),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def get_scheduled_tasks(self, active_only: bool = True) -> List[Dict]:
+        conn = self._get_conn()
+        query = "SELECT * FROM scheduled_tasks"
+        if active_only:
+            query += " WHERE active = 1"
+        with self._lock:
+            rows = conn.execute(query).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_due_scheduled_tasks(self) -> List[Dict]:
+        """Active scheduled tasks whose cron expression has a fire time at or
+        before now, computed from `last_run` (or `created_at` if it has never
+        run). Malformed cron expressions are skipped, not raised — one bad
+        row must not block every other task from being checked."""
+        from croniter import croniter
+
+        conn = self._get_conn()
+        with self._lock:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE active = 1"
+            ).fetchall()]
+
+        now = datetime.now()
+        due = []
+        for row in rows:
+            base_raw = row.get("last_run") or row.get("created_at")
+            try:
+                base_dt = datetime.fromisoformat(base_raw)
+            except (TypeError, ValueError):
+                continue
+            try:
+                next_fire = croniter(row["cron_expr"], base_dt).get_next(datetime)
+            except Exception:
+                continue
+            if next_fire <= now:
+                due.append(row)
+        return due
+
+    def set_scheduled_task_active(self, task_id: int, active: bool) -> None:
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute(
+                "UPDATE scheduled_tasks SET active = ? WHERE id = ?",
+                (1 if active else 0, task_id),
+            )
+            conn.commit()
 
     def update_last_run(self, task_id: int):
         conn = self._get_conn()

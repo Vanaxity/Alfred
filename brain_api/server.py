@@ -57,6 +57,7 @@ START_TIME = time.time()
 CONNECTED_CLIENTS: Set[WebSocket] = set()
 NGROK_URL: Optional[str] = None
 NGROK_PROCESS: Optional[subprocess.Popen] = None
+_HEARTBEAT_POLL_TASK: Optional[asyncio.Task] = None
 
 
 @asynccontextmanager
@@ -104,14 +105,45 @@ async def lifespan(app: FastAPI):
     # if the file doesn't exist -- MCP is additive, not required to boot.
     await alfred.connect_mcp_servers()
 
+    # Day 7: start the cognitive heartbeat (its own thread + event loop,
+    # see brain/v2/heartbeat.py) and a lightweight poller that broadcasts
+    # whatever it queues to connected WebSocket clients. The heartbeat
+    # thread has no access to this process's asyncio loop or
+    # CONNECTED_CLIENTS, so the poll is what actually gets an alert in
+    # front of the cockpit UI.
+    alfred.start_heartbeat()
+    global _HEARTBEAT_POLL_TASK
+    _HEARTBEAT_POLL_TASK = asyncio.create_task(_poll_heartbeat_alerts(alfred))
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 
     yield
 
     print("\nShutting down Alfred Brain API...")
+    if _HEARTBEAT_POLL_TASK is not None:
+        _HEARTBEAT_POLL_TASK.cancel()
+        try:
+            await _HEARTBEAT_POLL_TASK
+        except asyncio.CancelledError:
+            pass
+    alfred.stop_heartbeat()
     await alfred.disconnect_mcp_servers()
     stop_ngrok()
+
+
+async def _poll_heartbeat_alerts(alfred, poll_interval: float = 5.0) -> None:
+    """Drain CognitiveHeartbeat's alert queue and broadcast each one to
+    every connected WebSocket client, same path a live chat reply uses."""
+    while True:
+        try:
+            for alert in alfred.pop_heartbeat_alerts():
+                await broadcast_to_clients({"type": "heartbeat_alert", **alert})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[Heartbeat] Alert poll error: {e}")
+        await asyncio.sleep(poll_interval)
 
 
 # ============ NGROK MANAGEMENT ============

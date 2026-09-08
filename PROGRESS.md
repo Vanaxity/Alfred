@@ -7,25 +7,121 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 + Phase 2 engineering: closed. Currently in: Phase 3
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is
 over — Q2 and Q8 both closed same-day via local-session work, on top of
 the earlier Q3/Q6 work. **Cloud routine re-enabled 2026-09-08**
 (`trig_01U7DDqtuWKAsfWa6c2fU66E`, hourly at :17) — was paused 2026-09-05
 in favor of local-session live testing for Phase 2; that testing is done
-(see the dated entry below), so it's back on autonomous duty, prompt
+(see the dated entries below), so it's back on autonomous duty, prompt
 refreshed to drop stale references to already-finished work. Remaining
 Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
 explicitly manual/non-blocking per `ROADMAP.md` — not something a
 session should pick up and start working unprompted.
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+**Now in Phase 3** (see `ROADMAP.md`'s Week 3 plan): Phase 2's own scope
+(MCP client + filesystem connector, plus the `find_mcp_server`/
+`install_mcp_server` stretch) shipped and was live-verified 2026-09-08.
+Phase 3 carries over proactive memory surfacing (the relocated heartbeat +
+GBrain's confidence-gated push-context) and adds Tool Forge, the
+self-audit loop, and the entity graph. See the dated entries below for
+what's actually shipped so far.
 
 ---
+
+## 2026-09-08 — Day 7 CognitiveHeartbeat: built for real (was dead code before this), code-only + mocked
+
+Picked the next unblocked, code-only roadmap item: `ROADMAP.md` Week 3
+carries "proactive memory surfacing (relocated heartbeat...)" into Phase
+3, and the branch this work lives on (`feature/day7-heartbeat`) is named
+for exactly this. Checked first whether it already existed anywhere live:
+it didn't. `brain/v2/conversation.py` (the actual live Alfred class since
+the Hermes rebuild) has never had any heartbeat at all — README/
+ARCHITECTURE/docs/PHASES.md all still mark it "🚀 In Progress (Day 7)".
+The only heartbeat that ever existed (`brain/alfred.py`, `brain/v2/
+alfred_v2.py` — two byte-identical 2304-line legacy files, neither
+imported by `brain/__init__.py` or any live path, only by three debug/
+test scripts) called `self.db.get_due_reminders()` and
+`get_local_db().get_due_scheduled_tasks()` — methods that, confirmed by
+grep across the whole repo, **never existed anywhere**, in this file or
+any other. That heartbeat could not have run a single real tick, ever.
+
+- **`brain/local_db.py`**: added the CRUD those old calls assumed existed
+  but never did — `add_reminder`/`get_due_reminders`/`mark_reminder_fired`,
+  and `add_scheduled_task`/`get_scheduled_tasks`/`get_due_scheduled_tasks`/
+  `set_scheduled_task_active` (the `reminders`/`scheduled_tasks` tables
+  themselves already existed in the schema, just with no code path
+  reading or writing them). `get_due_scheduled_tasks` uses `croniter`
+  (already an unused `requirements.txt` entry) against `last_run` (or
+  `created_at` if it's never run) to compute the next fire time; a
+  malformed cron expression is skipped, not raised, so one bad row can't
+  block every other scheduled task from being checked.
+- **`brain/v2/heartbeat.py`** (new): `CognitiveHeartbeat`, matching
+  `docs/PHASES.md`'s original Day 7 spec — `tick()` (check due reminders →
+  run due cron tasks through the real `Alfred.execute()`, same tool
+  access/guardrails a live turn gets → one lightweight proactive-reasoning
+  LLM call against the T4 profile asking "is there a real gap worth
+  surfacing," explicitly allowed to come back empty most ticks per the
+  original acceptance criteria — no tool access from inside the reasoning
+  call itself, no entity graph or calibrated confidence score yet, that's
+  the rest of Phase 3's own item, not this one), `start()`/`stop()` (a
+  dedicated daemon thread with its own event loop, default 1800s interval,
+  interruptible stop), and `pop_alerts()`. A failed tick logs a
+  `heartbeat_error` alert and the loop keeps going — one bad cycle must
+  not kill the daemon thread.
+- **Wired into the real Alfred class** (`brain/v2/conversation.py`):
+  `self.heartbeat = CognitiveHeartbeat(self)` in `__init__` (cheap, no
+  thread started yet — same defer-the-I/O split `connect_mcp_servers()`
+  already uses), plus `start_heartbeat()`/`stop_heartbeat()`/
+  `pop_heartbeat_alerts()` thin wrappers.
+- **`brain_api/server.py`**: `lifespan()` now calls `alfred.start_heartbeat()`
+  and starts a small poller task that drains `pop_heartbeat_alerts()`
+  every 5s and broadcasts each one to `CONNECTED_CLIENTS` over the
+  existing `/ws` path (`{"type": "heartbeat_alert", ...}`) — the heartbeat
+  thread has no access to the server's own asyncio loop or the connected-
+  client set, so this poll is what actually gets an alert in front of the
+  cockpit UI rather than just sitting in an in-memory queue nobody reads.
+  Both the poll task and the heartbeat thread are torn down cleanly on
+  shutdown.
+- **31 new mocked tests** (`build-system/test_heartbeat.py`, 21) split
+  two ways: real-SQLite tests of the new `local_db.py` due-reminder/due-
+  cron-window logic (temp-file DB, no mocking — this is exactly the kind
+  of off-by-a-boundary logic a mock would paper over), and
+  `CognitiveHeartbeat` mechanics (tick/start/stop/pop_alerts, cron-task
+  success and failure paths, reasoning "nothing" vs. a real nudge) against
+  a `FakeAlfred` double — no real DB, no real LLM, no real network. Full
+  suite re-run clean after: 141/141 across the other 8 mocked files (only
+  the pre-existing, already-documented `test_glob_rejects_unsafe_absolute_
+  pattern` Linux-sandbox-vs-real-Windows failure persists, untouched by
+  this change), `test_live_realistic.py` still correctly refuses to run
+  with no provider keys in this cloud sandbox.
+- **What still needs a live check from Sam or a local session** (this is a
+  cloud session — no real server, no real LLM keys, no real vault, per
+  `ROADMAP.md`'s own fail-safe rules): the actual 30-minute cadence
+  against real reminders/cron tasks Sam has stored; whether the proactive-
+  reasoning prompt produces genuinely useful nudges against a real T4
+  profile instead of the synthetic ones in the mocked tests (this is
+  exactly the "needs a feedback loop that calibrates over time" work
+  `ROADMAP.md` already flagged for Phase 3, not something one run can
+  settle); that the `/ws` broadcast actually reaches the cockpit UI and
+  renders a `heartbeat_alert` message sensibly (the cockpit's frontend has
+  no handler for this message type yet — it's a new type, not a
+  compatibility break, so existing `chat`/`pong` handling is unaffected,
+  but the alert will currently arrive with nothing in the UI listening for
+  it); and that a cron task routed through the real `Alfred.execute()`
+  loop behaves safely unattended (e.g. a cron task that happens to need
+  tool approval will correctly stall rather than run, per the existing
+  `awaiting_approval` gate, but that path is only mock-verified here, not
+  watched live).
+- **Open question for Sam, no clearly-right default so left as-is rather
+  than guessed**: `CognitiveHeartbeat.DEFAULT_INTERVAL_SECONDS` is 1800s
+  per the original Day 7 spec, but nothing yet lets Sam actually create a
+  reminder or scheduled task from a conversation turn (no `remind_me`/
+  `schedule_task` tool exists — the DB methods this PR adds are there, but
+  unwired from the tool layer). Worth deciding whether that's the next
+  Phase 3 slice or whether cron tasks are meant to be seeded some other
+  way (a config file, a direct DB seed script) instead.
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 

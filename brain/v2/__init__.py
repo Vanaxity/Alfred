@@ -13,6 +13,7 @@ Public API (preserves existing interface for brain_api/server.py):
 """
 
 from .conversation import Alfred, execute_task
+from .heartbeat import CognitiveHeartbeat
 from .context_manager import ConversationHistory, Message
 from .prompt_builder import (
     AssembledPrompt,
@@ -54,6 +55,7 @@ __all__ = [
     "Alfred",
     "get_alfred",
     "execute_task",
+    "CognitiveHeartbeat",
     "PromptBuilder",
     "count_tokens",
     "ToolSchema",

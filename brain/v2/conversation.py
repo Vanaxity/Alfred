@@ -171,6 +171,12 @@ class Alfred:
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
+        # Day 7: cognitive heartbeat. Cheap to construct (no thread yet --
+        # same "defer the actual I/O to an explicit call" split as MCP
+        # above), started via start_heartbeat() from the lifespan handler.
+        from .heartbeat import CognitiveHeartbeat
+        self.heartbeat = CognitiveHeartbeat(self)
+
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
         and register each one through the same ToolExecutor.register()
@@ -215,6 +221,23 @@ class Alfred:
     async def disconnect_mcp_servers(self) -> None:
         from ..mcp_client import get_mcp_client
         await get_mcp_client().disconnect_all()
+
+    # ------------------------------------------------------------------
+    # Cognitive heartbeat (Day 7)
+    # ------------------------------------------------------------------
+
+    def start_heartbeat(self) -> None:
+        """Start the background proactive loop. Call once from the app's
+        startup lifespan, mirroring connect_mcp_servers() above."""
+        self.heartbeat.start()
+
+    def stop_heartbeat(self) -> None:
+        self.heartbeat.stop()
+
+    def pop_heartbeat_alerts(self) -> List[Dict[str, Any]]:
+        """Drain alerts queued by the heartbeat since the last call --
+        reminders fired, cron tasks run, proactive-reasoning nudges."""
+        return self.heartbeat.pop_alerts()
 
     async def install_mcp_server(
         self,
