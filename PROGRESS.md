@@ -27,6 +27,107 @@ so far.
 
 ---
 
+## 2026-09-08 — Phase 3: Self-Audit Loop shipped (code-only, cloud routine)
+
+Picked the next unblocked Week 3 item off `ROADMAP.md`: Phase 2 (MCP client
++ filesystem connector) is done and live-verified per the entry below, so
+this run started Phase 3. Of that phase's four items (self-audit loop, Tool
+Forge, entity graph, proactive surfacing), self-audit was the one that fit
+a single code-only, mockable, cloud-safe unit of work — Tool Forge involves
+generating and sandbox-validating LLM-written code (real execution risk,
+wants live testing before trusting it), entity graph is a genuinely new
+subsystem, and proactive surfacing is explicitly flagged in `ROADMAP.md` as
+the item most likely to eat a schedule without a live feedback loop to
+calibrate against. Self-audit has none of those problems: it only reads and
+proposes, never mutates or executes anything.
+
+**What shipped**, per the manifesto's own spec ("a weekly cron job feeds
+Alfred's own execution logs back to itself... propose one concrete
+optimization"):
+
+- **Execution logging didn't exist before this** — the Q8 speed-audit
+  `timings` dict was per-response only, never persisted. Added an
+  `execution_log` table to `brain/local_db.py` (`LocalDB.log_execution` /
+  `get_recent_executions(days=...)`), and wired one write into
+  `Alfred.execute()` in `brain/v2/conversation.py` right after the existing
+  Q8 timing block: session id, turn count, total/LLM/tool-exec ms, tools
+  called, tool-error count, whether the untooled-completion-claim or
+  time-mismatch nudge fired this turn (the two existing "the model tried to
+  skip a step" signals), whether the turn ended awaiting approval, whether
+  it hit `MAX_TURNS`. Best-effort by design — wrapped in try/except so a
+  logging failure can never break a real user-facing turn (verified: a test
+  runs `execute()` with `db=None`, same as `test_speed_audit_timing.py`'s
+  existing fake-Alfred pattern, and confirms the turn still completes
+  normally).
+- **`brain/self_audit.py`**: `summarize_executions()` reduces raw log rows
+  into the stats the manifesto's prompt needs (turn count, avg turn time,
+  top tools, error rate, nudge count, max-turns-hit count);
+  `run_self_audit(db, router, days=7)` sends that summary to the LLM with
+  the manifesto's own review prompt, persists the proposal via a new
+  `self_audit_log` table (also on `LocalDB`) so a *later* audit can see
+  what was already raised and say "still true" or "resolved, here's the
+  next thing" instead of blindly repeating itself.
+- **Deliberately proposal-only, not self-modifying**: the manifesto also
+  describes an "implement in sandbox mode" half. Not built here — a cloud,
+  unattended run has no way to live-verify a self-edit before calling it
+  done, which is exactly the discipline this whole log exists to enforce.
+  `run_self_audit` only ever returns text; nothing it does writes to
+  Alfred's own code or config.
+- **Exposed as a new tool, not a new API endpoint**: `self_audit` (params:
+  `days`, default 7) registered in `brain/v2/tool_executor.py` and
+  described in `conversation.py`'s `_get_tool_descriptions()`. Read-only,
+  no approval gate — same tier as `find_mcp_server`. Chosen over adding an
+  `/admin/self-audit` HTTP route so the existing `/api/command` auth
+  already covers it; a cron just needs to send Alfred the equivalent of
+  "run your self-audit," no new attack surface.
+- **31 new mocked tests** (`build-system/test_self_audit.py`): real-sqlite
+  round-trips against a temp-file `LocalDB` for both new tables (including
+  a days-window filter test that back-dates a row directly to prove
+  `get_recent_executions` actually excludes it, not just accepts
+  everything); `summarize_executions` aggregation math and malformed-input
+  tolerance; `run_self_audit` against a fake router/db (empty history skips
+  the LLM call entirely rather than sending it nothing useful; a blank LLM
+  response falls back to a clear message instead of an empty proposal;
+  the prior-proposal reference actually reaches the prompt); the `execute()`
+  wiring itself (one log row per turn, correct tool-error counting, the
+  `db=None` no-crash case); the `self_audit` tool handler end-to-end
+  through the real `ToolExecutor`. Full suite: **136/137** (only the
+  already-known, already-documented `test_glob_rejects_unsafe_absolute_pattern`
+  Linux-sandbox-vs-real-Windows-target failure from the 2026-09-05 entry
+  below — re-confirmed pre-existing and unrelated by running it against
+  this branch before any of today's changes; `test_live_realistic.py`
+  preflight-skips with no API keys, as every prior cloud-only run has
+  noted). This cloud sandbox was also missing the `mcp` package this time
+  (present as a `requirements.txt>=2.1.0` pin, just not pre-installed in
+  this particular container) on top of the already-documented
+  dotenv/numpy/groq/openai/google-genai gap — installed before running the
+  suite, same as previous runs' environment note.
+
+**What still needs a live check from Sam or a local session** (this is a
+cloud sandbox — no real server, no real LLM keys reachable, no real usage
+history to audit yet):
+- Whether a week of *real* execution_log rows actually produces a useful,
+  specific proposal, or a generic one the summary stats don't support —
+  the mocked tests only prove the plumbing (right stats computed, right
+  prompt sent, right thing persisted), not proposal quality against real
+  data.
+- The actual weekly-cron trigger. Same category as Task Scheduler
+  auto-start: a local, Sam-side step (e.g. a Task Scheduler job that hits
+  `/api/command` with something like "run your self-audit" on a weekly
+  cadence), not something this cloud routine can wire up itself.
+- Whether `self_audit`'s tool description is enough for the LLM to
+  reliably reach for it unprompted vs. only when Sam explicitly asks —
+  untested against a real model, same caveat as every other tool
+  description in this file's history.
+
+**Open question for Sam**: once real proposals start coming back, worth
+deciding whether they should also surface somewhere Sam actually looks
+(cockpit UI, a digest) rather than living only in `self_audit_log` waiting
+to be asked for — left unbuilt rather than guessed at, since (like Q8's
+similar open question) it touches the cockpit's TS side.
+
+---
+
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
 Full offline+live pass over everything Phase 2 shipped (generic client,
