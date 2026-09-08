@@ -25,6 +25,113 @@ so far.
 
 ---
 
+## 2026-09-08 — Phase 3: cognitive heartbeat relocated (cloud, code-only)
+
+**Note before anything else**: this run fired from a scheduled cloud
+routine, even though the 2026-09-05 entry below says the cloud routine
+was disabled in favor of local-session driving ("re-enable only if that
+changes"). Nothing in this log shows that decision being reversed. Did
+its own read of the situation (branch/roadmap/progress all point at the
+same next item, described below) and proceeded rather than stalling, but
+**this is a real discrepancy for Sam to reconcile** — either the routine
+was deliberately re-enabled and this file just never got updated to say
+so, or it's still supposed to be off and something re-armed it by
+accident. Flagging rather than guessing which.
+
+**What this picked up and why**: Phase 2's only remaining item (one more
+MCP connector) is explicitly "Sam's call, whenever" per the entry below —
+not something to pick unprompted. The branch this works from is literally
+named `feature/day7-heartbeat`, and ROADMAP.md's Phase 3 lists "the
+relocated heartbeat + GBrain's confidence-gated push-context" as the next
+piece of proactive-surfacing work. Reading the actual code confirmed this
+is a real, well-defined gap, not a guess: `brain/v2/conversation.py` (the
+class `brain_api/server.py` actually runs — confirmed via `brain/__init__.py`'s
+import chain) has **no heartbeat mechanism at all**. The reminder/cron/
+heartbeat system that does exist in the codebase (`brain/alfred.py`,
+duplicated verbatim in the dead `brain/v2/alfred_v2.py`) is legacy code
+from before the Hermes-inspired rebuild, not wired into anything live, and
+itself calls a `t3_search()` method that no longer exists on `FiveTierMemory`
+(would `AttributeError` every time, silently swallowed by its own
+try/except — a real, if moot, latent bug in code nothing calls). Also
+confirmed via `git log`: the whole reminder/heartbeat system was
+**deliberately removed** 2026-08-23 as a scope-reduction ahead of a 2-day
+showcase deadline, explicitly calling the old "Day 7: Cognitive heartbeat"
+PR obsolete — this is a fresh rebuild of that Phase 3 item, not a revival
+of the removed code.
+
+**What shipped**:
+- `brain/local_db.py`: restored `get_due_reminders()`, `mark_reminder_fired()`,
+  `get_due_scheduled_tasks()` (cron-due check via `croniter`, added to
+  `requirements.txt` back when this was first planned but never actually
+  used until now). The `reminders`/`scheduled_tasks` tables themselves
+  survived the 2026-08-23 removal untouched — only these query methods had
+  been dropped.
+- `brain/v2/heartbeat.py` (new): `CognitiveHeartbeat`, a background loop
+  owned by one `Alfred` instance. A light tick (30s) checks due reminders/
+  cron tasks and clears expired T1 context. A heavy tick (2h) is the actual
+  manifesto upgrade — gathers T4 goals, recent T3 episode titles, and a
+  best-effort calendar/email snapshot, then asks the LLM one confidence-
+  gated question ("is there a gap between his current state and his
+  goals?"), parses a `CONFIDENCE: high|medium|low` header, and either logs
+  (low) or surfaces a nudge alert (medium/high). Skips the LLM call
+  entirely when there's nothing to reason about, and only inside 7am-11pm.
+- **Deliberate safety scoping, different from the manifesto's literal
+  text**: the manifesto says high confidence should "execute the
+  corrective action." This build never does — it only ever logs or nudges,
+  the same as medium confidence, just louder. An unattended background
+  loop auto-executing mutating tools (sending email, deleting calendar
+  events) with no per-action human review is a different risk profile than
+  a chat turn a human is actively watching, and ROADMAP.md's own fail-safe
+  section already draws that line ("no sending messages/emails... no
+  destructive actions"). Documented in the module docstring; revisit only
+  if Sam explicitly wants the auto-execute path.
+- Wired into `brain/v2/conversation.py`'s `Alfred` (`self.heartbeat`,
+  `start_heartbeat()`/`stop_heartbeat()`/`pop_heartbeat_alerts()`) and
+  `brain_api/server.py`'s lifespan (`start_heartbeat()` after MCP connect,
+  `stop_heartbeat()` on shutdown, nudges routed to the existing
+  `broadcast_to_clients()` WebSocket path the way the old alert broadcaster
+  used to).
+- **Explicitly not in scope here**: no reminder-*creation* tools
+  (`set_reminder` etc. are still gone) — `get_due_reminders()` has nothing
+  to return until those exist again. Real next step for whoever picks
+  Phase 3 back up, not silently assumed done.
+- 16 new mocked tests (`test_cognitive_heartbeat.py`): `local_db`'s
+  restored methods against a real temp-file sqlite db (including a
+  malformed-cron-expression case that must not crash the tick), and
+  `CognitiveHeartbeat`'s parsing/gating/tick logic against fakes (no real
+  LLM keys, no real vault, no real Google auth — cloud session). Full
+  existing suite still green except the one already-documented
+  Linux-sandbox `test_glob_rejects_unsafe_absolute_pattern` failure (see
+  2026-09-05 entry below — confirmed identical before and after this
+  branch's changes, not something this PR touches).
+- Confirmed real `Alfred()` construction + `start_heartbeat()`/
+  `stop_heartbeat()` runs clean end-to-end in this sandbox (no crash, task
+  actually scheduled and cancelled) — as far as "live" verification goes
+  without real LLM keys or a real Google token.
+
+**What still needs a live check from Sam or a local session** (this cloud
+sandbox has no LLM keys, no Google auth, no real vault, no way to leave
+this running for 2 hours):
+- Whether the cognitive-pulse prompt actually produces useful, well-
+  calibrated nudges against Sam's real goals/calendar/email, not just
+  parseable ones — the parsing and gating logic is verified, the LLM's
+  actual judgment isn't.
+- Whether the WebSocket nudge actually reaches a connected Cockpit client
+  end-to-end (the broadcast call is wired, never fired against a real
+  socket).
+- Whether the calendar/email snapshot works against a real, authenticated
+  `GWSClient` (this sandbox has no token.json — every gather call above
+  hit the `except` branch, never the real API path).
+- The 2h heavy-tick cadence and 30s light-tick cadence are carried over
+  from the removed code's original values, not re-validated — worth a
+  real second look once live numbers exist.
+
+**Open question for Sam**: reminder-creation tools — worth rebuilding as
+a direct Phase 3 follow-up (the heartbeat mechanism has nothing to check
+until reminders can be set again), or intentionally deferred further?
+Left open rather than guessed at, plus the cloud-routine-disabled
+discrepancy flagged at the top of this entry.
+
 ## 2026-09-06 — Phase 2 stretch: find_mcp_server + live install shipped
 
 Closed the gap the generic client left: a human still had to know an

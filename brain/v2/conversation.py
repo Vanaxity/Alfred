@@ -171,6 +171,13 @@ class Alfred:
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
+        # Phase 3: the relocated cognitive heartbeat (ROADMAP.md). Built but
+        # not started here -- like connect_mcp_servers(), it needs a running
+        # event loop, so brain_api/server.py's lifespan handler calls
+        # start_heartbeat() once the app is actually serving.
+        from .heartbeat import CognitiveHeartbeat
+        self.heartbeat = CognitiveHeartbeat(self)
+
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
         and register each one through the same ToolExecutor.register()
@@ -215,6 +222,19 @@ class Alfred:
     async def disconnect_mcp_servers(self) -> None:
         from ..mcp_client import get_mcp_client
         await get_mcp_client().disconnect_all()
+
+    # ------------------------------------------------------------------
+    # Cognitive heartbeat (Phase 3, see .heartbeat.CognitiveHeartbeat)
+    # ------------------------------------------------------------------
+
+    def start_heartbeat(self) -> None:
+        self.heartbeat.start()
+
+    def stop_heartbeat(self) -> None:
+        self.heartbeat.stop()
+
+    def pop_heartbeat_alerts(self) -> List[Dict[str, Any]]:
+        return self.heartbeat.pop_alerts()
 
     async def install_mcp_server(
         self,

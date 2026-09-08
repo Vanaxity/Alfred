@@ -350,7 +350,56 @@ class LocalDB:
             conn.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
             conn.commit()
 
-    # ============ SCHEDULED TASKS (legacy v1 path only — see local_db.py) ============
+    # ============ REMINDERS / SCHEDULED TASKS (heartbeat) ============
+    # The `reminders`/`scheduled_tasks` tables above survived the 2026-08-23
+    # heartbeat removal (explicit scope-reduction ahead of a demo) -- only
+    # the query methods that drove them were dropped. Restored here for
+    # ROADMAP.md's Phase 3 "relocated heartbeat" item. No tool writes to
+    # `reminders` yet (set_reminder etc. are still gone) -- these will stay
+    # empty until that's rebuilt, tracked as a follow-up in PROGRESS.md.
+
+    def get_due_reminders(self) -> List[Dict]:
+        conn = self._get_conn()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT id, text, due_at, category FROM reminders "
+                "WHERE fired = 0 AND due_at <= datetime('now') ORDER BY due_at"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_reminder_fired(self, reminder_id: int):
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute("UPDATE reminders SET fired = 1 WHERE id = ?", (reminder_id,))
+            conn.commit()
+
+    def get_due_scheduled_tasks(self) -> List[Dict]:
+        """Active cron tasks whose next fire time (per croniter, computed
+        from last_run if it has one, else created_at) has passed."""
+        from croniter import croniter
+
+        conn = self._get_conn()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT id, task, cron_expr, created_at, last_run, active "
+                "FROM scheduled_tasks WHERE active = 1"
+            ).fetchall()
+
+        now = datetime.utcnow()
+        due = []
+        for row in rows:
+            task = dict(row)
+            base_str = (task["last_run"] or task["created_at"] or "").replace(" ", "T")
+            try:
+                base_dt = datetime.fromisoformat(base_str)
+                next_fire = croniter(task["cron_expr"], base_dt).get_next(datetime)
+            except Exception:
+                # Malformed cron_expr or timestamp -- skip rather than crash
+                # the whole heartbeat tick over one bad row.
+                continue
+            if next_fire <= now:
+                due.append(task)
+        return due
 
     def update_last_run(self, task_id: int):
         conn = self._get_conn()

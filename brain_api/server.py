@@ -104,12 +104,20 @@ async def lifespan(app: FastAPI):
     # if the file doesn't exist -- MCP is additive, not required to boot.
     await alfred.connect_mcp_servers()
 
+    # Phase 3: start the cognitive heartbeat now that a real event loop is
+    # running. Nudges (medium/high confidence) get broadcast to any
+    # connected Cockpit clients the same way the old alert broadcaster did;
+    # low-confidence observations stay server-log-only.
+    alfred.heartbeat.on_alert = broadcast_to_clients
+    alfred.start_heartbeat()
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 
     yield
 
     print("\nShutting down Alfred Brain API...")
+    alfred.stop_heartbeat()
     await alfred.disconnect_mcp_servers()
     stop_ngrok()
 
