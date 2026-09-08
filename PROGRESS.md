@@ -11,12 +11,14 @@ don't rewrite history — newest entries at the top.
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is
 over — Q2 and Q8 both closed same-day via local-session work, on top of
-the earlier Q3/Q6 work. **Cloud routine stays disabled**
-(`trig_01U7DDqtuWKAsfWa6c2fU66E`) — local-session driving worked better
-for this than the cloud's mocked-only verification; re-enable only if
-that changes. Remaining Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9
-business questions) are explicitly manual/non-blocking per `ROADMAP.md`
-— not something a session should pick up and start working unprompted.
+the earlier Q3/Q6 work. **Cloud routine re-enabled 2026-09-08**
+(`trig_01U7DDqtuWKAsfWa6c2fU66E`, hourly at :17) — was paused 2026-09-05
+in favor of local-session live testing for Phase 2; that testing is done
+(see the dated entry below), so it's back on autonomous duty, prompt
+refreshed to drop stale references to already-finished work. Remaining
+Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
+explicitly manual/non-blocking per `ROADMAP.md` — not something a
+session should pick up and start working unprompted.
 
 **Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
 one connector this week, proactive surfacing and further connectors
@@ -25,18 +27,79 @@ so far.
 
 ---
 
+## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
+
+Full offline+live pass over everything Phase 2 shipped (generic client,
+filesystem proof connector, `find_mcp_server`/`install_mcp_server`),
+since mocked-green was never treated as the actual bar this project uses.
+
+- **Offline**: all 9 mocked suites re-run clean, 119/119 (later 121/121
+  after this session's own additions) — no regressions from two days'
+  gap since last run.
+- **Live, direct API**: filesystem MCP tool call through a real approval
+  gate (had to specifically target `list_allowed_directories`, since
+  `list_directory` collides with Alfred's own built-in tool of the same
+  name — the LLM reasonably prefers the built-in on ambiguous phrasing,
+  not a bug); `find_mcp_server` against the real registry (real Slack
+  hit, real "no npm match" for a docker/uvx-only package); `install_mcp_server`
+  live-installing `@modelcontextprotocol/server-memory` with its tools
+  immediately usable in the same running session, no restart; a
+  deliberately bad command failing in ~26ms (not 20-100s).
+- **Live, through the cockpit UI**: ran the cockpit's own dev server
+  locally against the local brain API (sidesteps the ngrok/Vercel chain
+  entirely — see below) and drove a real MCP approval through the actual
+  Approve/Deny buttons in the browser. Confirmed those buttons (built
+  during the Q2 auth work) render and work for an MCP-sourced tool, not
+  just built-ins.
+- **Two real bugs found live, not caught by any mock, both fixed** (see
+  `feature/day7-heartbeat` commit `8b022d5`):
+  1. The already-configured filesystem server was failing to connect at
+     every startup. `CONNECT_TIMEOUT_SECONDS=20` (added for the
+     install-path bad-command case) was too tight for a legitimate npx
+     cold spawn, which alone takes ~20s on this machine before the MCP
+     handshake even starts. Raised to 45s.
+  2. A multi-turn flow (incomplete tool request → Alfred asks a
+     clarifying question → user answers) sometimes produced a reply
+     narrating "I need your approval before running X..." **without
+     ever calling the tool** — no real `awaiting_approval` gate fired,
+     leaving the user approving a request that didn't exist. Extended
+     the existing untooled-completion-claim detector (previously only
+     caught "has been saved"-style claims) to also catch this "about to
+     act" phrasing. Confirmed via ~9 live trials post-fix: the
+     nudge-and-retry recovers a real tool call every time observed, but
+     note this is phrase-matching, not semantic — a future paraphrase
+     could still slip past it (already happened once between the first
+     and second fix pass; not a closeable-in-one-session problem).
+- Unrelated finding, not chased: the two-days-old cockpit "disconnected"
+  issue was a stale ngrok URL baked into the Vercel build, plus the
+  `vercel env rm`/`env add` steps in `start_alfred_live.ps1` failing
+  silently on a CLI version bump (fixed to use `--json` output instead of
+  regex-scraping text — separate commit, `alfred-cockpit` repo /
+  `Ai-terminal-stuff`'s `start_alfred_live.ps1`, not this repo).
+- 23 test episodes this generated in the real Obsidian vault archived to
+  `C:\Coding\_archive\alfred-mcp-live-test-20260908\` afterward.
+- **Cloud routine (`trig_01U7DDqtuWKAsfWa6c2fU66E`) re-enabled**, prompt
+  refreshed to drop the stale "start with Q2" and "Week 1/Week 2" framing
+  now that Phase 1 and 2 are both done — it should pick up whatever's
+  next on `ROADMAP.md` on its own. Fired one manual run
+  (`cse_01V1gSZPLJJhHCHt4ihCHWNB`) immediately after re-enabling to
+  confirm it still works end-to-end before leaving it unattended; check
+  `list_runs`/`get_run_log` for that session's outcome.
+
 ## 2026-09-08 — Phase 3: cognitive heartbeat relocated (cloud, code-only)
 
-**Note before anything else**: this run fired from a scheduled cloud
-routine, even though the 2026-09-05 entry below says the cloud routine
-was disabled in favor of local-session driving ("re-enable only if that
-changes"). Nothing in this log shows that decision being reversed. Did
-its own read of the situation (branch/roadmap/progress all point at the
-same next item, described below) and proceeded rather than stalling, but
-**this is a real discrepancy for Sam to reconcile** — either the routine
-was deliberately re-enabled and this file just never got updated to say
-so, or it's still supposed to be off and something re-armed it by
-accident. Flagging rather than guessing which.
+**Update on the manual confirmation run mentioned just above**: that run
+(`cse_01V1gSZPLJJhHCHt4ihCHWNB`) is this entry — confirmed by matching
+session IDs. When this session started, PROGRESS.md as checked out still
+read "Cloud routine stays disabled... re-enable only if that changes"
+(the entry above hadn't been pushed to `feature/day7-heartbeat` yet), so
+this run's own PR description and an earlier notification flagged the
+routine firing as an unreconciled discrepancy. Resolving that here on
+merge: it wasn't a discrepancy, just a race between two same-day
+sessions — Sam's local session re-enabled the routine and fired this
+confirmation run, and pushed the log entry above slightly after this
+session had already branched off the same commit. No action needed from
+Sam on that point after all.
 
 **What this picked up and why**: Phase 2's only remaining item (one more
 MCP connector) is explicitly "Sam's call, whenever" per the entry below —
@@ -129,8 +192,7 @@ this running for 2 hours):
 **Open question for Sam**: reminder-creation tools — worth rebuilding as
 a direct Phase 3 follow-up (the heartbeat mechanism has nothing to check
 until reminders can be set again), or intentionally deferred further?
-Left open rather than guessed at, plus the cloud-routine-disabled
-discrepancy flagged at the top of this entry.
+Left open rather than guessed at.
 
 ## 2026-09-06 — Phase 2 stretch: find_mcp_server + live install shipped
 
