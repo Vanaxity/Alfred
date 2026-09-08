@@ -7,25 +7,116 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 + 2 engineering: closed. Currently in: Phase 3 — 5 open PRs, unmerged
 
-Phase 1's active-catch-up mode (was here, see git history if needed) is
-over — Q2 and Q8 both closed same-day via local-session work, on top of
-the earlier Q3/Q6 work. **Cloud routine re-enabled 2026-09-08**
-(`trig_01U7DDqtuWKAsfWa6c2fU66E`, hourly at :17) — was paused 2026-09-05
-in favor of local-session live testing for Phase 2; that testing is done
-(see the dated entry below), so it's back on autonomous duty, prompt
-refreshed to drop stale references to already-finished work. Remaining
-Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
-explicitly manual/non-blocking per `ROADMAP.md` — not something a
-session should pick up and start working unprompted.
+Phase 1 and Phase 2 are both done (Q2/Q8/Q3/Q6, then the MCP client +
+filesystem connector, all live-verified — see dated entries below). The
+cloud routine has been firing on Phase 3 since re-enabling on 2026-09-08
+and has **4 open, unmerged PRs in flight against this branch**, none of
+them reflected in this file until now because each was written from this
+same base commit without merging the others first: `#15` relocated the
+cognitive heartbeat, `#16` shipped Tool Forge's skill-validation-sandbox
+prerequisite, `#17` built an execution-log persistence layer, `#18` built
+a self-audit loop that **independently re-implemented `#17`'s
+execution_log table** (different schema, same table name — flagged as a
+PR comment on `#18`, not fixed there, since merge-order across two open
+PRs someone else opened isn't this run's call). A 5th PR (`#19`) is an
+unrelated `main`-sync catch-up, not part of the Phase 3 queue. **Whoever
+reviews next: read `#15`-`#18` before merging any of them — there's real
+schema overlap to resolve, not just four independent diffs.**
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+This run picked **entity graph & synthesis** (see the dated entry right
+below) — the fourth and last Phase 3 item from `ROADMAP.md`, and the only
+one of the four with no open PR already claiming it.
 
 ---
+
+## 2026-09-08 — Entity graph & synthesis (Phase 3, GBrain-inspired) shipped, v1 scope
+
+Picked this off `ROADMAP.md`'s Phase 3 list after checking all 5 open PRs
+(`#15`-`#19`) first — heartbeat/proactive-surfacing, Tool Forge's
+validation slice, and the self-audit loop (twice, see the flag in the
+entry above) already had open PRs claiming them; entity graph didn't.
+
+**What shipped**: `brain/memory/entity_graph.py` — a new, self-contained
+SQLite store (`brain/data/entity_graph.db`, no Obsidian vault dependency,
+same pattern as `LocalDB`/T5's `archive.db`) for named entities (people,
+projects, orgs, places) and relations between them. T4 (`remember`) is one
+key → one value, latest write wins; this instead accumulates every mention
+of the same entity (case/whitespace-insensitive dedupe key) so a later
+`entity_lookup` synthesizes across all of them plus one-hop relations,
+instead of only ever seeing the most recent thing said about it — the
+actual "grows with you" gap Claim A (2026-08-26) deferred.
+
+- `EntityGraph.upsert_entity(name, entity_type, note)` — creates on first
+  mention, bumps `mention_count` + appends a capped note list (20 max) on
+  repeat mentions; a real classification never gets overwritten back to
+  `'unknown'` by a later untyped mention.
+- `EntityGraph.add_relation(a, relation, b)` — creates either missing
+  entity, dedupes on a normalized `(a, relation, b)` key so repeats bump a
+  count instead of duplicating rows.
+- `EntityGraph.synthesize(name)` — deterministic plain-text rollup (notes
+  + one-hop relations). Deliberately not LLM-written prose in v1 — keeps
+  it testable without a live model and safe to expose as a read-only tool.
+- Three new tools (`brain/v2/tool_executor.py`, wired into
+  `create_tool_executor()` and `_get_tool_descriptions()`):
+  `entity_note`/`entity_relate` (writes, no approval needed — same trust
+  tier as `remember`/`forget`) and `entity_lookup` (read-only synthesis).
+  Both writes added to `MUTATION_TOOLS` **with real `VERIFY_MAP` entries**
+  (read back via `entity_lookup`) — not just added to the mutation set and
+  left unverified, which a pre-existing test
+  (`test_every_mutation_tool_has_readback_or_is_exempt`) caught immediately
+  when first added without one.
+- Wired into the existing post-turn memory-curation pass
+  (`Alfred._curate_memory`, from Claim A) rather than a new LLM call:
+  `entity_note`/`entity_relate` added to the curator's allowed-tools set
+  and its system prompt, alongside `remember`/`forget`. Known limitation,
+  called out in the prompt itself: the curator makes at most one tool call
+  per pass, so a turn that both has a durable fact *and* mentions a
+  trackable entity only gets one of the two persisted per pass — pre-existing
+  shape of the curation mechanism, not new here.
+
+**Verified (mocked suite only — cloud sandbox, no live server/vault/LLM
+keys)**: 26 new tests in `build-system/test_entity_graph.py` — storage
+layer against a real temp-file sqlite db (upsert dedupe across
+case/whitespace, note-cap enforcement, type-not-downgraded-to-unknown,
+relation dedupe/either-side lookup, a name containing `|` not corrupting
+the relation key), the three tool handlers against a real `ToolExecutor`
+including the "entity graph unavailable" path a bare context can hit, and
+two integration-level tests against a bare `Alfred.__new__()` instance
+(same fixture shape `test_speed_audit_timing.py` already uses): one
+confirming `execute()` doesn't `AttributeError` when `self.entity_graph`
+was never set (the tool_ctx entry uses `getattr(self, "entity_graph",
+None)`, same resilience pattern as `_mcp_tool_schemas`), one driving a real
+end-to-end turn where the curation pass's LLM response calls `entity_note`
+and confirming it actually lands in the graph. Full suite: **146/147** —
+121 pre-existing (this branch's base, per the entry below) + 26 new, minus
+the same already-documented `test_glob_rejects_unsafe_absolute_pattern`
+Linux-sandbox-vs-Windows-target failure every prior PROGRESS.md entry
+this week has noted; re-confirmed pre-existing via `git stash` against the
+unmodified base branch before writing this up. Installed this sandbox's
+missing runtime deps (`python-dotenv`, `numpy`, `groq`, `openai`,
+`google-genai`, `croniter`, `mcp`) at session start — same gap every
+cloud-session PR this week has hit.
+
+**Still needs a live check from Sam or a local session**:
+- Whether the curator's LLM actually reaches for `entity_note`/
+  `entity_relate` unprompted on real conversation text, or needs prompt
+  tuning — the mocked tests prove the plumbing (a scripted tool call
+  reaches the graph correctly), not real-model judgment on when to use it.
+- The one-tool-per-curation-pass limitation above, in practice: does it
+  actually cost anything real, or is it rare enough not to matter? No
+  live conversation volume to check against from this sandbox.
+- Whether `entity_lookup` should also feed the planner's system prompt
+  proactively (like T3 episodic snippets already do) rather than only
+  being reachable when the LLM decides to call it — left as designed,
+  matching the "not built here" list in this module's own docstring
+  (proactive surfacing, multi-hop traversal, LLM-written synthesis).
+
+**Open question for Sam**: the `#15`-`#18` PR pile above needs a real
+decision on merge order (`#17` before `#18`, with `#18` rebased to drop
+its duplicate schema, is the obvious fix, but it's not this run's call to
+make and push to someone else's branch).
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
