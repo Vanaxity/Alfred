@@ -117,6 +117,144 @@ def test_improve_skill_without_new_steps_leaves_steps_untouched():
         os.unlink(path)
 
 
+# ---------------------------------------------------------------------------
+# Markdown round-trip: success/failure counts and Tool Forge state
+#
+# to_markdown() always wrote a "Success Rate: X/Y" line, but from_markdown()
+# never read it back -- every skill's success_count/failure_count silently
+# reset to 0 on every SkillManager reload (server restart, or a fresh
+# process picking up skills from disk). That's the exact counter Tool
+# Forge's "used 3+ times" promotion threshold depends on, so a reload
+# wiping it out made the threshold unreachable across restarts. Fixed
+# alongside adding forged_tool/forge_attempts, which needed the same
+# round-trip.
+# ---------------------------------------------------------------------------
+
+def test_skill_markdown_round_trip_persists_success_and_failure_counts():
+    skill, path = _temp_skill()
+    skill.success_count = 5
+    skill.failure_count = 2
+    try:
+        reloaded = Skill.from_markdown(path, skill.to_markdown())
+        assert reloaded.success_count == 5
+        assert reloaded.failure_count == 2
+    finally:
+        os.unlink(path)
+
+
+def test_skill_markdown_round_trip_persists_forge_state():
+    skill, path = _temp_skill()
+    skill.forged_tool = "forged_do_the_thing_abc12345"
+    try:
+        reloaded = Skill.from_markdown(path, skill.to_markdown())
+        assert reloaded.forged_tool == "forged_do_the_thing_abc12345"
+    finally:
+        os.unlink(path)
+
+
+def test_skill_markdown_round_trip_persists_forge_attempts_when_not_forged():
+    skill, path = _temp_skill()
+    skill.forge_attempts = 2
+    try:
+        reloaded = Skill.from_markdown(path, skill.to_markdown())
+        assert reloaded.forge_attempts == 2
+        assert reloaded.forged_tool is None
+    finally:
+        os.unlink(path)
+
+
+def test_skill_markdown_round_trip_defaults_for_never_forged_fresh_skill():
+    skill, path = _temp_skill()
+    try:
+        reloaded = Skill.from_markdown(path, skill.to_markdown())
+        assert reloaded.forged_tool is None
+        assert reloaded.forge_attempts == 0
+        assert reloaded.success_count == 0
+        assert reloaded.failure_count == 0
+    finally:
+        os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# record_skill_use / mark_forged / record_forge_attempt
+# ---------------------------------------------------------------------------
+
+def test_record_skill_use_increments_success_and_persists():
+    mgr = _bare_manager()
+    skill, path = _temp_skill()
+    mgr._skills_cache[skill.skill_id] = skill
+    try:
+        ok = mgr.record_skill_use(skill.skill_id, success=True)
+        assert ok is True
+        assert mgr._skills_cache[skill.skill_id].success_count == 1
+        assert mgr._skills_cache[skill.skill_id].failure_count == 0
+        # Persisted, not just held in memory.
+        reloaded = Skill.from_markdown(path, Path(path).read_text(encoding="utf-8"))
+        assert reloaded.success_count == 1
+    finally:
+        os.unlink(path)
+
+
+def test_record_skill_use_increments_failure():
+    mgr = _bare_manager()
+    skill, path = _temp_skill()
+    mgr._skills_cache[skill.skill_id] = skill
+    try:
+        mgr.record_skill_use(skill.skill_id, success=False)
+        assert mgr._skills_cache[skill.skill_id].failure_count == 1
+        assert mgr._skills_cache[skill.skill_id].success_count == 0
+    finally:
+        os.unlink(path)
+
+
+def test_record_skill_use_accumulates_across_calls():
+    mgr = _bare_manager()
+    skill, path = _temp_skill()
+    mgr._skills_cache[skill.skill_id] = skill
+    try:
+        mgr.record_skill_use(skill.skill_id, success=True)
+        mgr.record_skill_use(skill.skill_id, success=True)
+        mgr.record_skill_use(skill.skill_id, success=False)
+        cached = mgr._skills_cache[skill.skill_id]
+        assert cached.success_count == 2
+        assert cached.failure_count == 1
+    finally:
+        os.unlink(path)
+
+
+def test_record_skill_use_missing_skill_id_returns_false():
+    mgr = _bare_manager()
+    assert mgr.record_skill_use("does-not-exist", success=True) is False
+
+
+def test_mark_forged_sets_field_and_persists():
+    mgr = _bare_manager()
+    skill, path = _temp_skill()
+    mgr._skills_cache[skill.skill_id] = skill
+    try:
+        ok = mgr.mark_forged(skill.skill_id, "forged_thing_abc123")
+        assert ok is True
+        assert mgr._skills_cache[skill.skill_id].forged_tool == "forged_thing_abc123"
+        reloaded = Skill.from_markdown(path, Path(path).read_text(encoding="utf-8"))
+        assert reloaded.forged_tool == "forged_thing_abc123"
+    finally:
+        os.unlink(path)
+
+
+def test_record_forge_attempt_increments_and_persists():
+    mgr = _bare_manager()
+    skill, path = _temp_skill()
+    mgr._skills_cache[skill.skill_id] = skill
+    try:
+        mgr.record_forge_attempt(skill.skill_id)
+        mgr.record_forge_attempt(skill.skill_id)
+        assert mgr._skills_cache[skill.skill_id].forge_attempts == 2
+        reloaded = Skill.from_markdown(path, Path(path).read_text(encoding="utf-8"))
+        assert reloaded.forge_attempts == 2
+    finally:
+        os.unlink(path)
+
+
 def main():
     import traceback
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

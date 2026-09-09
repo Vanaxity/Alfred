@@ -104,6 +104,10 @@ async def lifespan(app: FastAPI):
     # if the file doesn't exist -- MCP is additive, not required to boot.
     await alfred.connect_mcp_servers()
 
+    # Phase 3: re-register any skill Tool Forge already promoted to a
+    # standalone tool in a previous run. No-op if nothing's been forged yet.
+    alfred.load_forged_tools()
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 

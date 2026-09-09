@@ -171,6 +171,13 @@ class Alfred:
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
+        # Tool Forge: skills promoted to standalone registered tools,
+        # loaded from disk at startup (load_forged_tools()) plus whatever
+        # gets forged live during this process's lifetime. Same merge
+        # pattern as _mcp_tool_schemas above.
+        self._forge_tool_schemas: Dict[str, Dict[str, Any]] = {}
+        self._pending_forge_tasks: List[Any] = []
+
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
         and register each one through the same ToolExecutor.register()
@@ -215,6 +222,18 @@ class Alfred:
     async def disconnect_mcp_servers(self) -> None:
         from ..mcp_client import get_mcp_client
         await get_mcp_client().disconnect_all()
+
+    def load_forged_tools(self) -> None:
+        """Re-register every previously Tool-Forge-promoted skill into this
+        process's ToolExecutor. Sync (unlike connect_mcp_servers) -- exec'ing
+        already-validated Python from disk needs no I/O beyond a file read,
+        so there's no reason to make brain_api/server.py's startup await it.
+        Safe to call with nothing forged yet (no-op)."""
+        from ..memory import tool_forge
+
+        self._forge_tool_schemas.update(
+            tool_forge.load_persisted_forged_tools(self._tool_executor)
+        )
 
     async def install_mcp_server(
         self,
@@ -573,7 +592,11 @@ class Alfred:
         # in isolation without running the real __init__ -- confirmed this
         # broke test_speed_audit_timing.py live. An absent attribute means
         # "no MCP servers connected yet," same as an empty dict would.
-        return {**builtin, **getattr(self, "_mcp_tool_schemas", {})}
+        return {
+            **builtin,
+            **getattr(self, "_mcp_tool_schemas", {}),
+            **getattr(self, "_forge_tool_schemas", {}),
+        }
 
     # ------------------------------------------------------------------
     # LLM output parser
@@ -806,6 +829,11 @@ class Alfred:
             "bootstrap": self._bootstrap,
             "install_mcp_server": self.install_mcp_server,
             "approved_actions": (context or {}).get("approved_actions") or [],
+            # So a forged tool's replayed steps can call back into the same
+            # guardrail-checked executor every other tool call goes through
+            # (see tool_forge.py's _RealExecutorAdapter) -- forging removes
+            # the per-turn LLM planning cost, not the per-step guardrails.
+            "tool_executor": self._tool_executor,
         }
 
         # Initialize conversation history
@@ -1172,23 +1200,37 @@ class Alfred:
             except Exception as e:
                 thinking.append(f"  Skill generation failed: {e}")
 
-        # --- Maybe improve skill ---
+        # --- Maybe improve skill / count this use ---
         # A matched skill was used to shape this turn and something in it
         # still failed -- the recipe was wrong, patch it, mirroring Hermes
         # Agent's skill self-improvement loop. Same gate shape as skill
         # generation above, inverted (that one requires no failures; this one
         # requires a failure plus a skill actually having been in play).
-        if matched_skill is not None and any(
-            tr.get("success") is False for tr in tool_results
-        ):
-            failed = next((tr for tr in tool_results if tr.get("success") is False), {})
-            failure_detail = failed.get("output") or failed.get("error") or "unknown"
-            note = f"Used for '{task[:80]}' and a step failed: {str(failure_detail)[:150]}"
+        if matched_skill is not None:
+            turn_failed = any(tr.get("success") is False for tr in tool_results)
+            if turn_failed:
+                failed = next((tr for tr in tool_results if tr.get("success") is False), {})
+                failure_detail = failed.get("output") or failed.get("error") or "unknown"
+                note = f"Used for '{task[:80]}' and a step failed: {str(failure_detail)[:150]}"
+                try:
+                    self.skill_manager.improve_skill(matched_skill.skill_id, note)
+                    thinking.append(f"  Flagged skill '{matched_skill.title}' for improvement")
+                except Exception as e:
+                    thinking.append(f"  Skill improvement failed: {e}")
+            # Previously nothing ever counted a successful replay -- a
+            # skill's success_count was set once at generation time and
+            # never touched again, so Tool Forge's "used 3+ times"
+            # threshold could never actually be reached. record_skill_use
+            # is deliberately separate from improve_skill (which also
+            # patches steps and writes a log entry a routine reuse doesn't
+            # need).
             try:
-                self.skill_manager.improve_skill(matched_skill.skill_id, note)
-                thinking.append(f"  Flagged skill '{matched_skill.title}' for improvement")
+                self.skill_manager.record_skill_use(matched_skill.skill_id, success=not turn_failed)
             except Exception as e:
-                thinking.append(f"  Skill improvement failed: {e}")
+                thinking.append(f"  Skill usage tracking failed: {e}")
+
+            if not turn_failed:
+                self._maybe_forge_skill(matched_skill)
 
         # --- Post-turn memory curation (fire-and-forget) ---
         # A second, independent look at this exchange, restricted to
@@ -1316,6 +1358,39 @@ class Alfred:
             task=task, steps=steps, task_complexity=complexity, had_error=False,
         )
         return skill is not None
+
+    def _maybe_forge_skill(self, skill: Any) -> None:
+        """Fire-and-forget: if this just-used skill is a Tool Forge
+        candidate (used 3+ times, net-successful, not already forged, not
+        out of attempts), kick off codegen+validation in the background.
+        The eligibility check itself is a cheap in-memory comparison, so
+        it's fine to run on every turn a skill matches -- only an actual
+        candidate spends an LLM call. Never awaited: a codegen call must
+        not add latency to the response the user is waiting on, same
+        reasoning as _curate_memory below.
+        """
+        from ..memory import tool_forge
+
+        if not tool_forge.is_forge_candidate(skill):
+            return
+        task_ref = asyncio.create_task(self._forge_skill(skill))
+        self._pending_forge_tasks.append(task_ref)
+        self._pending_forge_tasks = [t for t in self._pending_forge_tasks if not t.done()]
+
+    async def _forge_skill(self, skill: Any) -> None:
+        from ..memory import tool_forge
+
+        try:
+            result = await tool_forge.forge_from_skill(
+                skill, self.skill_manager, self._router, self._tool_executor
+            )
+            if result.success and result.tool_name:
+                self._forge_tool_schemas[result.tool_name] = result.schema
+                print(f"[ToolForge] Promoted skill '{skill.title}' to tool '{result.tool_name}'")
+            else:
+                print(f"[ToolForge] Declined to promote '{skill.title}': {result.reason}")
+        except Exception as e:
+            print(f"[ToolForge] Forge attempt errored for '{skill.title}': {e}")
 
     async def _curate_memory(
         self,

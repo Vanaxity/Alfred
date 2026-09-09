@@ -7,6 +7,119 @@ don't rewrite history — newest entries at the top.
 
 ---
 
+## 2026-09-09 — Cloud routine: Tool Forge shipped (code-only, mocked-verified)
+
+Picked up ROADMAP.md's Week 3 item: "Finish Tool Forge: the markdown-skill
+-> executable-Python conversion path (skill used 3+ times -> LLM-generated
+function -> sandboxed validation -> registered tool). `improve_skill()`'s
+wiring from this week is the down payment; this is the rest of it." Branch
+`auto/tool-forge-20260909` off `feature/day7-heartbeat`, PR opened against
+it — this is a cloud, code-only session (no local Alfred, no real LLM
+keys, no live vault), so everything below is verified against the mocked
+suite only, per this file's own fail-safe rules.
+
+**Two real, pre-existing bugs found and fixed while building this** (the
+same "verify before claiming done" discipline this file already asks
+for — Tool Forge's own threshold literally could not have worked without
+these):
+1. **A matched skill's `success_count` was never incremented on reuse.**
+   `generate_skill()` set it once (0 or 1) at creation time; nothing ever
+   called anything afterward to count a later successful replay. The
+   failure path already existed (`improve_skill()` on a failed reuse), but
+   there was no success-path equivalent — so "used 3+ times" could never
+   actually be reached no matter how often a skill matched and worked.
+   Added `SkillManager.record_skill_use(skill_id, success)`, wired into
+   `conversation.py`'s existing post-turn skill block (kept separate from
+   `improve_skill()`, which also patches steps and writes a log entry a
+   routine successful reuse doesn't need).
+2. **`Skill.from_markdown()` never read back `to_markdown()`'s own
+   "Success Rate: X/Y" line.** Every `SkillManager` reload (a server
+   restart, or any fresh process picking up skills from disk) silently
+   reset every skill's `success_count`/`failure_count` to 0 — so even with
+   bug #1 fixed, a restart would have wiped the counter Tool Forge's
+   threshold depends on. Fixed the round trip; added the same round-trip
+   support for the two new fields below.
+
+**Shipped** (`brain/memory/tool_forge.py`, new):
+- `is_forge_candidate(skill)`: used >=3 times total, success >= 2x
+  failure, not already forged, hasn't exhausted `MAX_FORGE_ATTEMPTS` (3).
+  The 2:1 ratio (not "0 failures") is a judgment call, not something the
+  roadmap specified — see open question below.
+- `generate_tool_code`: one LLM call asking for a single
+  `async def run(params: dict, ctx: dict) -> dict` that replays the
+  skill's recorded steps via `ctx["tool_executor"].execute(...)`.
+- `validate_tool_code`: static AST denylist (no imports, no
+  eval/exec/compile/open/`__import__`, no dunder access, exact
+  `run(params, ctx)` signature) followed by a sandboxed dynamic smoke
+  test — the candidate function actually runs, against a fake executor
+  that never touches a real tool, inside a restricted-builtins namespace,
+  under a 5s timeout.
+- `register_forged_tool` / `load_persisted_forged_tools`: registers a
+  validated tool into a live `ToolExecutor` with
+  `Guardrails(require_approval=True)` — same trust tier as
+  `run_code`/`shell`/`install_mcp_server`. Persisted to a new
+  `T2-ForgedTools/` tier dir (source `.py` + a `registry.json`) so a
+  restart re-registers everything already forged, mirroring how MCP
+  servers reconnect at startup.
+- A forged tool's replayed steps still go through the real
+  `ToolExecutor.execute()` per step (via a small dict<->`ToolResult`
+  adapter, since the sandbox contract is dict-in/dict-out but the real
+  executor returns `ToolResult` objects) — so a promoted skill that
+  happens to include a `shell` step still needs approval for that step,
+  every single time. Forging only removes the LLM's per-turn planning
+  cost of re-deriving "which tools, in what order, with what params"; it
+  does not grant new trust beyond what the skill's own steps already had.
+- `conversation.py`: fire-and-forget `_maybe_forge_skill`/`_forge_skill`
+  after a matched skill's successful turn (cheap eligibility check first;
+  an LLM call only happens for a real candidate), forged-tool schemas
+  merged into `_get_tool_descriptions()` the same way MCP tool schemas
+  already are, `load_forged_tools()` called from `brain_api/server.py`'s
+  startup lifespan.
+
+**Verified against the mocked suite only** — 43 new tests (33 in new
+`test_tool_forge.py`, 10 added to `test_skill_manager.py` for the
+markdown round-trip fix and the three new `SkillManager` methods), full
+existing suite re-run clean alongside them. One pre-existing failure
+(`test_glob_rejects_unsafe_absolute_pattern`) is unchanged and already
+documented in this file's 2026-09-05 entry as a Linux-sandbox-vs-real-
+Windows-target difference, not something this PR touches;
+`test_live_realistic.py` preflight-skips with no provider API keys, as
+expected in a cloud sandbox.
+
+**What still needs a live check from Sam or a local session** (this
+session structurally cannot do any of this, per the autonomy system's own
+design):
+1. Real LLM-generated code quality — the codegen prompt/contract has
+   never faced an actual model. Needs a real skill to genuinely earn 3+
+   successful reuses, then a look at whether the generated code clears
+   both validation stages and whether the resulting forged tool actually
+   behaves correctly once approved and invoked for real.
+2. The AST denylist + restricted-builtins sandbox is a best-effort code
+   review, not a hardened sandbox (same posture as `run_code`'s own
+   subprocess isolation — not containerized). Worth a deliberate
+   adversarial look once real generated code exists to examine, and
+   ideally covered by the still-pending Strix pentest gate.
+3. Whether the fire-and-forget forge attempt is actually invisible to
+   turn latency in practice — it's never awaited so it should be, but
+   that's asserted, not measured against a live turn (same caveat Q8's
+   speed-audit entry already flagged for the similarly-fire-and-forget
+   memory curation pass).
+4. Whether `_safe_tool_name()` produces sane, non-colliding names for real
+   skill titles in practice — only exercised against a couple of fixed
+   titles in mocked tests.
+
+**Open question for Sam**: is "success >= 2x failure" the right
+promotion bar on top of the >=3-uses threshold, or should it be stricter
+("0 failures")? I picked the looser ratio so one early hiccup doesn't
+permanently block a skill from ever promoting, but the roadmap didn't
+specify this and it's a real judgment call, not a derived fact.
+
+Not done from Week 3's list: self-audit loop, entity graph & synthesis,
+any further proactive-surfacing/heartbeat work — left for a future run,
+each is its own well-scoped unit.
+
+---
+
 ## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is

@@ -74,6 +74,8 @@ class Skill:
     success_count: int = 0
     failure_count: int = 0
     path: str = ""
+    forged_tool: Optional[str] = None
+    forge_attempts: int = 0
 
     def to_markdown(self) -> str:
         steps_md = "\n\n".join(
@@ -87,6 +89,13 @@ class Skill:
 
         total = self.success_count + self.failure_count
         rate = f"{self.success_count}/{total}" if total else "No data"
+        forge_line = (
+            f"**Forged Tool:** `{self.forged_tool}`\n"
+            if self.forged_tool
+            else f"**Forge Attempts:** {self.forge_attempts}\n"
+            if self.forge_attempts
+            else ""
+        )
 
         return f"""# Learned Skill: {self.title}
 
@@ -94,7 +103,7 @@ class Skill:
 **Created:** {datetime.now().strftime("%Y-%m-%d %H:%M")}
 **Complexity:** {self.complexity}
 **Success Rate:** {rate}
-
+{forge_line}
 ---
 
 ## Description
@@ -119,6 +128,10 @@ class Skill:
         complexity = "moderate"
         tags = []
         steps = []
+        forged_tool: Optional[str] = None
+        forge_attempts = 0
+        success_count = 0
+        failure_count = 0
 
         for i, line in enumerate(lines):
             if "Skill ID:" in line:
@@ -133,6 +146,30 @@ class Skill:
                 parts = line.split("**Complexity:**")
                 if len(parts) > 1:
                     complexity = parts[1].strip()
+            elif "Forged Tool:" in line:
+                parts = line.split("`")
+                if len(parts) > 1 and parts[1].strip():
+                    forged_tool = parts[1].strip()
+            elif "Forge Attempts:" in line:
+                parts = line.split("**Forge Attempts:**")
+                if len(parts) > 1:
+                    try:
+                        forge_attempts = int(parts[1].strip())
+                    except ValueError:
+                        pass
+            elif "Success Rate:" in line:
+                # "**Success Rate:** X/Y" or "No data" (never persisted before
+                # this fix -- to_markdown() always wrote a rate, but nothing
+                # ever read it back, so success_count/failure_count silently
+                # reset to 0 on every reload. That broke usage tracking across
+                # restarts, which Tool Forge's "used 3+ times" threshold
+                # depends on.
+                parts = line.split("**Success Rate:**")
+                rate = parts[1].strip() if len(parts) > 1 else ""
+                m = _re.match(r"^(\d+)/(\d+)$", rate)
+                if m:
+                    success_count = int(m.group(1))
+                    failure_count = int(m.group(2)) - success_count
 
         current_step = {}
         for line in lines:
@@ -162,7 +199,11 @@ class Skill:
             steps=steps,
             tags=tags,
             complexity=complexity,
+            success_count=success_count,
+            failure_count=failure_count,
             path=path,
+            forged_tool=forged_tool,
+            forge_attempts=forge_attempts,
         )
 
 
@@ -556,6 +597,52 @@ class SkillManager:
 """
         updated_content = skill.to_markdown() + improvement_section
         Path(skill.path).write_text(updated_content, encoding="utf-8")
+        self._skills_cache[skill_id] = skill
+        return True
+
+    def record_skill_use(self, skill_id: str, success: bool) -> bool:
+        """Count one real replay of a matched skill.
+
+        Previously nothing ever called this: a skill's success_count/
+        failure_count were set once at generate_skill() time and never
+        touched again, so "used 3+ times" (Tool Forge's promotion
+        threshold, ROADMAP.md Week 3) could never actually be reached no
+        matter how often a skill got matched and reused. Deliberately
+        separate from improve_skill() -- that method also patches steps
+        and writes a log entry, which a routine successful reuse doesn't
+        need.
+        """
+        skill = self._skills_cache.get(skill_id)
+        if not skill:
+            return False
+        if success:
+            skill.success_count += 1
+        else:
+            skill.failure_count += 1
+        Path(skill.path).write_text(skill.to_markdown(), encoding="utf-8")
+        self._skills_cache[skill_id] = skill
+        return True
+
+    def mark_forged(self, skill_id: str, tool_name: str) -> bool:
+        """Record that a skill has been promoted to a standalone registered
+        tool by Tool Forge, so it's never re-forged on a later pass."""
+        skill = self._skills_cache.get(skill_id)
+        if not skill:
+            return False
+        skill.forged_tool = tool_name
+        Path(skill.path).write_text(skill.to_markdown(), encoding="utf-8")
+        self._skills_cache[skill_id] = skill
+        return True
+
+    def record_forge_attempt(self, skill_id: str) -> bool:
+        """Count one failed Tool Forge attempt (bad codegen or a validation
+        rejection), so a skill whose generated code never validates doesn't
+        burn an LLM call on every single future turn forever."""
+        skill = self._skills_cache.get(skill_id)
+        if not skill:
+            return False
+        skill.forge_attempts += 1
+        Path(skill.path).write_text(skill.to_markdown(), encoding="utf-8")
         self._skills_cache[skill_id] = skill
         return True
 

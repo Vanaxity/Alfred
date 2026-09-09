@@ -38,6 +38,7 @@ OBSIDIAN_VAULT = Path(
 )
 MEMORY_DIR = OBSIDIAN_VAULT / "Memory"
 T2_SKILLS_DIR = MEMORY_DIR / "T2-Skills"
+T2_FORGED_TOOLS_DIR = MEMORY_DIR / "T2-ForgedTools"
 T3_EPISODIC_DIR = MEMORY_DIR / "T3-Episodic"
 T5_ARCHIVE_DIR = MEMORY_DIR / "T5-Archive"
 PROFILES_DIR = MEMORY_DIR / "T4-UserProfile"
@@ -83,7 +84,7 @@ class FiveTierMemory:
 
     def _ensure_dirs(self):
         """Ensure memory directories exist."""
-        for d in [T2_SKILLS_DIR, T3_EPISODIC_DIR, T5_ARCHIVE_DIR, PROFILES_DIR]:
+        for d in [T2_SKILLS_DIR, T2_FORGED_TOOLS_DIR, T3_EPISODIC_DIR, T5_ARCHIVE_DIR, PROFILES_DIR]:
             d.mkdir(parents=True, exist_ok=True)
 
         # Create T1 context placeholder if not exists
