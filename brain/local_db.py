@@ -384,7 +384,15 @@ class LocalDB:
         if not include_fired:
             query += " WHERE fired = 0"
         query += " ORDER BY due_at ASC"
-        rows = conn.execute(query).fetchall()
+        # Same lock every other method on this connection uses, including
+        # plain reads -- the real serialization mechanism for the shared
+        # check_same_thread=False connection. Missing here (and in
+        # get_due_reminders below) let this race a concurrent add_reminder/
+        # mark_reminder_fired write on the same connection. Confirmed live
+        # 2026-09-09 -- same defect class already found and fixed in the
+        # self-audit log's read methods (see PR #32).
+        with self._lock:
+            rows = conn.execute(query).fetchall()
         return [dict(r) for r in rows]
 
     def delete_reminder(self, reminder_id: int) -> bool:
@@ -398,10 +406,11 @@ class LocalDB:
         """Reminders not yet fired whose due_at has passed, earliest first."""
         conn = self._get_conn()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        rows = conn.execute(
-            "SELECT * FROM reminders WHERE fired = 0 AND due_at <= ? ORDER BY due_at ASC",
-            (now_str,),
-        ).fetchall()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM reminders WHERE fired = 0 AND due_at <= ? ORDER BY due_at ASC",
+                (now_str,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def mark_reminder_fired(self, reminder_id: int):

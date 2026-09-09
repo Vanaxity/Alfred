@@ -109,6 +109,41 @@ def test_get_due_reminders_orders_earliest_first():
     assert [r["id"] for r in due] == [earlier_overdue, later_overdue]
 
 
+def test_list_reminders_and_get_due_reminders_use_the_shared_lock():
+    """Confirmed live 2026-09-09: list_reminders()/get_due_reminders() were
+    the only two reminder methods that skipped `with self._lock:` -- every
+    other method on this connection (including plain reads elsewhere in
+    the file) goes through it, the real serialization mechanism for the
+    shared check_same_thread=False connection. Same defect class already
+    found and fixed in the self-audit log's read methods. A
+    single-threaded call can't distinguish "works" from "works but isn't
+    actually serialized against a concurrent writer" -- this checks the
+    lock is genuinely acquired."""
+    db = fresh_db()
+
+    class _TrackingLock:
+        def __init__(self, real_lock):
+            self._real = real_lock
+            self.entered = False
+
+        def __enter__(self):
+            self.entered = True
+            return self._real.__enter__()
+
+        def __exit__(self, *args):
+            return self._real.__exit__(*args)
+
+    tracking = _TrackingLock(db._lock)
+    db._lock = tracking
+
+    db.list_reminders()
+    assert tracking.entered, "list_reminders() must acquire self._lock"
+
+    tracking.entered = False
+    db.get_due_reminders()
+    assert tracking.entered, "get_due_reminders() must acquire self._lock"
+
+
 def main():
     import traceback
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
