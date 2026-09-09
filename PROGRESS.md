@@ -27,6 +27,76 @@ so far.
 
 ---
 
+## 2026-09-09 — Tool Forge attempted 3x in parallel by the cloud routine; all 3 closed by Sam's review
+
+**Not shipped. Do not resume Tool Forge (the LLM-generates-code half) without a scoped hardening pass — see below.**
+
+Three separate cloud-routine firings today independently picked up the same
+ROADMAP.md Phase 3 item ("Finish Tool Forge... skill used 3+ times →
+LLM-generated function → sandboxed validation → registered tool") and each
+built a full, working, mocked-green implementation on its own branch, none
+aware the other two existed:
+
+- PR #25 (`auto/tool-forge-2026-09-08`) — `brain/tool_forge.py`,
+  vault-persisted forged tools under `Memory/ForgedTools/`.
+- PR #27 (`auto/tool-forge-2026-09-09`) — `brain/memory/tool_forge.py`,
+  subprocess-sandboxed validation, in-repo `T2-Skills` markdown persistence.
+- PR #28 (`auto/tool-forge-20260909`) — `brain/memory/tool_forge.py`,
+  `T2-ForgedTools/` persistence tier, `success ≥ 2× failure` promotion bar.
+
+Sam reviewed all three together (not just the PR descriptions) and **closed
+all three without merging**, same day. This is a process gap worth fixing
+in the autonomy system itself, not just a one-off: nothing currently stops
+two routine firings from both reading `PROGRESS.md`, both seeing Tool Forge
+as the next unclaimed item, and both starting before either one has pushed
+anything for the other to see. Worth Sam's call on a fix (e.g. an
+in-flight/claimed marker written to `PROGRESS.md` before work starts, or
+serializing routine firings) before this recurs on the next multi-branch
+item.
+
+**The actual review findings — real, and shared across all three
+independent implementations**, per Sam's close comments on #25/#27/#28:
+
+1. **No human approval gate on a forged tool's *first* execution.**
+   `require_approval` (all three PRs) only gates *subsequent* calls to an
+   already-registered tool — the validation run that decides whether
+   LLM-generated code is safe enough to register at all runs before any
+   human ever sees it. This is a design-level gap in the Tool Forge
+   *concept* as scoped by all three PRs, not a bug in one implementation.
+2. **All three AST safety-checkers share the same bypass**: none catch
+   string-based dunder/introspection access (e.g. building `"__class__"`
+   as a string and reaching it without a literal `ast.Attribute` node the
+   checker looks for) — a denylist over syntax shapes doesn't cover code
+   that constructs the dangerous string at runtime.
+3. **Per-PR gaps found on top of the shared ones**: #25's sandbox has no
+   restricted-builtins namespace (AST denylist + timeout only, so a bypass
+   there is unrestricted code execution); #27's live call-time handler
+   `exec()`s generated code in-process rather than out-of-process (unlike
+   its own forge-time validation, which *is* subprocess-isolated), so a
+   bypass at call time runs with the live server's own privileges; #27 also
+   has an independent regression where `require_approval` gets set
+   *conditionally* on the skill's own steps needing approval, meaning a
+   skill built purely from non-gated tools (`calculator`/`web_search`/
+   `memory_search`) forges into a tool with **no approval requirement at
+   all** — #25 and #28 both hard-code `require_approval=True`
+   unconditionally, correctly. #25's `success_count` persistence fix was
+   also incomplete (never updated `Skill.from_markdown()`'s parsing, so the
+   counter still reset to 0 on reload) — #27 and #28 both fixed this
+   completely.
+
+**What Sam wants before any Tool Forge PR merges**: a deliberately-scoped
+hardening pass — approval gating *before* first execution (not just on
+reuse), an AST/static checker that also catches string-based introspection,
+and generated code running out-of-process even at real call time, not just
+at forge time. Not a quick patch inside a cleanup PR.
+
+**Unaffected and can proceed independently**: PR #16 (`SkillManager.
+validate_skill()` + SemVer versioning) deliberately scoped itself to skill
+validation/versioning only, with no LLM-code-generation surface at all —
+explicitly called out in both #16's own description and Sam's close
+comments on the other three as a separate, lower-risk slice that this
+finding doesn't touch.
+
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
 Full offline+live pass over everything Phase 2 shipped (generic client,
