@@ -89,7 +89,7 @@ class Guardrails:
 # Tools that mutate external state (need verification after execution)
 MUTATION_TOOLS: Set[str] = {
     "calendar", "email", "remember", "write_file", "memory_save", "run_code",
-    "forget",
+    "forget", "set_reminder", "delete_reminder",
 }
 
 # calendar and email dispatch both reads and writes through a single tool, so
@@ -144,6 +144,16 @@ VERIFY_MAP: Dict[str, Dict[str, Any]] = {
         "read_params": {"tier": "t4"},
         "carry": {"key_or_query": "query"},
         "description": "memory search T4 (should now come up empty)",
+    },
+    "set_reminder": {
+        "read_tool": "list_reminders",
+        "read_params": {"include_fired": "false"},
+        "description": "list pending reminders",
+    },
+    "delete_reminder": {
+        "read_tool": "list_reminders",
+        "read_params": {"include_fired": "true"},
+        "description": "list reminders (deleted one should be gone)",
     },
 }
 
@@ -1246,6 +1256,114 @@ async def handle_forget(params: Dict, ctx: Dict) -> ToolResult:
     return ToolResult(success=True, output=out)
 
 
+def _parse_reminder_time(when: str) -> Optional[str]:
+    """Normalize a reminder's 'when' into a 'YYYY-MM-DD HH:MM:SS' local
+    naive string. Accepts ISO 8601 (space or 'T' separated, seconds
+    optional), 'now', or a bare clock time ('10am', '3:30pm') meaning today,
+    or tomorrow if that time has already passed today. Returns None if
+    nothing recognizable was found -- deliberately narrower than calendar's
+    day-name/relative-date parsing, since reminders are a smaller feature.
+    """
+    when = (when or "").strip()
+    if not when:
+        return None
+    if when.lower() == "now":
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        dt = datetime.fromisoformat(when.replace("T", " "))
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+
+    m = re.match(r'^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$', when, re.IGNORECASE)
+    if not m:
+        return None
+    hr = int(m.group(1))
+    mi = int(m.group(2)) if m.group(2) else 0
+    sfx = (m.group(3) or "").lower()
+    if sfx and hr > 12:
+        return None
+    if hr > 23 or mi > 59:
+        return None
+    if sfx == "pm" and hr < 12:
+        hr += 12
+    elif sfx == "am" and hr == 12:
+        hr = 0
+
+    now = datetime.now()
+    target = now.replace(hour=hr, minute=mi, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target.strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def handle_set_reminder(params: Dict, ctx: Dict) -> ToolResult:
+    """Set a reminder that fires at a given time."""
+    db = ctx.get("db")
+    if not db:
+        return ToolResult(success=False, error="Database unavailable")
+    text = str(params.get("text", "")).strip()
+    when = str(params.get("when", ""))
+    category = str(params.get("category") or "general").strip() or "general"
+    if not text:
+        return ToolResult(success=False, error="text required")
+
+    due_at = _parse_reminder_time(when)
+    if due_at is None:
+        return ToolResult(
+            success=False,
+            error=(
+                f"Could not understand reminder time '{when}'. Use an ISO "
+                "datetime ('2026-05-19 15:30:00'), 'now', or a clock time "
+                "('10am', '3:30pm')."
+            ),
+        )
+    try:
+        reminder_id = db.add_reminder(text, due_at, category)
+        return ToolResult(success=True, output=f"Reminder set: '{text}' at {due_at} (ID: {reminder_id})")
+    except Exception as e:
+        return ToolResult(success=False, error=f"Failed to set reminder: {e}")
+
+
+async def handle_list_reminders(params: Dict, ctx: Dict) -> ToolResult:
+    """List pending (or all) reminders."""
+    db = ctx.get("db")
+    if not db:
+        return ToolResult(success=False, error="Database unavailable")
+    include_fired = str(params.get("include_fired", "false")).strip().lower() == "true"
+    try:
+        reminders = db.list_reminders(include_fired)
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+    if not reminders:
+        return ToolResult(success=True, output="No reminders found.")
+    lines = [
+        f"- ID {r['id']}: {r['text']} (due: {r['due_at']}"
+        + (", fired" if r.get("fired") else "") + ")"
+        for r in reminders
+    ]
+    return ToolResult(success=True, output="\n".join(lines))
+
+
+async def handle_delete_reminder(params: Dict, ctx: Dict) -> ToolResult:
+    """Delete a reminder by ID."""
+    db = ctx.get("db")
+    if not db:
+        return ToolResult(success=False, error="Database unavailable")
+    try:
+        reminder_id = int(params.get("id"))
+    except (TypeError, ValueError):
+        return ToolResult(success=False, error="Invalid reminder ID")
+    try:
+        deleted = db.delete_reminder(reminder_id)
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+    if not deleted:
+        return ToolResult(success=False, error=f"Reminder {reminder_id} not found.")
+    return ToolResult(success=True, output=f"Reminder {reminder_id} deleted.")
+
+
 async def handle_weather(params: Dict, ctx: Dict) -> ToolResult:
     """Get weather for a location."""
     loc = params.get("location", "auto")
@@ -1495,6 +1613,9 @@ def create_tool_executor() -> ToolExecutor:
         "run_code": handle_run_code,
         "find_mcp_server": handle_find_mcp_server,
         "install_mcp_server": handle_install_mcp_server,
+        "set_reminder": handle_set_reminder,
+        "list_reminders": handle_list_reminders,
+        "delete_reminder": handle_delete_reminder,
     }
 
     for name, handler in builtin_tools.items():

@@ -294,6 +294,7 @@ class Alfred:
             "CRITICAL: ALL arithmetic, trigonometry, and geometry REQUIRE the calculator tool — never compute mentally and never state a number you did not get from it. Word problems count: extract the expression and call calculator.",
             "CRITICAL: To find, read, or list files, use glob/read_file/list_directory — never shell. Those run immediately; shell requires human approval and stalls the turn.",
             "CRITICAL: A standing or recurring fact about the user ('from now on...', 'permanently...', 'every week...', 'no longer...') is a `remember` call, not silent acknowledgement — always persist it.",
+            "'Remind me to X at Y' is `set_reminder` (fires once at a specific time), not `remember` (a durable fact with no fire time) or `calendar` (a real calendar event).",
             "If the question contains a contradiction or impossible premise (e.g. a right triangle whose leg exceeds its hypotenuse, a date that doesn't exist), SAY SO and stop. Never silently reinterpret the numbers into something solvable — for homework, a confident answer to a broken question is worse than no answer.",
             "If a required detail is genuinely missing (a time, a name, a value), ASK for it. Never invent it and never quietly assume a default.",
             "When find_mcp_server returns a candidate with required or secret environment variables, ASK Master Sam for the actual values before calling install_mcp_server — never invent a placeholder credential.",
@@ -517,6 +518,28 @@ class Alfred:
                 ),
                 "params": {"key_or_query": "Exact key, or a natural-language "
                                             "description of the fact to remove"},
+            },
+            "set_reminder": {
+                "description": (
+                    "Set a one-off reminder that fires at a specific time — use "
+                    "for 'remind me to X at Y', 'alert me when...', 'notify me "
+                    "in an hour'. Different from `remember` (a durable profile "
+                    "fact, no specific time) and `calendar` (a real calendar "
+                    "event). 'when' accepts an ISO datetime "
+                    "('2026-05-19 15:30:00'), 'now', or a bare clock time "
+                    "('10am', '3:30pm', meaning today or tomorrow if that time "
+                    "already passed)."
+                ),
+                "params": {"text": "What to remind about", "when": "When to fire",
+                           "category": "Optional category (default: 'general')"},
+            },
+            "list_reminders": {
+                "description": "List pending reminders (or all, including already-fired, with include_fired='true').",
+                "params": {"include_fired": "'true' to include fired reminders (default: 'false')"},
+            },
+            "delete_reminder": {
+                "description": "Delete a reminder by its ID (from list_reminders).",
+                "params": {"id": "The reminder ID to delete"},
             },
             "weather": {
                 "description": (

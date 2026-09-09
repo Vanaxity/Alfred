@@ -7,25 +7,117 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 & 2 engineering: closed. Currently in: Phase 3
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is
 over — Q2 and Q8 both closed same-day via local-session work, on top of
 the earlier Q3/Q6 work. **Cloud routine re-enabled 2026-09-08**
 (`trig_01U7DDqtuWKAsfWa6c2fU66E`, hourly at :17) — was paused 2026-09-05
 in favor of local-session live testing for Phase 2; that testing is done
-(see the dated entry below), so it's back on autonomous duty, prompt
+(see the dated entries below), so it's back on autonomous duty, prompt
 refreshed to drop stale references to already-finished work. Remaining
 Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
 explicitly manual/non-blocking per `ROADMAP.md` — not something a
 session should pick up and start working unprompted.
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+**Now in Phase 3** (`ROADMAP.md` Week 3): Phase 2's rescoped MCP client +
+filesystem connector + find/install_mcp_server all shipped and
+live-verified (2026-09-05/06/08 entries below). Phase 3 items: Tool Forge,
+self-audit loop, entity graph, and the carried-over "relocated heartbeat +
+confidence-gated push-context" — the first slice of that last one is the
+2026-09-09 entry directly below.
 
 ---
+
+## 2026-09-09 — Phase 3: relocated reminders + the mechanical heartbeat poll (cloud, code-only)
+
+Picked up ROADMAP.md's carried-over "relocated heartbeat" item, since
+Phase 2 is fully shipped and live-verified (see 2026-09-08 below) and
+this is the next unblocked, code-only piece of Phase 3. Before writing
+anything, read both the live `brain/v2/` architecture and the pre-v2
+`brain/alfred.py`/`brain/v2/alfred_v2.py` (confirmed dead code —
+`brain/alfred_v2.py` is a 37-line shim that re-exports from
+`brain/v2/conversation.py`, which is the actual `Alfred` class per
+`brain/__init__.py`; the 2304-line `alfred.py`/`v2/alfred_v2.py` files are
+an unused leftover from before the Hermes rebuild, referenced only by
+debug scripts). That comparison surfaced the real gap: the rebuild
+dropped reminders entirely, not just the heartbeat that fired them —
+`local_db.py`'s `reminders` table still exists in the schema, but every
+method to read or write it, and the `set_reminder`/`list_reminders`/
+`delete_reminder` tools themselves, only exist in the dead code. As of
+before this PR, a user cannot set a reminder in the live app at all, and
+nothing has ever polled for one being due.
+
+Scoped this run to the mechanical half only — reminders working
+end-to-end plus the poll-and-fire loop. NOT built (deliberately, per the
+roadmap's own two-part framing): the manifesto's "cognitive heartbeat"
+(confidence-gated proactive reasoning over T4 goals/calendar/inbox — act
+on high confidence, nudge on medium, log on low) and `scheduled_tasks`
+(cron) support, since no tool anywhere in `brain/v2/` can create a cron
+task yet either — both are real, separate, larger pieces of work for a
+future run, not something to guess at cramming in here.
+
+- **`brain/local_db.py`**: added `add_reminder`, `list_reminders`,
+  `delete_reminder`, `get_due_reminders`, `mark_reminder_fired`. `due_at`
+  is normalized to a `YYYY-MM-DD HH:MM:SS` local-naive string by the tool
+  layer before it ever reaches the DB, so a plain string comparison
+  against `now` sorts correctly with no UTC/local mismatch against
+  SQLite's own `datetime('now')`.
+- **`brain/v2/tool_executor.py`**: added `set_reminder`/`list_reminders`/
+  `delete_reminder` handlers plus `_parse_reminder_time()` (ISO datetime,
+  `'now'`, or a bare clock time like `'10am'`/`'3:30pm'`, rolling to
+  tomorrow if that time already passed today). Registered in
+  `create_tool_executor()`; `set_reminder`/`delete_reminder` added to
+  `MUTATION_TOOLS` with a `VERIFY_MAP` read-back through
+  `list_reminders`, same pattern every other mutating tool already uses.
+- **`brain/v2/conversation.py`**: tool descriptions + one disambiguation
+  rule (`set_reminder` vs. `remember` vs. `calendar`) so the LLM planner
+  actually knows these tools exist and doesn't reach for the wrong one.
+- **`brain/heartbeat.py`** (new): `check_due_reminders()` +
+  `run_heartbeat_loop()` — polls `LocalDB.get_due_reminders()`, marks each
+  fired *before* broadcasting (so a broadcast failure can't leave one
+  stuck re-firing forever), hands it to a caller-supplied async
+  `broadcast` callable. Deliberately dependency-free (asyncio + typing
+  only, no `brain_api`/`brain/__init__.py` imports) so it unit-tests
+  cleanly in this cloud sandbox, which cannot import the full server
+  (`faiss`/`sentence-transformers` aren't installed here) — same
+  rationale `brain_api/auth.py` already established for Q2.
+- **`brain_api/server.py`**: wired `run_heartbeat_loop` into the lifespan
+  as a background `asyncio.Task`, using the existing `broadcast_to_clients`
+  WebSocket function (not the old `_pending_alerts`-polling design the
+  dead code used) — cancelled cleanly on shutdown.
+- **43 new mocked tests**: `test_local_db.py` (7, real temp-file SQLite —
+  the point is catching a wrong SQL string, not mocking sqlite3 itself),
+  `test_heartbeat.py` (5, fake DB + fake async broadcast, including that
+  the loop survives a broadcast exception and keeps polling), plus 16 in
+  `test_tool_executor.py` for the handlers/time-parser/mutation wiring
+  (kept the clock-rollover test's assertion to "ends up in the future"
+  rather than "== tomorrow's date" — a fixed offset can itself cross
+  midnight, which would make a same-date assertion flaky depending on
+  wall-clock time; caught this before it shipped, not after). Full mocked
+  suite after these additions: 147/148 across every `test_*.py` (excluding
+  `test_live_realistic.py`, which needs real LLM keys and correctly
+  preflight-aborts without them). The one failure is the pre-existing
+  `test_glob_rejects_unsafe_absolute_pattern`, already documented in the
+  2026-09-05 entry below as a Linux-sandbox-vs-real-Windows-target
+  difference — confirmed still present on this branch before this PR's
+  changes too, not something this PR touches or introduces.
+- **What still needs a live check from Sam or a local session** (cloud
+  sandbox has no real server, no live LLM keys, no local vault, per the
+  fail-safe rules): (1) that the LLM planner actually picks `set_reminder`
+  over `remember`/`calendar` on real natural-language phrasing, not just
+  that the rule text exists; (2) that the heartbeat task actually starts
+  and survives inside the real FastAPI lifespan (mocked tests prove the
+  polling logic in isolation, not that `asyncio.create_task` wiring in
+  `server.py` is correct end-to-end); (3) that a fired reminder actually
+  reaches a connected Cockpit client over the real WebSocket and the UI
+  does something sensible with a `{"type": "reminder", ...}` message it
+  hasn't seen before (the cockpit's TS side has no handler for this yet —
+  flagging, not guessing at a UI change from the cloud side).
+- **Open question for Sam**: whether the Cockpit should render a fired
+  reminder as a toast/notification now, or whether that's worth batching
+  with the rest of Phase 3's "confidence-gated push-context" UI work
+  instead of shipping two separate notification UIs back to back.
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 

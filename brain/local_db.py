@@ -358,6 +358,58 @@ class LocalDB:
             conn.execute("UPDATE scheduled_tasks SET last_run = datetime('now') WHERE id = ?", (task_id,))
             conn.commit()
 
+    # ============ REMINDERS ============
+    # Relocated for brain/v2 (ROADMAP.md's "relocated heartbeat"): the
+    # `reminders` table has existed since _init_db above, but the v2 rebuild
+    # dropped every method that reads or writes it, along with the
+    # set_reminder/list_reminders/delete_reminder tools -- reminders could no
+    # longer be set at all. due_at is always a 'YYYY-MM-DD HH:MM:SS' local
+    # naive string (normalized by the tool layer before it reaches here), so
+    # a plain string comparison against `now` sorts correctly without any
+    # UTC/local timezone mismatch against SQLite's own datetime('now').
+
+    def add_reminder(self, text: str, due_at: str, category: str = "general") -> int:
+        conn = self._get_conn()
+        with self._lock:
+            cur = conn.execute(
+                "INSERT INTO reminders (text, due_at, category) VALUES (?, ?, ?)",
+                (text, due_at, category),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def list_reminders(self, include_fired: bool = False) -> List[Dict]:
+        conn = self._get_conn()
+        query = "SELECT * FROM reminders"
+        if not include_fired:
+            query += " WHERE fired = 0"
+        query += " ORDER BY due_at ASC"
+        rows = conn.execute(query).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_reminder(self, reminder_id: int) -> bool:
+        conn = self._get_conn()
+        with self._lock:
+            cur = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_due_reminders(self) -> List[Dict]:
+        """Reminders not yet fired whose due_at has passed, earliest first."""
+        conn = self._get_conn()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = conn.execute(
+            "SELECT * FROM reminders WHERE fired = 0 AND due_at <= ? ORDER BY due_at ASC",
+            (now_str,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_reminder_fired(self, reminder_id: int):
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute("UPDATE reminders SET fired = 1 WHERE id = ?", (reminder_id,))
+            conn.commit()
+
 
 # Singleton
 _db_instance: Optional[LocalDB] = None

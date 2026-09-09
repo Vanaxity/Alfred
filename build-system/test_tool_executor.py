@@ -47,10 +47,14 @@ from brain.v2 import (  # noqa: E402
 from brain.v2.tool_executor import (  # noqa: E402
     _action_signature,
     _is_safe_path,
+    _parse_reminder_time,
     handle_calculator,
+    handle_delete_reminder,
     handle_forget,
     handle_glob,
+    handle_list_reminders,
     handle_open_app,
+    handle_set_reminder,
 )
 from brain.memory.five_tier import FiveTierMemory  # noqa: E402
 
@@ -125,6 +129,40 @@ def _bare_memory(profile):
     mem._t3_vector_model = None  # force keyword-only resolution, deterministic
     mem._save_t4_profile = lambda: None
     return mem
+
+
+class FakeReminderDB:
+    """Stands in for LocalDB's reminder methods -- add_reminder/list_reminders/
+    delete_reminder's real SQL behavior is covered separately against a real
+    LocalDB in test_local_db.py; this only checks the tool handlers dispatch
+    to whatever `db` they're given correctly."""
+
+    def __init__(self, reminders=None, next_id=1, raise_on=None):
+        self._reminders = list(reminders or [])
+        self._next_id = next_id
+        self._raise_on = raise_on or set()
+        self.add_calls = []
+        self.delete_calls = []
+
+    def add_reminder(self, text, due_at, category="general"):
+        if "add" in self._raise_on:
+            raise RuntimeError("db write failed")
+        self.add_calls.append((text, due_at, category))
+        rid = self._next_id
+        self._next_id += 1
+        self._reminders.append({"id": rid, "text": text, "due_at": due_at, "category": category, "fired": 0})
+        return rid
+
+    def list_reminders(self, include_fired=False):
+        if include_fired:
+            return list(self._reminders)
+        return [r for r in self._reminders if not r.get("fired")]
+
+    def delete_reminder(self, reminder_id):
+        self.delete_calls.append(reminder_id)
+        before = len(self._reminders)
+        self._reminders = [r for r in self._reminders if r["id"] != reminder_id]
+        return len(self._reminders) < before
 
 
 class FakeMemoryForForget:
@@ -697,6 +735,130 @@ def test_toolresult_to_dict_preserves_metadata():
     # Empty metadata must not add a stray key — keeps the common case lean.
     assert "metadata" not in ToolResult(success=True, output="x").to_dict()
     assert "metadata" not in ToolResult(success=False, error="x").to_dict()
+
+
+# ---------------------------------------------------------------------------
+# 23-31. Reminders (relocated heartbeat, ROADMAP.md Phase 3)
+# ---------------------------------------------------------------------------
+
+def test_parse_reminder_time_now():
+    from datetime import datetime
+    before = datetime.now()
+    parsed = datetime.strptime(_parse_reminder_time("now"), "%Y-%m-%d %H:%M:%S")
+    assert abs((parsed - before).total_seconds()) < 5
+
+
+def test_parse_reminder_time_iso_with_space_and_t():
+    assert _parse_reminder_time("2026-05-19 15:30:00") == "2026-05-19 15:30:00"
+    assert _parse_reminder_time("2026-05-19T15:30:00") == "2026-05-19 15:30:00"
+
+
+def test_parse_reminder_time_bare_clock_time_rolls_forward_if_already_past():
+    # Deliberately asserts "ends up in the future" rather than "== tomorrow's
+    # date": a fixed hours-ago offset can itself cross midnight (e.g. run at
+    # 00:30, "1 hour ago" is 23:30 *today*, which hasn't passed yet), which
+    # would make a same-date assertion flaky depending on wall-clock time.
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    past = (now - timedelta(minutes=1)).strftime("%I:%M%p").lstrip("0").lower()
+    parsed = datetime.strptime(_parse_reminder_time(past), "%Y-%m-%d %H:%M:%S")
+    assert parsed > now, (
+        f"a clock time already passed ({past!r}) must roll forward, not stay in the past"
+    )
+
+
+def test_parse_reminder_time_am_pm_conversion():
+    assert _parse_reminder_time("12am").endswith(" 00:00:00")
+    assert _parse_reminder_time("12pm").endswith(" 12:00:00")
+    assert _parse_reminder_time("3:30pm").endswith(" 15:30:00")
+
+
+def test_parse_reminder_time_rejects_garbage():
+    assert _parse_reminder_time("whenever") is None
+    assert _parse_reminder_time("25:00") is None
+    assert _parse_reminder_time("13am") is None
+    assert _parse_reminder_time("") is None
+
+
+def test_set_reminder_requires_text_and_valid_time():
+    db = FakeReminderDB()
+    r = run(handle_set_reminder({"text": "", "when": "now"}, {"db": db}))
+    assert not r.success and "text required" in r.error
+
+    r = run(handle_set_reminder({"text": "call mom", "when": "not a time"}, {"db": db}))
+    assert not r.success
+    assert "Could not understand" in r.error
+    assert not db.add_calls, "a bad time must not reach the database"
+
+
+def test_set_reminder_success_stores_normalized_time_and_default_category():
+    db = FakeReminderDB()
+    r = run(handle_set_reminder({"text": "call mom", "when": "2026-05-19 10:00:00"}, {"db": db}))
+    assert r.success
+    assert "call mom" in r.output and "ID: 1" in r.output
+    assert db.add_calls == [("call mom", "2026-05-19 10:00:00", "general")]
+
+
+def test_set_reminder_no_db_in_context_fails_cleanly():
+    r = run(handle_set_reminder({"text": "x", "when": "now"}, {}))
+    assert not r.success and "unavailable" in r.error.lower()
+
+
+def test_set_reminder_db_exception_becomes_tool_error():
+    db = FakeReminderDB(raise_on={"add"})
+    r = run(handle_set_reminder({"text": "x", "when": "now"}, {"db": db}))
+    assert not r.success and "Failed to set reminder" in r.error
+
+
+def test_list_reminders_defaults_to_pending_only():
+    db = FakeReminderDB(reminders=[
+        {"id": 1, "text": "pending one", "due_at": "2026-05-19 10:00:00", "fired": 0},
+        {"id": 2, "text": "already fired", "due_at": "2026-05-18 10:00:00", "fired": 1},
+    ])
+    r = run(handle_list_reminders({}, {"db": db}))
+    assert r.success
+    assert "pending one" in r.output
+    assert "already fired" not in r.output
+
+
+def test_list_reminders_include_fired_true_shows_everything():
+    db = FakeReminderDB(reminders=[
+        {"id": 1, "text": "pending one", "due_at": "2026-05-19 10:00:00", "fired": 0},
+        {"id": 2, "text": "already fired", "due_at": "2026-05-18 10:00:00", "fired": 1},
+    ])
+    r = run(handle_list_reminders({"include_fired": "true"}, {"db": db}))
+    assert r.success
+    assert "pending one" in r.output and "already fired" in r.output
+
+
+def test_list_reminders_empty_is_a_clean_message_not_an_error():
+    r = run(handle_list_reminders({}, {"db": FakeReminderDB()}))
+    assert r.success and "No reminders" in r.output
+
+
+def test_delete_reminder_success_and_not_found():
+    db = FakeReminderDB(reminders=[{"id": 5, "text": "x", "due_at": "2026-01-01 00:00:00", "fired": 0}])
+    r = run(handle_delete_reminder({"id": "5"}, {"db": db}))
+    assert r.success and db.delete_calls == [5]
+
+    r = run(handle_delete_reminder({"id": "5"}, {"db": db}))
+    assert not r.success and "not found" in r.error
+
+
+def test_delete_reminder_invalid_id_rejected_without_touching_db():
+    db = FakeReminderDB()
+    r = run(handle_delete_reminder({"id": "not-a-number"}, {"db": db}))
+    assert not r.success and "Invalid reminder ID" in r.error
+    assert not db.delete_calls
+
+
+def test_reminders_are_mutations_with_a_registered_readback():
+    ex = create_tool_executor()
+    assert ex.is_mutation("set_reminder", {})
+    assert ex.is_mutation("delete_reminder", {})
+    assert not ex.is_mutation("list_reminders", {})
+    for tool in ("set_reminder", "delete_reminder"):
+        assert VERIFY_MAP[tool]["read_tool"] == "list_reminders"
 
 
 # ---------------------------------------------------------------------------

@@ -51,12 +51,14 @@ from brain import get_alfred, get_memory, get_skill_manager
 from brain.local_db import get_local_db
 from brain.neural_memory import get_neural_memory
 from brain.tools.gws_client import get_auth_url, exchange_code, get_token_status, AuthRequiredError
+from brain.heartbeat import run_heartbeat_loop
 
 # Global state
 START_TIME = time.time()
 CONNECTED_CLIENTS: Set[WebSocket] = set()
 NGROK_URL: Optional[str] = None
 NGROK_PROCESS: Optional[subprocess.Popen] = None
+_HEARTBEAT_TASK: Optional[asyncio.Task] = None
 
 
 @asynccontextmanager
@@ -104,12 +106,20 @@ async def lifespan(app: FastAPI):
     # if the file doesn't exist -- MCP is additive, not required to boot.
     await alfred.connect_mcp_servers()
 
+    # Relocated heartbeat (ROADMAP.md Phase 3): poll for due reminders and
+    # push them to connected Cockpit clients. See brain/heartbeat.py for why
+    # this lives there instead of inline here.
+    global _HEARTBEAT_TASK
+    _HEARTBEAT_TASK = asyncio.create_task(run_heartbeat_loop(db, broadcast_to_clients))
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 
     yield
 
     print("\nShutting down Alfred Brain API...")
+    if _HEARTBEAT_TASK is not None:
+        _HEARTBEAT_TASK.cancel()
     await alfred.disconnect_mcp_servers()
     stop_ngrok()
 
