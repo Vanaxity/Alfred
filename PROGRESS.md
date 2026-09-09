@@ -27,6 +27,80 @@ so far.
 
 ---
 
+## 2026-09-09 — Phase 3: self-audit loop, code-side (cloud routine)
+
+Picked up the first Phase 3 item from `ROADMAP.md`'s Week 3 plan: "weekly
+cron feeding Alfred its own execution logs, proposing one concrete
+optimization." Scoped down to a well-defined code-only slice — see "What
+still needs a live/local check" below for what this run couldn't finish.
+
+- **Found the actual gap before writing anything**: Alfred keeps no
+  structured record of its own turns today. `Alfred.execute()`'s real
+  per-phase `timings` dict and per-tool `tool_results` (both correct,
+  shipped 2026-09-05 for Q8) die at the HTTP response boundary —
+  `ChatResponse` never carries `timings`, confirmed by reading
+  `brain_api/server.py`'s `process_chat()` directly. T3 episodic memory is
+  the closest persisted trace but is a lossy human-readable summary (tool
+  names only, no timings, no success/failure). There was nothing for a
+  self-audit to actually read. Also confirmed: no generic "run this job
+  periodically" primitive survived the 2026-08-23 heartbeat/cron removal —
+  `local_db.py`'s `scheduled_tasks` table is inert schema with no live
+  caller, and the only cron/heartbeat *logic* left in the repo lives in the
+  two dead v1 files (`brain/alfred.py`, `brain/v2/alfred_v2.py`) that
+  nothing on the active path imports.
+- **`brain/self_audit.py` (new)**: `log_turn_execution()` appends one
+  compact JSONL record per turn (tool names, tool failures + truncated
+  detail, the existing `timings` dict, turn count — no full task/reply
+  text, that already lives in T3 when a real tool ran) to
+  `brain/data/execution_log.jsonl` (gitignored, same directory convention
+  as `local_db.py`'s `alfred.db`). `read_execution_log()` reads it back,
+  tolerant of a missing file or corrupt/partial lines. `aggregate_stats()`
+  turns records into per-tool call/failure counts, average per-phase
+  timings, and the single dominant phase. `propose_optimization()` asks
+  the LLM for exactly one concrete, numbers-grounded optimization (skips
+  the LLM call entirely when there's no data yet, or no router
+  configured). `run_self_audit(lookback_days=7, ...)` ties it together;
+  callable directly (`python -m brain.self_audit`) or from whatever local
+  weekly trigger gets wired up.
+- **Wired into `Alfred.execute()`** (`brain/v2/conversation.py`): one new
+  fire-and-forget, try/except-guarded call right next to the existing T3
+  episode save. `_self_audit_log_path` is only set in `__init__` (real
+  path), so every existing test file's `Alfred.__new__(Alfred)` bypass
+  pattern (skips `__init__`) leaves it unset and logs nothing — confirmed
+  by a test that runs a full turn through a bypass-built instance and
+  asserts the real default log path was never created, the exact same
+  `getattr(self, "...", None)` defensive shape already established for
+  `_mcp_tool_schemas`.
+- **Deliberately not done this run** (flagged rather than guessed at):
+  - **No scheduler wiring.** Matches the roadmap's own framing (Phase 3
+    still calls this "not yet built") and the established pattern for
+    auto-start-on-boot, where the actual Task Scheduler entry is a local,
+    manual step outside this repo. `run_self_audit()` is a plain callable
+    Sam (or a local session) can invoke by hand or wire into a weekly
+    Task Scheduler job.
+  - **`ChatResponse`/cockpit timings passthrough** — the open question
+    PROGRESS.md's 2026-09-05 Q8 entry already flagged — is untouched.
+    Deliberately out of scope here to keep this one unit of work scoped;
+    still open.
+  - **No real magnitude data.** Every aggregation/proposal path is only
+    proven correct in shape against fakes (hand-built JSONL records, a
+    `FakeRouter`) — this cloud sandbox has no real execution history to
+    audit and no real LLM key. The first real run needs a local session
+    with at least a few days of real turns logged first.
+- **Verified against the mocked suite only**: 12 new tests in
+  `build-system/test_self_audit.py` (log/read round-trip, corrupt-line and
+  missing-file tolerance, the `since` lookback filter, stats aggregation
+  including the "aggregate keys never win slowest-phase" edge case, the
+  no-data/no-router `propose_optimization` short-circuits, and the two
+  `Alfred.execute()` integration tests above). Ran the full existing
+  suite after installing this sandbox's missing runtime deps
+  (`python-dotenv`, `numpy`, `groq`, `openai`, `google-genai`, `mcp` —
+  none were present at session start): everything passes except the same
+  pre-existing `test_glob_rejects_unsafe_absolute_pattern` failure noted
+  in the 2026-09-05 Q8 entry (confirmed again via `git stash` that it
+  fails identically with none of this branch's changes applied — Linux-
+  sandbox-vs-real-target difference, not something this PR touches).
+
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
 Full offline+live pass over everything Phase 2 shipped (generic client,

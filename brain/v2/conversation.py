@@ -171,6 +171,15 @@ class Alfred:
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
+        # Phase 3: self-audit execution log (see brain/self_audit.py).
+        # Only set here, on a real Alfred() instance -- test instances
+        # built via Alfred.__new__(Alfred) (bypassing __init__) skip this,
+        # so the getattr(..., None) default at the execute() call site
+        # disables logging there instead of writing to the real
+        # repo-relative path during a test run.
+        from ..self_audit import EXECUTION_LOG_PATH
+        self._self_audit_log_path = EXECUTION_LOG_PATH
+
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
         and register each one through the same ToolExecutor.register()
@@ -1230,6 +1239,19 @@ class Alfred:
                 turns_used=timings.get("turns_used", 0),
             )
         )
+
+        # --- Self-audit execution log (Phase 3, fire-and-forget) ---
+        # Feeds brain/self_audit.py's weekly-review reader. Same non-fatal
+        # shape as the T3 save above; see the __init__ comment on
+        # _self_audit_log_path for why the getattr default is None (not the
+        # real path) rather than always-on.
+        self_audit_log_path = getattr(self, "_self_audit_log_path", None)
+        if self_audit_log_path is not None:
+            try:
+                from ..self_audit import log_turn_execution
+                log_turn_execution(task, tools_called, tool_results, timings, log_path=self_audit_log_path)
+            except Exception:
+                pass
 
         return {
             "response": final_reply,
