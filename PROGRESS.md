@@ -25,6 +25,83 @@ one connector this week, proactive surfacing and further connectors
 pushed to Phase 3. See the dated entry below for what's actually shipped
 so far.
 
+**⚠️ 2026-09-09: Phase 3 has a 16-PR pileup, unresolved, none merged — see the
+2026-09-09 entry below before picking any Phase 3 item.** Two prior
+stand-down requests (#22, #26) were ignored by later firings; this entry
+supersedes them and recommends disabling the trigger until Sam triages the
+queue by hand. Do not open another duplicate PR for any Phase 3 roadmap
+item (heartbeat, self-audit, Tool Forge) until that's resolved.
+
+---
+
+## 2026-09-09 — PR pileup: 16 open PRs, two prior stand-downs (#22, #26) ignored — recommend disabling the trigger
+
+No new feature code this run, same call as #22 and #26 before it, now with harder evidence for a
+conclusion those two only recommended. **Do not act on this entry by opening a 4th "stop and
+look" PR** — that pattern has been tried twice already and produced zero response and zero effect
+on subsequent firings. This entry exists so the next reader (Sam or a future session) has the
+full, current picture in one place, and because leaving the routine running unmodified means it
+will keep doing this.
+
+**What happened**: #22 (2026-09-08 19:22) asked Sam to pick a resolution for a 3-way overlap and
+said "the routine has no fifth Phase 3 item to pick up without adding to the pileup." #26
+(2026-09-09 00:22) reported that ask was ignored — three more firings (#23, #24, #25) landed
+anyway — and escalated: *"No further autonomous Phase 3/4 picks will happen from this routine
+until [Sam decides]."* Two more firings landed after that anyway: **#27** and **#28**, both
+independent Tool Forge implementations, neither referencing #16, #25, each other, or either
+triage PR. Both found and fixed the *same* underlying bug independently (`success_count` never
+persisted across a `SkillManager` reload) — a strong sign the work itself is fine, the *process*
+is what's broken.
+
+**Root cause, now clear**: each firing is a fresh session that reads `ROADMAP.md` and
+`PROGRESS.md` on `feature/day7-heartbeat`'s current tip — it has no way to see warnings that only
+exist in the *body* of an unmerged PR. #22 and #26's stand-down requests never reached later
+firings because nobody merged them, so the tip of the branch still looked like "Phase 2 done,
+proceed to Phase 3" the whole time. Writing the stand-down only into a PR body was the mistake;
+this entry puts it in `PROGRESS.md` itself, which every firing actually reads first, and directly
+recommends disabling the trigger rather than trusting a future firing to keep respecting a text
+warning it may not check for either.
+
+**Current queue, 16 open PRs total against `feature/day7-heartbeat`, none merged**:
+
+| Roadmap item | Open PRs | Relationship |
+|---|---|---|
+| Heartbeat / proactive surfacing | #15, #21, #23, #24 | Four independent, mutually-unaware rebuilds of `brain/v2/heartbeat.py` — not mergeable together as-is. |
+| Self-audit loop | #17, #18 | #18 looks like a strict superset of #17 (richer schema + the actual audit loop on top). |
+| Tool Forge | #16, #25, #27, #28 | #16 is a validation-only prerequisite; #25, #27, #28 are three independent full pipelines, none aware of the other two. |
+| Entity graph | #20 | No duplicate. |
+| PR-pileup triage (this thread) | #22, #26, this PR | Two prior stand-downs, ignored; this is the third and should be the last until Sam has looked. |
+| Unrelated | #19 | `main` sync, separate concern. |
+
+**Verified this run**: no code changed, so nothing to regress. Re-ran the full mocked suite on
+unmodified `feature/day7-heartbeat` (base `4208193`) after installing this sandbox's missing
+deps (`python-dotenv`, `numpy`, `groq`, `openai`, `google-genai`): every suite green except the
+same two already-documented, pre-existing gaps — `test_tool_executor.py`'s
+`test_glob_rejects_unsafe_absolute_pattern` (Linux-sandbox-vs-Windows-target difference) and
+`test_mcp_client.py` failing to import (`mcp` package not installable in this sandbox, unrelated
+to any of the pending PRs). `test_live_realistic.py` correctly preflight-aborts with no provider
+keys set. No regressions on the base branch itself.
+
+**Recommendation (Sam's call, not executed here — this session cannot merge, close PRs, or touch
+the trigger config)**:
+1. **Disable or pause the recurring trigger now.** Text-based stand-down requests in PR bodies
+   don't reach future firings — only actually turning the trigger off (or Sam manually triaging
+   the queue) stops the pileup from growing further before the next scheduled fire.
+2. Triage order once ready: merge #18 and close #17 as superseded (least ambiguous); decide #20
+   on its own schedule (no conflict); the heartbeat 4-way fork and the Tool Forge 3-way fork both
+   need a real look at each diff rather than a pure pick, since each independently reinvented
+   different pieces worth keeping (see #26 for the heartbeat breakdown; for Tool Forge, #27 and
+   #28 both include the `success_count` persistence fix, #28 additionally adds a persisted
+   `T2-ForgedTools/` registry surviving restarts, #27 additionally documents the
+   sandbox-boundary caveat more explicitly in its module docstring — worth cherry-picking rather
+   than picking one whole diff).
+3. Close #22 and #26 once this entry supersedes them, or leave them as historical record — either
+   is fine, this session isn't closing them itself.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_01WByYZHwYqkSQbhvujFpVi5
+
 ---
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
