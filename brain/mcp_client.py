@@ -2,8 +2,18 @@
 MCP Client — generic Model Context Protocol client.
 
 Connects to any MCP server listed in mcp_servers.json (repo root) -- the
-same config shape every MCP-compatible client already uses:
-    {"mcpServers": {"<name>": {"command": "...", "args": [...], "env": {...}}}}
+same config shape every MCP-compatible client already uses. Two server
+shapes, both valid in the same file:
+    {"mcpServers": {
+        "<stdio-name>": {"command": "...", "args": [...], "env": {...}},
+        "<http-name>": {"url": "http://host:port/mcp"}
+    }}
+A "command" entry is spawned as a subprocess (stdio transport). A "url"
+entry is a long-lived server already running elsewhere that this process
+just connects to over HTTP (streamable HTTP transport) -- no process of
+ours to spawn or own the lifecycle of. Nuclear's music-player MCP server
+is the first "url" example: it only runs inside the Nuclear desktop app
+itself, with MCP enabled in its settings.
 
 Discovers each server's tools via tools/list and wraps them into Alfred's
 own ToolResult shape so they register through the existing
@@ -28,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 from .v2.tool_executor import ToolResult
 
@@ -125,30 +136,48 @@ class MCPClientManager:
         disturbing already-connected servers -- only transferred into the
         shared stack (for disconnect_all()) once connection fully
         succeeds."""
-        # A command that doesn't resolve to a real executable can take far
-        # longer to fail via actual process spawn than the timeout below
-        # allows for -- confirmed live on Windows: a bad command name hits
-        # an OS command-resolution shim (the "look this up in the Store?"
-        # path) that can block the event loop itself for 20-100+s, well
-        # past what asyncio.wait_for can preempt since the block isn't a
-        # cancellable await. shutil.which is a plain PATH/PATHEXT scan
-        # with none of that, and resolves in milliseconds either way.
-        if shutil.which(spec.get("command", "")) is None:
+        # Two transports: most MCP servers are stdio (spawn a subprocess,
+        # talk over stdin/stdout) -- command+args in the config. Some (e.g.
+        # Nuclear's music-player MCP server) are HTTP instead: a long-lived
+        # server the config just points at by url, no process of ours to
+        # spawn at all. The SDK's streamable_http_client yields the exact
+        # same (read_stream, write_stream) shape stdio_client does, so
+        # everything past that point -- ClientSession, initialize(),
+        # list_tools() -- is identical for both.
+        is_http = "url" in spec
+
+        if not is_http and shutil.which(spec.get("command", "")) is None:
+            # A command that doesn't resolve to a real executable can take
+            # far longer to fail via actual process spawn than the timeout
+            # below allows for -- confirmed live on Windows: a bad command
+            # name hits an OS command-resolution shim (the "look this up in
+            # the Store?" path) that can block the event loop itself for
+            # 20-100+s, well past what asyncio.wait_for can preempt since
+            # the block isn't a cancellable await. shutil.which is a plain
+            # PATH/PATHEXT scan with none of that, and resolves in
+            # milliseconds either way. Only meaningful for stdio -- an http
+            # server has no local command to pre-check, a bad/unreachable
+            # url just fails normally (fast) inside the timeout below.
             print(f"  [MCP] Failed to connect '{name}': command not found: {spec.get('command')!r}")
             return []
 
         local_stack = AsyncExitStack()
 
         async def _do_connect():
-            merged_env = None
-            if spec.get("env"):
-                merged_env = {**os.environ, **spec["env"]}
-            params = StdioServerParameters(
-                command=spec["command"],
-                args=spec.get("args", []),
-                env=merged_env,
-            )
-            read, write = await local_stack.enter_async_context(stdio_client(params))
+            if is_http:
+                read, write = await local_stack.enter_async_context(
+                    streamable_http_client(spec["url"])
+                )
+            else:
+                merged_env = None
+                if spec.get("env"):
+                    merged_env = {**os.environ, **spec["env"]}
+                params = StdioServerParameters(
+                    command=spec["command"],
+                    args=spec.get("args", []),
+                    env=merged_env,
+                )
+                read, write = await local_stack.enter_async_context(stdio_client(params))
             session = await local_stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
             tools_result = await session.list_tools()

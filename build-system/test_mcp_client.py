@@ -11,11 +11,13 @@ alone isn't enough, since the LLM only ever sees what that method returns.
 """
 import asyncio
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import brain.mcp_client as mcp_client_module  # noqa: E402
 from brain.mcp_client import MCPClientManager  # noqa: E402
 from brain.v2.conversation import Alfred  # noqa: E402
 
@@ -171,6 +173,114 @@ def test_connect_all_is_idempotent():
     manager._connected = True  # simulate already having connected
     discovered = run(manager.connect_all())
     assert discovered == [], "a second connect_all() call must be a no-op, not reconnect"
+
+
+class _FakeToolsResult:
+    def __init__(self, tools):
+        self.tools = tools
+
+
+class _FakeHttpSession:
+    """Stands in for ClientSession(read, write) -- used as an async context
+    manager in the real code (local_stack.enter_async_context(...)), so
+    this needs __aenter__/__aexit__ too, not just initialize()/list_tools()."""
+
+    def __init__(self, tools):
+        self._tools = tools
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def initialize(self):
+        pass
+
+    async def list_tools(self):
+        return _FakeToolsResult(self._tools)
+
+
+def test_connect_one_uses_http_transport_when_spec_has_a_url():
+    """A server config keyed by "url" instead of "command" (e.g. Nuclear's
+    music-player MCP server) must go through streamable_http_client, not
+    stdio_client -- and must NOT run the stdio path's shutil.which
+    precheck, which only makes sense for a local command to spawn."""
+    calls = {"http_urls": [], "stdio_commands": []}
+
+    @asynccontextmanager
+    async def fake_streamable_http_client(url):
+        calls["http_urls"].append(url)
+        yield ("fake_read", "fake_write")
+
+    @asynccontextmanager
+    async def fake_stdio_client(params):
+        calls["stdio_commands"].append(params.command)
+        yield ("fake_read", "fake_write")
+
+    def fake_client_session(read, write):
+        return _FakeHttpSession([_FakeTool("call", "Execute a Nuclear API method")])
+
+    original_http = mcp_client_module.streamable_http_client
+    original_stdio = mcp_client_module.stdio_client
+    original_session = mcp_client_module.ClientSession
+    mcp_client_module.streamable_http_client = fake_streamable_http_client
+    mcp_client_module.stdio_client = fake_stdio_client
+    mcp_client_module.ClientSession = fake_client_session
+    try:
+        manager = MCPClientManager()
+        discovered = run(manager.connect_one("nuclear", {"url": "http://127.0.0.1:8800/mcp"}))
+    finally:
+        mcp_client_module.streamable_http_client = original_http
+        mcp_client_module.stdio_client = original_stdio
+        mcp_client_module.ClientSession = original_session
+
+    assert calls["http_urls"] == ["http://127.0.0.1:8800/mcp"]
+    assert calls["stdio_commands"] == [], "a url-keyed spec must never touch the stdio path"
+    assert len(discovered) == 1
+    assert discovered[0] == ("nuclear", "call", discovered[0][2])
+
+
+def test_connect_one_still_uses_stdio_for_a_command_spec():
+    """Regression check alongside the http test above: an ordinary
+    command-keyed spec (every existing server) must still take the stdio
+    path, not get accidentally routed through http just because the http
+    branch now exists."""
+    calls = {"http_urls": [], "stdio_commands": []}
+
+    @asynccontextmanager
+    async def fake_streamable_http_client(url):
+        calls["http_urls"].append(url)
+        yield ("fake_read", "fake_write")
+
+    @asynccontextmanager
+    async def fake_stdio_client(params):
+        calls["stdio_commands"].append(params.command)
+        yield ("fake_read", "fake_write")
+
+    def fake_client_session(read, write):
+        return _FakeHttpSession([_FakeTool("list_directory")])
+
+    original_http = mcp_client_module.streamable_http_client
+    original_stdio = mcp_client_module.stdio_client
+    original_session = mcp_client_module.ClientSession
+    original_which = mcp_client_module.shutil.which
+    mcp_client_module.streamable_http_client = fake_streamable_http_client
+    mcp_client_module.stdio_client = fake_stdio_client
+    mcp_client_module.ClientSession = fake_client_session
+    mcp_client_module.shutil.which = lambda cmd: "/usr/bin/npx"  # pretend it exists
+    try:
+        manager = MCPClientManager()
+        discovered = run(manager.connect_one("filesystem", {"command": "npx", "args": ["-y", "pkg"]}))
+    finally:
+        mcp_client_module.streamable_http_client = original_http
+        mcp_client_module.stdio_client = original_stdio
+        mcp_client_module.ClientSession = original_session
+        mcp_client_module.shutil.which = original_which
+
+    assert calls["stdio_commands"] == ["npx"]
+    assert calls["http_urls"] == [], "a command-keyed spec must never touch the http path"
+    assert len(discovered) == 1
 
 
 def test_discovered_tools_reach_get_tool_descriptions():
