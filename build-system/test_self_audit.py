@@ -125,6 +125,12 @@ def _test_local_db_log_execution_round_trips():
         assert json.loads(r["tools_called"]) == ["weather"]
         assert r["tool_error_count"] == 0
         assert r["max_turns_hit"] == 0
+        # Windows keeps a file handle open on an unclosed sqlite3 connection,
+        # which makes TemporaryDirectory's own cleanup fail with WinError 32
+        # right as this `with` block exits (passed in the cloud sandbox's
+        # Linux target, where unlinking an open file is allowed -- confirmed
+        # live 2026-09-09 running this suite on a real Windows target).
+        db.close()
 
 
 def _test_local_db_get_recent_executions_filters_by_window():
@@ -153,6 +159,45 @@ def _test_local_db_get_recent_executions_filters_by_window():
 
         everything = db.get_recent_executions(days=60)
         assert len(everything) == 2
+        db.close()
+
+
+def _test_get_recent_executions_and_self_audits_use_the_shared_lock():
+    """Confirmed live 2026-09-09: get_recent_executions()/get_recent_self_audits()
+    were the only two LocalDB methods that skipped `with self._lock:` --
+    every other method, including plain reads, goes through it (the real
+    serialization mechanism for the shared check_same_thread=False
+    connection, despite this file's own "no locks needed" docstring). A
+    single-threaded call can't distinguish "works" from "works but isn't
+    actually serialized against a concurrent writer" -- this checks the
+    lock is genuinely acquired, not just that the query still returns
+    correct rows."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = LocalDB(db_path=Path(tmp) / "test.db")
+
+        class _TrackingLock:
+            def __init__(self, real_lock):
+                self._real = real_lock
+                self.entered = False
+
+            def __enter__(self):
+                self.entered = True
+                return self._real.__enter__()
+
+            def __exit__(self, *args):
+                return self._real.__exit__(*args)
+
+        tracking = _TrackingLock(db._lock)
+        db._lock = tracking
+
+        db.get_recent_executions(days=7)
+        assert tracking.entered, "get_recent_executions() must acquire self._lock"
+
+        tracking.entered = False
+        db.get_recent_self_audits()
+        assert tracking.entered, "get_recent_self_audits() must acquire self._lock"
+
+        db.close()
 
 
 def _test_local_db_self_audit_log_round_trips():
@@ -163,6 +208,7 @@ def _test_local_db_self_audit_log_round_trips():
         assert len(recent) == 1
         assert recent[0]["proposal"] == "Cache T3 embeddings."
         assert json.loads(recent[0]["summary_json"])["turn_count"] == 3
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +476,10 @@ def test_local_db_get_recent_executions_filters_by_window():
 
 def test_local_db_self_audit_log_round_trips():
     _test_local_db_self_audit_log_round_trips()
+
+
+def test_get_recent_executions_and_self_audits_use_the_shared_lock():
+    _test_get_recent_executions_and_self_audits_use_the_shared_lock()
 
 
 def test_summarize_executions_empty():

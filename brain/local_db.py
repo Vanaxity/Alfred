@@ -35,6 +35,21 @@ class LocalDB:
             self._conn.execute("PRAGMA busy_timeout=3000")
         return self._conn
 
+    def close(self) -> None:
+        """Release the underlying sqlite3 connection. The real singleton
+        (get_local_db()) lives for the process's lifetime and never needs
+        this, but a short-lived LocalDB(db_path=...) instance -- every
+        test that points at a tempfile -- does: on Windows, an open
+        connection keeps a file handle on the db file, so
+        tempfile.TemporaryDirectory's cleanup fails with WinError 32
+        (works on Linux, where unlinking an open file is allowed, which is
+        why this only ever surfaced running tests on a real Windows target).
+        """
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
     def _init_db(self):
         """Create tables if they don't exist."""
         conn = self._get_conn()
@@ -432,14 +447,22 @@ class LocalDB:
 
     def get_recent_executions(self, days: int = 7, limit: int = 1000) -> List[Dict]:
         conn = self._get_conn()
-        rows = conn.execute(
-            """
-            SELECT * FROM execution_log
-            WHERE created_at >= datetime('now', ?)
-            ORDER BY created_at DESC LIMIT ?
-            """,
-            (f"-{int(days)} days", limit),
-        ).fetchall()
+        # Every other method on this connection (including plain reads) goes
+        # through self._lock -- that's the real serialization mechanism for
+        # the shared check_same_thread=False connection, despite this file's
+        # own "no locks needed" docstring. Missing it here let a live turn's
+        # log_execution() write race this read on the same connection; the
+        # single-threaded mocked suite never exercised real concurrency so
+        # it never caught this. Confirmed live 2026-09-09 during PR review.
+        with self._lock:
+            rows = conn.execute(
+                """
+                SELECT * FROM execution_log
+                WHERE created_at >= datetime('now', ?)
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (f"-{int(days)} days", limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     # ============ SELF-AUDIT LOG ============
@@ -456,10 +479,11 @@ class LocalDB:
 
     def get_recent_self_audits(self, limit: int = 5) -> List[Dict]:
         conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT * FROM self_audit_log ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM self_audit_log ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
