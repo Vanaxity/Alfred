@@ -7,25 +7,114 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 + 2 closed. Currently in: Phase 3. Cloud routine DISABLED (2026-09-09)
 
-Phase 1's active-catch-up mode (was here, see git history if needed) is
-over — Q2 and Q8 both closed same-day via local-session work, on top of
-the earlier Q3/Q6 work. **Cloud routine re-enabled 2026-09-08**
-(`trig_01U7DDqtuWKAsfWa6c2fU66E`, hourly at :17) — was paused 2026-09-05
-in favor of local-session live testing for Phase 2; that testing is done
-(see the dated entry below), so it's back on autonomous duty, prompt
-refreshed to drop stale references to already-finished work. Remaining
-Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
-explicitly manual/non-blocking per `ROADMAP.md` — not something a
-session should pick up and start working unprompted.
+Phase 1 and Phase 2 (generic MCP client + `find_mcp_server`/
+`install_mcp_server`) are both done and live-verified — see the dated
+entries below. **Cloud routine (`trig_01U7DDqtuWKAsfWa6c2fU66E`) is
+disabled as of 2026-09-09 — do not re-enable without reading the
+2026-09-09 entry below first.** It produced a real pileup (17 open PRs
+in ~19 hours, heavy duplication across 3 roadmap items) because each
+firing is a fresh session with no visibility into prior firings' work or
+their own stand-down requests, which only ever lived in unmerged PR
+bodies. A second, subtler issue: **disabling the cron trigger does not
+stop already-running sessions that subscribed to a PR's activity
+webhooks from continuing to react indefinitely** — closing #25/#27/#28
+today caused two *more* PRs (#33, #34) from sessions that had subscribed
+to those PRs' activity, well after the trigger was already off. If
+re-enabling this in the future, that's a real gap to design around, not
+just the scheduling one.
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+Remaining Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business
+questions) are explicitly manual/non-blocking per `ROADMAP.md`.
 
 ---
+
+## 2026-09-09 — Triaged and fixed the Phase 3 PR pileup; cloud routine disabled
+
+The cloud routine fired continuously through the night and produced a
+genuine pileup: 17 open PRs against `feature/day7-heartbeat`, heavy
+duplication across 3 roadmap items, none merged. The routine caught this
+itself and asked to be paused three times (#22, #26, #29) — each ignored
+by the next scheduled firing, since a stand-down request that only lives
+in an unmerged PR body is invisible to a fresh session that only reads
+this file's current tip. Disabled the trigger directly (not another PR)
+once this was found. Full detail on *why* the process failed is in the
+banner above; this entry covers the actual triage outcome.
+
+Reviewed every pileup PR's real diff (not just its description) before
+deciding anything — four parallel reviews, one per cluster.
+
+**Heartbeat (#15, #21, #23, #24 — four independent rebuilds)**: #24 had
+the cleanest lifecycle and no confirmed bugs, and already included what
+would otherwise need porting from the others (correct `range(7, 24)`
+quiet-hours gate, `/api/alerts` endpoint) — **merge #24 as-is**, nothing
+to fix. #15 has a dead-code off-by-one in its quiet-hours upper bound
+(`now.hour > 23` never fires) and treats `GWSClient`'s error *strings*
+(it doesn't raise) as real calendar/email content. #23 blocks the event
+loop up to 5s on shutdown (`thread.join()` called unawaited from async
+`lifespan()`) and compares local `datetime.now()` against SQLite's UTC
+`datetime('now')` for cron due-times. #21 had no bugs but less scope.
+#15/#21/#23 closed with the specific findings on each.
+
+**Self-audit loop (#17, #18, #30)**: #18 is *not* actually a superset of
+#17 as its description claimed — incompatible schemas, verified by diff.
+Fixed a real bug in #18 (`get_recent_executions()`/`get_recent_self_audits()`
+were the only two `LocalDB` methods skipping `with self._lock:` — a real
+concurrent-write hazard) and a Windows-only test bug (tempdir cleanup
+failed with `WinError 32` since `LocalDB` never closed its cached sqlite3
+connection — added `LocalDB.close()`) → **PR #32**. #30 was a genuinely
+different, well-scoped design (plain JSONL log instead of a SQLite table)
+worth a real tradeoff note, not just "duplicate" — closed in favor of
+staying consistent with `local_db.py`'s pattern used everywhere else, not
+because it did anything wrong (branch `auto/self-audit-loop-20260909`
+still exists if the JSONL approach is ever preferred). #17/#18/#30 closed.
+
+**Reminders + mechanical heartbeat poll (#31)**: genuinely new, valuable
+work, not a duplicate of the cognitive-heartbeat cluster — rebuilds
+`set_reminder`/`list_reminders`/`delete_reminder`, dropped entirely since
+the 2026-08-23 heartbeat removal (a reminder could not be set at all
+before this). Same lock bug as the self-audit case, same fix, same
+regression-test pattern → **PR #35**. Expect a small, easy merge conflict
+in `brain_api/server.py`'s `lifespan()` if both #24 and #35 get merged —
+two separate task-creation lines near the same spot, not a sign either is
+wrong.
+
+**Tool Forge (#16, #25, #27, #28) — NOT merged, needs real hardening
+first**: confirmed a shared, serious security gap across all three full
+pipeline PRs, not a style nitpick — LLM-generated code gets its *first
+execution* (forge-time validation) with no human approval gate at all;
+`require_approval` only guards *subsequent* calls to an already-registered
+tool. All three PRs' AST safety-checkers share the same bypass (string-based
+dunder access, e.g. `"{0.__class__...}".format(x)`, never appears as an
+`ast.Attribute` node). #27 additionally has its own regression: a forged
+tool built only from already-"safe" steps registers with **no approval
+requirement at all**, contradicting its own docstring. **Merged nothing
+from this cluster except #16** (validation/versioning only, no code-gen,
+independently confirmed clean). #25/#27/#28 closed with the specific
+findings on each — if Tool Forge gets picked back up, #28 is the right
+starting point (correct `success_count` round-trip, consistent approval
+gating, persisted registry) but still needs: approval before the *first*
+execution, an AST checker hardened against string introspection, and
+generated code always running out-of-process even at call time.
+
+**Entity graph (#20)**: no real bugs, properly wired, test-isolated (never
+touches the real vault) — safe to merge as-is, still open for Sam's review.
+
+**Today's own cockpit fixes** (`alfred-cockpit` repo, separate from all of
+the above): fixed `/api/call` being permanently stuck on the build-time
+brain URL (never re-discovered a rotated ngrok tunnel), fixed the call
+feature only ever handling one turn (mic could hear Alfred's own TTS
+output and no fetch timeout meant a slow request just hung forever with
+the mic gated shut), and added per-session delete to the sidebar (the
+backend route already existed, just had no UI). All three verified live
+or by careful code trace; delete-session's actual browser confirm-click
+needs Sam's own click since automated browser contexts auto-dismiss
+native `confirm()` dialogs.
+
+**Open PRs after this pass**: #16, #19, #20, #32, #35 (`alfred`), plus
+`alfred-cockpit`'s existing #1 — all reviewed, all green on the full
+mocked suite, ready for Sam to review and merge himself.
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
