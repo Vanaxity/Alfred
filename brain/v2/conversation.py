@@ -64,6 +64,32 @@ _COMPLETION_CLAIM_PHRASES = (
     "waiting for your approval", "waiting for your confirmation",
 )
 
+# A third, distinct shape, live-caught 2026-09-09: a reply that states
+# *future* intent ("I'm going to read the files") with no tool call
+# attached this turn, then the turn just ends there. Unlike the two phrase
+# lists above, this check deliberately does NOT require `not tools_called`
+# -- a mid-task "I'll keep going" after several real tool calls already
+# happened is exactly the failure mode this catches (confirmed live: Alfred
+# read a few files, then narrated intent instead of calling the next tool,
+# and the turn silently ended). An intent statement about work not yet
+# done is never a legitimate final answer regardless of what happened
+# earlier in the same request, so this has no business being gated on
+# prior tool history the way the completion-claim check correctly is.
+_INTENT_ONLY_PHRASES = (
+    "i'm going to", "i am going to", "i'll now", "i will now",
+    "let me start by", "let me begin by", "i'm about to", "i am about to",
+    "next i'll", "next, i'll", "next i will", "i'll continue", "i will continue",
+    "i'll go ahead and", "i will go ahead and",
+)
+
+# A reply this short that also matches an intent-only phrase is almost
+# certainly just the intent statement and nothing else -- a real answer
+# that happens to *open* with "I'm going to explain how caching works"
+# and then actually explains it runs well past this length. Keeps the
+# check from nudging a genuinely complete answer into a needless retry
+# loop just for using a common introductory phrase.
+_INTENT_ONLY_MAX_CHARS = 150
+
 # Cues that this is a legitimate refusal/limitation reply, not a false
 # completion claim — must not be nudged (calendar_down_reminders_still_work,
 # impossible_right_triangle, reminder_missing_time all rely on exactly this
@@ -122,7 +148,15 @@ class Alfred:
     """
 
     CHAT_MODEL = "llama-3.1-8b-instant"
-    MAX_TURNS = 10
+    # Was 10 -- fine for "what's the weather" (1-2 turns), hopeless for
+    # anything that has to read a real codebase one file per turn. Raised
+    # 2026-09-09 after a live-reproduced stall on "reverse-engineer
+    # yourself": a genuinely large task ran out of budget long before it
+    # ran out of things to legitimately do. Raising this costs nothing for
+    # short tasks -- a turn that ends in a real final answer doesn't burn
+    # extra turns just because the ceiling is higher -- it only matters for
+    # tasks that actually need this many steps.
+    MAX_TURNS = 30
     CONVERSATION_BUDGET = 12000
     SYSTEM_PROMPT_BUDGET = 8000
 
@@ -611,6 +645,23 @@ class Alfred:
             return False  # honest "I can't do that" must never be nudged
         return any(phrase in text for phrase in _COMPLETION_CLAIM_PHRASES)
 
+    @staticmethod
+    def _is_untooled_intent_only_reply(reply: str) -> bool:
+        """True if `reply` states intent to do something next ("I'm going
+        to read the files") with no tool call this turn and nothing else
+        of substance -- a stalled narration, not a real answer. See the
+        module-level comment on _INTENT_ONLY_PHRASES for why this
+        deliberately fires regardless of whether earlier turns already
+        called tools, unlike _is_untooled_completion_claim."""
+        text = reply.strip().lower()
+        if not text or text.endswith("?"):
+            return False  # clarifying questions / offers are never stalls
+        if any(cue in text for cue in _REFUSAL_CUES):
+            return False  # honest "I can't do that" must never be nudged
+        if len(text) > _INTENT_ONLY_MAX_CHARS:
+            return False  # long enough to plausibly be a real answer too
+        return any(phrase in text for phrase in _INTENT_ONLY_PHRASES)
+
     def _parse_llm_output(self, content: str) -> tuple:
         """
         Parse LLM output into (reply, tool_name, tool_params).
@@ -822,6 +873,7 @@ class Alfred:
         awaiting_approval: Optional[Dict[str, Any]] = None
         repeats: Dict[str, int] = {}
         completion_claim_nudge_used = False
+        intent_only_nudge_used = False
         time_mismatch_nudge_used = False
         time_tool_output: Optional[str] = None
         weather_tool_output: Optional[str] = None
@@ -961,6 +1013,29 @@ class Alfred:
                             "call the matching tool now with a real {\"tool\": ..., \"params\": "
                             "{...}} call. If you genuinely can't do it, say so plainly instead "
                             "of claiming it's done."
+                        )
+                        continue
+                    if (
+                        not intent_only_nudge_used
+                        and self._is_untooled_intent_only_reply(reply)
+                    ):
+                        # Deliberately no `not tools_called` guard here -- see
+                        # _INTENT_ONLY_PHRASES' module-level comment. Live-caught
+                        # 2026-09-09: Alfred read several files (turns 1-4 all real
+                        # tool calls), then turn 5's reply was "I'm going to keep
+                        # reading the rest" with no tool call attached, and the
+                        # loop treated that as a finished answer and stopped --
+                        # exactly what a multi-step task must never do.
+                        intent_only_nudge_used = True
+                        thinking.append(
+                            f"[Turn {turn + 1}] Stated intent with no tool call — nudging"
+                        )
+                        conv.add_user(
+                            f"You said what you're about to do, but didn't call a tool this "
+                            f"turn -- Task: {task}. Don't narrate the next step, take it: call "
+                            "the matching tool now with a real {\"tool\": ..., \"params\": "
+                            "{...}} call. If you're actually finished, give the real, complete "
+                            "answer instead of describing what you were going to do."
                         )
                         continue
                     if (
@@ -1118,22 +1193,40 @@ class Alfred:
         # using 10 tool(s): memory_search, memory_search, ..."), which leaks
         # implementation detail and, worse, claims completion for something that
         # did not complete. Say what actually happened instead.
+        #
+        # This branch means MAX_TURNS was hit for real (not the intent-only or
+        # completion-claim nudges above, which retry within budget) -- a
+        # genuinely large task ran out of steps. The old text here was a
+        # generic apology with no way to tell "give up" from "let me finish."
+        # Live-reproduced 2026-09-09 ("reverse-engineer yourself"): the honest
+        # answer is a real status report -- what was actually done, in plain
+        # terms, and an explicit offer to keep going -- not a shrug.
         if not final_reply:
             if tools_called:
+                unique_counts: Dict[str, int] = {}
+                for t in tools_called:
+                    unique_counts[t] = unique_counts.get(t, 0) + 1
+                done_summary = ", ".join(
+                    f"{name} x{count}" if count > 1 else name
+                    for name, count in unique_counts.items()
+                )
                 last = tool_results[-1] if tool_results else None
+                last_bit = ""
                 if last and last.get("success") and last.get("output"):
-                    final_reply = (
-                        "I ran out of steps before I could summarize that properly. "
-                        f"Here's the last thing I got back:\n\n{str(last['output'])[:400]}"
-                    )
-                else:
-                    final_reply = (
-                        "I wasn't able to finish that — I kept working but never "
-                        "reached an answer. Could you narrow it down or give me the "
-                        "missing detail?"
-                    )
+                    last_bit = f"\n\nMost recent result:\n{str(last['output'])[:400]}"
+                final_reply = (
+                    f"I hit my step limit ({self.MAX_TURNS} steps) before finishing "
+                    f"this. So far I actually did: {done_summary}.{last_bit}\n\n"
+                    "I'm not done -- say \"continue\" and I'll pick up from here, or "
+                    "narrow the task if you'd rather I focus on one part of it."
+                )
             else:
-                final_reply = "I wasn't able to process that request."
+                final_reply = (
+                    f"I hit my step limit ({self.MAX_TURNS} steps) without ever "
+                    "calling a tool or reaching an answer -- something about this "
+                    "request kept me from making real progress. Could you rephrase "
+                    "it or break it into a smaller first step?"
+                )
 
         # --- Save T3 episode ---
         # Skip turns whose only tool calls were perishable/live-data lookups
