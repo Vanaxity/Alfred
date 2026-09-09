@@ -27,6 +27,88 @@ so far.
 
 ---
 
+## 2026-09-09 — Phase 3: Tool Forge shipped (cloud, code-only)
+
+Picked up Tool Forge, the next unblocked code-only item on `ROADMAP.md`'s
+Phase 3 list (proactive surfacing needs Sam's design calibration first; the
+second MCP connector is explicitly "Sam's call, whenever" per the
+2026-09-05 entry — neither is a cloud routine's to start unprompted). Closes
+out the `improve_skill()` wiring that Phase 2 called "the down payment" —
+a skill used 3+ times now compiles into a directly-registered tool instead
+of the LLM re-planning it from its markdown steps every time it's matched.
+
+- **Found and fixed a real gap while building this**: `success_count` was
+  never actually parsed back out of a skill's markdown in
+  `Skill.from_markdown()` — every reload (server restart, or a fresh
+  `SkillManager()`) silently reset it to 0. Combined with the fact nothing
+  ever incremented it past skill-creation time either, Tool Forge's "used
+  3+ times" precondition could never have been reached by real usage.
+  Fixed both halves: `from_markdown()` now parses the existing
+  `**Success Rate:** N/M` line back into `success_count`/`failure_count`,
+  and a new `SkillManager.mark_skill_used()` increments and persists it on
+  every clean (no step failures) reuse of a matched skill — the success-path
+  mirror of the existing failure-path `improve_skill()` call in
+  `brain/v2/conversation.py`.
+- **`brain/memory/tool_forge.py` (new)**: `forge_tool_from_skill(skill,
+  router)` asks the LLM to compile a skill's fixed steps into one
+  `async def run(params, ctx):` function, then validates it before it's
+  ever trusted:
+  1. A static AST safety check — exactly one top-level `run` function, no
+     imports, no dunder attribute access (blocks the classic
+     `().__class__...` sandbox-escape pattern), no forbidden names
+     (`eval`/`exec`/`open`/`__import__`/`getattr`/...).
+  2. A sandboxed dry run in a subprocess: restricted builtins, no
+     environment, a hard timeout, and a fake tool executor that records
+     calls instead of touching anything real.
+  3. A tool-name allowlist check — the dry run must not call any tool the
+     original skill's own steps didn't already use, so a forged tool can't
+     acquire a capability the skill it came from never had.
+  The generated function's only capability, even after all this, is
+  `ctx["tool_executor"].execute(...)` — the same call every built-in tool
+  already goes through, guardrails and per-tool approval included. A forged
+  tool that replays a `shell` step still needs human approval every time it
+  fires; this is explicitly a best-effort sandbox for a personal,
+  single-user assistant, not a hardened multi-tenant boundary (documented
+  as such in the module docstring, not just implied by the word "sandbox").
+- **Wired into `brain/v2/conversation.py`**: a clean matched-skill turn now
+  calls `mark_skill_used()`; once `should_forge()` crosses the threshold, a
+  fire-and-forget task (`_maybe_forge_skill`, same pattern as the existing
+  post-turn memory-curation task — never awaited by the turn, so no reply
+  latency) runs the forge pipeline and, on success, registers the new tool
+  through the same `ToolExecutor.register()` path MCP tools already use
+  (`_register_forged_tool`), merged into `_get_tool_descriptions()` so the
+  LLM actually sees it exists.
+- **Verified against the mocked suite only** (no live server, no real LLM
+  keys, no local vault — this is a cloud session). New
+  `build-system/test_tool_forge.py`, 29 tests: the AST safety check's
+  accept/reject cases, the sandbox dry run's accept/reject/crash cases,
+  `forge_tool_from_skill()` end-to-end against a fake router (including
+  markdown-fenced code extraction), `make_forged_handler()`'s success/
+  failure/crash/bad-return paths, the `success_count` markdown round-trip
+  fix, and `Alfred.execute()`'s actual wiring (a clean turn marks the skill
+  used; crossing the threshold schedules a forge and the resulting tool
+  lands in the live `ToolExecutor`). Full existing suite re-run clean:
+  every file at the same pass count as before this branch (10 suites now,
+  the new one included; `test_tool_executor.py`'s one failure is the
+  same pre-existing `test_glob_rejects_unsafe_absolute_pattern` Linux-
+  sandbox-vs-real-Windows-target gap noted in the 2026-09-05 entry below,
+  not something this PR touches).
+- **What still needs a live check from Sam or a local session** (this is
+  the actual point of Q8's own cloud/local split, not new to this PR):
+  whether a *real* LLM (not the fake router these tests use) reliably
+  produces code that passes the AST/sandbox checks on the first try for a
+  real learned skill, whether the sandbox's `SANDBOX_TIMEOUT_SECONDS=10` /
+  `RUNTIME_TIMEOUT_SECONDS=30` are the right numbers under real load, and
+  whether a forged tool's replies read naturally to the LLM in a real
+  multi-turn conversation. None of this can be exercised from a cloud
+  sandbox with no provider API keys and no real skills on disk.
+- **Open question for Sam**: `FORGE_THRESHOLD = 3` is taken directly from
+  the roadmap's own wording ("skill used 3+ times") — not re-litigated
+  here, but worth a real second look once live data shows how often a
+  skill actually gets matched 3+ times in practice, since a threshold
+  that's rarely reached makes this whole feature dormant regardless of how
+  well it works.
+
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
 Full offline+live pass over everything Phase 2 shipped (generic client,

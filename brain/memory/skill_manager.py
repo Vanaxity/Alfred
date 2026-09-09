@@ -74,6 +74,10 @@ class Skill:
     success_count: int = 0
     failure_count: int = 0
     path: str = ""
+    # Set once Tool Forge has converted this skill into a directly-registered
+    # tool (see tool_forge.py) -- the tool's name in ToolExecutor, so a skill
+    # is only ever forged once rather than re-forged on every subsequent use.
+    forged_tool_name: Optional[str] = None
 
     def to_markdown(self) -> str:
         steps_md = "\n\n".join(
@@ -87,13 +91,14 @@ class Skill:
 
         total = self.success_count + self.failure_count
         rate = f"{self.success_count}/{total}" if total else "No data"
+        forged_line = f"\n**Forged Tool:** `{self.forged_tool_name}`" if self.forged_tool_name else ""
 
         return f"""# Learned Skill: {self.title}
 
 **Skill ID:** `{self.skill_id}`
 **Created:** {datetime.now().strftime("%Y-%m-%d %H:%M")}
 **Complexity:** {self.complexity}
-**Success Rate:** {rate}
+**Success Rate:** {rate}{forged_line}
 
 ---
 
@@ -119,6 +124,9 @@ class Skill:
         complexity = "moderate"
         tags = []
         steps = []
+        forged_tool_name = None
+        success_count = 0
+        failure_count = 0
 
         for i, line in enumerate(lines):
             if "Skill ID:" in line:
@@ -133,6 +141,22 @@ class Skill:
                 parts = line.split("**Complexity:**")
                 if len(parts) > 1:
                     complexity = parts[1].strip()
+            elif "Forged Tool:" in line:
+                parts = line.split("`")
+                if len(parts) > 1:
+                    forged_tool_name = parts[1].strip() or None
+            elif "Success Rate:" in line:
+                # "**Success Rate:** N/M" (or "No data") -- was never parsed
+                # back at all, so success_count silently reset to 0 on every
+                # reload (server restart, or a fresh SkillManager instance),
+                # which would have made the "used 3+ times" forge threshold
+                # below unreachable in practice for any skill that survives a
+                # restart before hitting it.
+                m = _re.search(r"(\d+)\s*/\s*(\d+)", line)
+                if m:
+                    total = int(m.group(2))
+                    success_count = int(m.group(1))
+                    failure_count = max(total - success_count, 0)
 
         current_step = {}
         for line in lines:
@@ -163,11 +187,17 @@ class Skill:
             tags=tags,
             complexity=complexity,
             path=path,
+            forged_tool_name=forged_tool_name,
+            success_count=success_count,
+            failure_count=failure_count,
         )
 
 
 class SkillManager:
     ECOSYSTEM_THROTTLE_SECS = 60
+    # ROADMAP.md Phase 3, Tool Forge: "skill used 3+ times" is the stated
+    # trigger for converting a markdown skill into an executable tool.
+    FORGE_THRESHOLD = 3
 
     def __init__(self):
         self.memory = get_memory()
@@ -558,6 +588,49 @@ class SkillManager:
         Path(skill.path).write_text(updated_content, encoding="utf-8")
         self._skills_cache[skill_id] = skill
         return True
+
+    def mark_skill_used(self, skill_id: str) -> Optional[Skill]:
+        """Record one more successful, uneventful use of an already-matched
+        skill (the mirror of improve_skill()'s failure path above). Without
+        this, success_count only ever got set once at generate_skill() time
+        and never moved again, so Tool Forge's "used 3+ times" precondition
+        (ROADMAP.md Phase 3) could never actually be reached by real usage.
+        """
+        skill = self._skills_cache.get(skill_id)
+        if not skill:
+            return None
+        skill.success_count += 1
+        self._persist_skill(skill)
+        return skill
+
+    def mark_skill_forged(self, skill_id: str, tool_name: str) -> bool:
+        """Record that Tool Forge converted this skill into tool `tool_name`,
+        so should_forge() below stops proposing it again on every future use."""
+        skill = self._skills_cache.get(skill_id)
+        if not skill:
+            return False
+        skill.forged_tool_name = tool_name
+        self._persist_skill(skill)
+        return True
+
+    def should_forge(self, skill_id: str, threshold: int = FORGE_THRESHOLD) -> bool:
+        """Whether this skill has been reused enough, and not already forged,
+        to be worth handing to tool_forge.py."""
+        skill = self._skills_cache.get(skill_id)
+        if not skill or skill.forged_tool_name:
+            return False
+        return skill.success_count >= threshold
+
+    def _persist_skill(self, skill: Skill) -> None:
+        """Regenerate a skill's markdown from its current field values and
+        write it back, keeping disk and cache in agreement -- same
+        cache-then-disk order improve_skill() already established."""
+        self._skills_cache[skill.skill_id] = skill
+        if skill.path:
+            Path(skill.path).write_text(skill.to_markdown(), encoding="utf-8")
+
+    def get_skill(self, skill_id: str) -> Optional[Skill]:
+        return self._skills_cache.get(skill_id)
 
     def get_all_skills(self) -> List[Skill]:
         return list(self._skills_cache.values())

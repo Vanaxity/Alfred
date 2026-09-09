@@ -27,7 +27,10 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 from .prompt_builder import PromptBuilder, ToolSchema, count_tokens, PRIO_IDENTITY, PRIO_RULES, PRIO_PROFILE
 from .context_manager import ConversationHistory
-from .tool_executor import ToolExecutor, ToolResult, create_tool_executor, MUTATION_TOOLS, VERIFY_MAP
+from .tool_executor import (
+    ToolExecutor, ToolResult, create_tool_executor, MUTATION_TOOLS, VERIFY_MAP,
+    TOOL_GUARDRAILS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +173,11 @@ class Alfred:
         # connect_mcp_servers(), called once from brain_api/server.py's
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
+
+        # Phase 3 Tool Forge: skills promoted into directly-registered tools
+        # (see _maybe_forge_skill / _register_forged_tool), merged into
+        # _get_tool_descriptions() the same way _mcp_tool_schemas is.
+        self._forged_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
@@ -573,7 +581,11 @@ class Alfred:
         # in isolation without running the real __init__ -- confirmed this
         # broke test_speed_audit_timing.py live. An absent attribute means
         # "no MCP servers connected yet," same as an empty dict would.
-        return {**builtin, **getattr(self, "_mcp_tool_schemas", {})}
+        return {
+            **builtin,
+            **getattr(self, "_mcp_tool_schemas", {}),
+            **getattr(self, "_forged_tool_schemas", {}),
+        }
 
     # ------------------------------------------------------------------
     # LLM output parser
@@ -1190,6 +1202,29 @@ class Alfred:
             except Exception as e:
                 thinking.append(f"  Skill improvement failed: {e}")
 
+        # --- Maybe mark matched skill used, and forge it into a tool ---
+        # The mirror image of the failure branch above: a matched skill that
+        # ran this turn with no step failures is one more successful reuse.
+        # Without counting this, Tool Forge's "used 3+ times" threshold
+        # (ROADMAP.md Phase 3, SkillManager.FORGE_THRESHOLD) could never be
+        # reached by real usage -- success_count was previously only ever set
+        # once at generate_skill() time. Forging itself is fire-and-forget
+        # (an LLM call plus a sandboxed subprocess run): it must not add
+        # latency to the reply the user is waiting on, same reasoning as the
+        # memory curation task below.
+        if matched_skill is not None and not any(
+            tr.get("success") is False for tr in tool_results
+        ):
+            try:
+                self.skill_manager.mark_skill_used(matched_skill.skill_id)
+                if self.skill_manager.should_forge(matched_skill.skill_id):
+                    forge_task = asyncio.create_task(
+                        self._maybe_forge_skill(matched_skill.skill_id)
+                    )
+                    self._pending_curation_tasks.append(forge_task)
+            except Exception as e:
+                thinking.append(f"  Skill usage tracking failed: {e}")
+
         # --- Post-turn memory curation (fire-and-forget) ---
         # A second, independent look at this exchange, restricted to
         # remember/forget/memory_search only -- catches durable facts the
@@ -1316,6 +1351,67 @@ class Alfred:
             task=task, steps=steps, task_complexity=complexity, had_error=False,
         )
         return skill is not None
+
+    async def _maybe_forge_skill(self, skill_id: str) -> bool:
+        """Tool Forge (ROADMAP.md Phase 3): once a skill has been reused
+        enough (should_forge()'s threshold), ask the LLM to compile its fixed
+        steps into a small Python function, validate it (AST safety check +
+        a sandboxed subprocess dry run against a fake tool executor — see
+        tool_forge.py), and register it live as a new tool via the same
+        ToolExecutor.register() every built-in and MCP tool goes through.
+
+        Never awaited by a turn — this is an LLM call plus a subprocess, and
+        the skill it's forging already works fine via the normal matched-
+        skill prompt path in the meantime, so there's no reply latency to
+        justify blocking on.
+        """
+        from ..memory.tool_forge import forge_tool_from_skill
+
+        skill = self.skill_manager.get_skill(skill_id)
+        if skill is None:
+            return False
+        try:
+            result = await forge_tool_from_skill(skill, self._router)
+        except Exception:
+            return False
+        if not result.ok:
+            return False
+        self._register_forged_tool(skill, result)
+        self.skill_manager.mark_skill_forged(skill_id, result.tool_name)
+        return True
+
+    def _register_forged_tool(self, skill: Any, forge_result: Any) -> str:
+        """Register a validated Tool Forge result the same way an
+        MCP-discovered tool gets registered (_register_mcp_tool above) --
+        one ToolExecutor.register() call plus a schema entry so the LLM
+        actually sees it exists (see _get_tool_descriptions).
+
+        Guardrails: a forged tool inherits require_approval from the
+        riskiest step it replays — replaying a `shell` step still needs a
+        human's approval every time, exactly as calling that step directly
+        would. Only when every underlying step is already approval-free does
+        the forged tool run without one.
+        """
+        from .tool_executor import Guardrails
+        from ..memory.tool_forge import make_forged_handler
+
+        handler = make_forged_handler(forge_result.code, forge_result.tool_name)
+        needs_approval = any(
+            TOOL_GUARDRAILS.get(step.get("tool"), Guardrails()).require_approval
+            for step in skill.steps
+        )
+        self._tool_executor.register(
+            forge_result.tool_name, handler,
+            guardrails=Guardrails(require_approval=needs_approval),
+        )
+        self._forged_tool_schemas[forge_result.tool_name] = {
+            "description": (
+                f"Forged from skill '{skill.title}' (used "
+                f"{skill.success_count}+ times): {skill.description}"
+            ),
+            "params": {},
+        }
+        return forge_result.tool_name
 
     async def _curate_memory(
         self,
