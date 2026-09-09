@@ -7,6 +7,20 @@ don't rewrite history — newest entries at the top.
 
 ---
 
+## 📍 Phase 3 blocked on PR pileup (2026-09-09) — cloud routine paused, needs Sam's triage
+
+**Do not pick a new Phase 3/4 code item until this resolves.** Every Phase 3
+`ROADMAP.md` item now has 1-4 independent, overlapping open PRs against
+`feature/day7-heartbeat` (see the dated entry below for the full table).
+The routine's own earlier triage PR (#22) flagged this and asked for a
+decision; three more firings after it ignored the flag and added three
+more duplicates anyway. This entry's PR adds no feature code, closes
+nothing (not this routine's call — see #22's own reasoning), and
+recommends the routine stay off autonomous "next roadmap item" picking
+until Sam has resolved the pileup by hand.
+
+---
+
 ## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is
@@ -26,6 +40,84 @@ pushed to Phase 3. See the dated entry below for what's actually shipped
 so far.
 
 ---
+
+## 2026-09-09 — PR pileup got worse after the first triage flag; escalating, no new code this run
+
+Picked up where PR #22 (2026-09-08, "PR triage: Phase 3 has 6 open,
+overlapping PRs") left off, expecting to either act on Sam's decision or
+find a genuinely unblocked item. Neither was true: #22 has **zero
+comments** — Sam hasn't seen or responded to it — and three more cloud
+routine firings landed *after* #22 was opened, each independently picking
+"the next unblocked item" without checking the open-PR queue #22 explicitly
+asked future firings to check. The pileup is now worse, not resolved:
+
+| Roadmap item | Open PRs | Relationship |
+|---|---|---|
+| Proactive surfacing / heartbeat | **#15, #21, #23, #24** | Four independent, mutually-unaware rebuilds of `brain/v2/heartbeat.py`. All confirmed the same real gap (no live heartbeat exists, the old `brain/alfred.py` one is dead/broken code) and then solved it differently: #15 restores calendar/email snapshot + reminder CRUD, 30s/2h tick; #21 is T4/T3-only reasoning, 1h tick, adds a `/api/alerts` poll endpoint; #23 restores reminder/cron CRUD too and routes due cron tasks through the real `Alfred.execute()` on a daemon thread; #24 adds `tool_executor`-signature-shaped action proposals and a cockpit WebSocket broadcast helper. No two are mergeable together as-is — same file, same class name, different designs. |
+| Self-audit loop | **#17, #18** | #17 ships only the execution-log persistence layer; #18 independently re-implements a persistence layer (richer schema) *and* the actual audit loop + tool on top. #18 is a superset of what #17 attempted, per #22's own read (not re-verified line-by-line here). |
+| Tool Forge | **#16, #25** | Not a clean duplicate like the above two: #16 explicitly scoped itself to the validation prerequisite only (`validate_skill()`, a `drafts/` folder, SemVer) and deliberately deferred the LLM-generates-code pipeline; #25 built that pipeline (`brain/tool_forge.py`) directly on top of *unvalidated* skills, using its own `record_skill_use()` success/failure counter rather than anything from #16. They touch different files and could plausibly both land, but nobody has checked whether #25's forge trigger should actually depend on #16's validation gate first (forging executable code from a skill that was never structurally validated seems like the wrong order) — a real design question, not a rebase mechanic. |
+| Entity graph & synthesis | **#20** | Only one PR, no duplicate. |
+| Unrelated | **#19** | `main` sync, targets `main` not this branch, no action needed. |
+
+**Why no new code this run**: every Phase 3 item already has at least one
+open PR; picking any of them means either building a *fifth* independent
+heartbeat, a *third* self-audit implementation, or a *third* Tool Forge
+angle — the exact mistake #22 already called out and three subsequent
+firings already repeated. Jumping ahead to a Phase 4 item instead would
+add a fifth independent thread of unmerged work on top of an already
+unreviewed backlog, which seemed like the wrong direction to compound the
+problem in, not a genuinely-better default — so this is a check-in, not a
+guess, per `ROADMAP.md`'s own "real fork with no clearly-better default"
+criterion.
+
+**What this run did instead**:
+- Re-ran the full mocked suite on unmodified `feature/day7-heartbeat`
+  (base `4208193`) to confirm the base itself is still healthy before
+  writing anything: same known-good state as every prior entry —
+  `test_tool_executor.py` 46/47 (pre-existing
+  `test_glob_rejects_unsafe_absolute_pattern` Linux-sandbox-vs-Windows
+  difference, documented since 2026-09-05), `test_mcp_client.py` fails to
+  import in this sandbox on a native `cryptography`/`pyo3` conflict
+  (environment gap, not this branch's code — different failure mode than
+  the "package not installed" version of this same pre-existing gap noted
+  earlier this week), `test_live_realistic.py` correctly preflight-aborts
+  with no provider keys, every other suite green. No regressions from
+  anything in the open-PR queue, since none of it is merged yet.
+- This PROGRESS.md entry plus the status pointer above it. No application
+  code touched.
+
+**Recommendation, sharpened from #22's** (still Sam's call, not executed
+here):
+1. **Heartbeat (#15/#21/#23/#24)**: this is now a 4-way design fork, not a
+   2-way one — worse than #22 described. Needs Sam to either pick one
+   outright, or (more likely, given each has a genuinely different useful
+   piece — #15/#23's reminder-CRUD restoration, #21's alerts-poll
+   endpoint, #24's approval-signature-shaped proposals) commission one
+   follow-up PR that merges the best parts of all four rather than
+   reviewing four full diffs of the same feature.
+2. **Self-audit (#17/#18)**: merge #18, close #17 as superseded — unchanged
+   from #22's read.
+3. **Tool Forge (#16/#25)**: decide whether #25's forge trigger should
+   gate on #16's `validate_skill()` before both land, or whether they're
+   independent enough to merge separately and wire the dependency in a
+   follow-up.
+4. **Entity graph (#20)**: independent of all of the above, safe to review
+   and merge on its own schedule.
+5. **Process fix, now more urgent than #22 called it**: the standing cloud
+   routine prompt needs an explicit "list open PRs against the base branch
+   before picking a roadmap item, and stop rather than add another one if
+   the item already has one" step. Three firings ignored #22's
+   informally-stated version of this same ask. Until that's added (or the
+   routine is paused outright), every future firing risks adding a fifth
+   heartbeat/third audit-loop/third forge-angle PR rather than helping.
+   Recommend Sam either pause the routine's trigger until the pileup above
+   is resolved, or hand the next firing this exact instruction directly.
+
+**Open question for Sam**: same as #22's, now with higher urgency — which
+heartbeat design (or which combination) should win, and should the routine
+pause until you've had a chance to triage the queue by hand? No further
+autonomous Phase 3 picks will happen from this routine until one of those
+is answered, to avoid adding a fifth overlapping PR.
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
