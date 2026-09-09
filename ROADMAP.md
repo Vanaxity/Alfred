@@ -1,207 +1,147 @@
-# Alfred Roadmap — Phase 1 → Phase 4 by September 30, 2026
+# Alfred Roadmap — reliability first, rescoped 2026-09-09
 
-**Written:** 2026-08-27, co-authored with Sam. First draft — meant to be
-argued with, not accepted as-is.
+**Rescoped 2026-09-09, Sam's call.** Six months in, still not reliable
+enough to actually rely on. The previous week-by-week plan (Phase 1→4 by
+Sep 30) is replaced by a different ordering: **prove the core engine is
+trustworthy before touching anything else.** UI, calls, and Phase 4 all
+wait behind that, not because they don't matter, but because polishing
+any of them on top of a loop that silently stalls mid-task is wasted
+work — confirmed live this week: a request to "reverse-engineer yourself"
+made Alfred announce "I'm going to read the files," then stop and wait,
+with no error, no status, nothing.
 
-**Scope decision (Sam's call, 2026-08-27):** Phase 5 (open-ended
-self-modification) is dropped from this roadmap entirely — the manifesto
-itself describes it as "Ongoing" with no ceiling, and pretending it fits in
-five weeks would be exactly the kind of aspirational-not-actual claim this
-whole project has been trying to stop making. Phase 1–4, in full, by
-September 30.
-
-**One hard constraint no amount of autonomous coding fixes:** Phase 4
-includes physical hardware — a LilyGo T-Watch S3, home-automation devices.
-Shipping takes real days. **Action for this week, not week 5: order the
-hardware now**, so it arrives in parallel with the software work instead of
-blocking week 5 entirely.
-
----
-
-## Where things actually stand today (2026-08-27), not aspirationally
-
-From this week's own live-verified work (see `ALFRED_MANIFESTO_V5.md`'s
-dated status entries for the full detail):
-
-- **Memory (T2/T3/T4/T5):** T3 strong, T4 reliable (Claim A: curation pass +
-  `forget` + narrowed `memory_save`), T5 verified this week (found and fixed
-  a real crash). T2 skill matching real but doesn't skip planning (that
-  claim was retracted as false).
-- **All 21 registered tools confirmed live-working** as of today (3 real
-  bugs found and fixed getting there).
-- **Auto-start on boot:** working, Task Scheduler-verified, local server +
-  ngrok tunnel + Vercel cockpit deploy all confirmed end-to-end.
-- **Still open from the original 9 launch questions** (Q1/Q3/Q6 closed):
-  - **Q2 — security/data-leak audit: UNVERIFIED, and genuinely urgent now.**
-    A real concern was flagged and never chased down: no confirmed auth
-    check on `/chat` / `/api/command` in `brain_api/server.py`. Now that
-    the ngrok tunnel is live and auto-starting on boot, this stops being a
-    hypothetical — anyone with the tunnel URL may currently be able to read
-    memory or send email as Sam. **This moves to week 1, not later.**
-  - Q4 (per-person customization) — hardcoded to one user, "Master Sam."
-    Not a goal for this roadmap unless Sam says otherwise — Alfred is a
-    personal, single-user system by design; revisit only if that changes.
-  - Q5 (non-technical install simplicity), Q7 (positioning), Q9 (value
-    synthesis) — business/positioning questions, not blocking engineering
-    work, revisit after Phase 2-3 land.
-  - Q8 (UX feel) — now has real first-hand signal, not just a hypothesis:
-    Sam's own first session reported slow replies and one recovered task
-    failure. **Also week 1** — a speed audit before piling more phases on
-    top of a system that already feels slow once.
+**Explicit non-goal for this phase**: don't rebuild what already works.
+Phase 1 (memory, tools, auth) and Phase 2 (generic MCP client) are done
+and live-verified — see `PROGRESS.md`'s dated entries. This roadmap is
+about the specific reliability gaps found this week, not a restart.
 
 ---
 
-## Week-by-week plan
+## Where things actually stand (2026-09-09)
 
-### Week 1 (Aug 27 – Sep 2): Close Phase 1's real gaps, order hardware
-
-- **Order Phase 4 hardware today** (LilyGo T-Watch S3, whatever home
-  automation devices Phase 4 needs) — pure lead-time insurance, zero
-  engineering cost to start now.
-- **Q2 security audit.** Confirm or fix the missing-auth suspicion on
-  `/chat` and `/api/command`. If confirmed, this is the single highest-
-  priority fix in the whole roadmap — a live, publicly-tunneled assistant
-  with no auth is a real exposure, not a nice-to-have.
-- **Q8 speed audit.** Instrument where a turn's time actually goes
-  (planning call / tool execution / the new memory-curation pass / T3
-  search) and find what's parallelizable vs. genuinely sequential. Doesn't
-  need to be fully solved this week, but needs a real answer, not a guess.
-- Set up the autonomy system itself (see below) so weeks 2-5 can actually
-  run semi-unattended.
-- **Phase 1 exit gate, manual, Sam only — not automated, not the cloud
-  routine's job:** a real pentest against the running app via
-  [Strix](https://github.com/usestrix/strix) (open-source AI pentesting,
-  59k★, Apache 2.0). Needs Docker locally, which isn't installed yet —
-  Sam's explicit call (2026-08-31): defer this to the last step before
-  Phase 1 is considered done, run it by hand rather than through Docker
-  install automation or Strix's managed cloud (which would mean sending
-  Alfred's code/running app to a third-party service). Q2's code-level
-  audit (missing-auth check on `/chat`/`/api/command`) still happens
-  earlier and separately — this is the dynamic, exploit-validated pass
-  on top of that, not a replacement for it.
-
-### Week 2 (Sep 3 – 9, started Sep 5): Phase 2 — MCP client + one real connector
-
-**Rescoped 2026-09-05** (Sam's call): Phase 2 is now already 2 days into a
-7-day window. Cut to what's actually tractable in what's left, push the
-rest to Phase 3 rather than let schedule slip get silently absorbed:
-
-- Build `brain/mcp_client.py`: reads `mcp_servers.json`, spawns servers,
-  discovers tools via `tools/list`, registers them dynamically — no
-  hardcoding, per the manifesto's own spec.
-- Ship the Filesystem MCP connector (near-free — the safe-path file tools
-  already exist server-side) plus **one** more real connector, Sam's pick.
-  Originally 2-3 connectors; cut to one beyond filesystem for this window.
-- **Moved to Phase 3**: proactive memory surfacing (the relocated
-  heartbeat + GBrain's confidence-gated push-context) and any further
-  connectors beyond the one above. This isn't wiring — it's new behavior
-  design with a feedback loop that has to calibrate over time, the part
-  of original Phase 2 most likely to have eaten the schedule if kept here.
-
-### Week 3 (Sep 10 – 16): Phase 3 — Tool Forge, self-audit, entity graph, proactive surfacing
-
-- **Carried over from Phase 2's rescoping**: proactive memory surfacing
-  (relocated heartbeat + GBrain's confidence-gated push-context) and any
-  MCP connectors beyond the one Week 2 ships.
-- Finish Tool Forge: the markdown-skill → executable-Python conversion path
-  (skill used 3+ times → LLM-generated function → sandboxed validation →
-  registered tool). `improve_skill()`'s wiring from this week is the down
-  payment; this is the rest of it.
-- Self-audit loop: weekly cron feeding Alfred its own execution logs,
-  proposing one concrete optimization.
-- Entity graph & synthesis (GBrain-inspired) — the actual "grows with you"
-  mechanism Claim A explicitly deferred. Build this now that Claim A has
-  held up under a real week of usage, per the manifesto's own stated
-  precondition.
-
-### Week 4 (Sep 17 – 23): Phase 4 software layer
-
-- Full voice autonomy: wake word (openWakeWord), continuous conversation
-  mode, SOUL.md-driven personality switching.
-- Visual perception via screenshot analysis (the software half of "sees" —
-  webcam/MediaPipe gesture control is physical-hardware-adjacent and can
-  slip into week 5 if needed without blocking the rest).
-
-### Week 5 (Sep 24 – 30): Phase 4 hardware + integration buffer
-
-- Home Assistant MCP connection (lights, climate, locks).
-- Twilio (SMS/calls) and LilyGo watch integration — hardware ordered week 1
-  should have arrived by now.
-- Buffer for whatever slipped, plus one real end-to-end pass across
-  everything shipped this month (same live-verification discipline as
-  Q3/Q6 this week — test it for real, don't just claim it).
+- **Memory (T1-T5), the generic MCP client, and most of Phase 3's roadmap
+  items are done** — heartbeat, self-audit, reminders, entity graph all
+  reviewed, bugs fixed, sitting as clean PRs waiting for Sam to merge
+  (`PROGRESS.md` has the full breakdown). Tool Forge is explicitly
+  **not** done — a real, shared security gap (LLM-generated code runs
+  once, unapproved, before any human sees it) was found across all three
+  attempts at it; it needs a dedicated hardening pass, not a quick patch.
+- **The core turn loop has two confirmed, unfixed reliability bugs**,
+  live-reproduced this week (see Phase A below) — this is the actual
+  reason "not reliable" and "stops after a long message" keep happening.
+- **Calls run through the exact same heavy loop as everything else** —
+  confirmed by reading the code, not assumed. No fast path, no turn
+  budget of its own, so a call pays the cost of the worst-case chat turn.
+- **The cloud routine is disabled** after producing a real PR pileup (17
+  open PRs, heavy duplication) — see `PROGRESS.md`'s 2026-09-09 entry for
+  what happened and why. Not resumed until Sam decides how (or whether).
 
 ---
 
-## The autonomy system: working on Alfred while Sam's away
+## Phase A — Terminal-first reliability (now, ~2 days)
 
-**The actual ask:** Sam doesn't want to sit and supervise every step. Wants
-real progress to happen unattended for stretches of hours, with check-ins
-when a decision genuinely needs a human — not a constant stream of pings,
-and not silent unreviewed changes either.
+Goal: a long, real, multi-step task runs to actual completion in the
+terminal — no UI, no calls, nothing hidden — or fails loudly and
+specifically instead of silently.
 
-### The fail-safe part (non-negotiable, already how this session works)
+1. **Fix the loop-termination bug.** `brain/v2/conversation.py`'s
+   `execute()` treats *any* plain-text reply as a finished answer — there
+   is no check for whether the reply actually answers the task versus
+   just narrates what it's about to do next ("I'm going to read the
+   files"). Confirmed live as the direct cause of tasks silently
+   stalling. Fix: extend the existing untooled-completion-claim nudge
+   (`_is_untooled_completion_claim`, already catches "has been saved"/"I
+   need your approval" phrasings with no tool call behind them) to also
+   catch stated-intent-with-no-tool-call, forcing another turn instead of
+   accepting it as final.
+2. **Fix the turn budget for open-ended work.** `MAX_TURNS = 10` is fine
+   for a calculator question, hopeless for reading a real codebase. When
+   a task genuinely won't finish in budget, the fallback must be a real
+   status report — what's done, what's left, does it need more turns or
+   a specific missing piece of information — not a generic apology.
+3. **Live step-by-step visibility.** The full tool-call trace
+   (`thinking`) currently comes back in one blob at the end of the whole
+   request. Stream it out as each turn completes instead of buffering it
+   — this is what "show me the reasoning like Claude Code does" actually
+   requires.
+4. **Real error surfacing.** A tool failure must reach the user as a
+   specific, readable error, not get swallowed into a generic "I wasn't
+   able to process that."
+5. **Root-cause the self-hallucination bug** ("tell me about myself"
+   inventing facts) — trace the real T4/T3 memory-context assembly live
+   against Sam's actual profile/episode data, not guessed at.
 
-- **Every code change goes on a feature branch, gets tested, then becomes a
-  PR. Nothing is ever pushed to `main` or merged without Sam reviewing it.**
-  This is the actual safety mechanism — not "ask before every line," but
-  "nothing reaches the real system without a human looking at it first."
-  Same workflow already used for every PR this week.
-- **The existing hard boundaries stay in force**: no entering credentials/
-  tokens on Sam's behalf, no sending messages/emails, no real deployments,
-  no destructive git operations — unchanged from how this whole week's
-  work has already run. Autonomy doesn't mean loosening these; it means
-  running the same rules for longer stretches without a human in the loop
-  for the routine parts.
-- **Verify before claiming done** — the discipline behind catching the T5
-  crash, the screenshot-routing bug, and the web_fetch truncation this
-  week — doesn't relax just because no one's watching in real time. If
-  anything it matters more unattended, since there's no one to catch a
-  false "done" in the moment.
+## Phase B — Reliable execution at scale
 
-### When to check in vs. just proceed
+Goal: a 20-step chain either finishes completely, or cleanly pauses
+asking permission with a genuine yes/no status — never a silent stall.
 
-Check in (push notification, since Remote Control reaches your phone) for:
-- Anything in the existing explicit-permission/prohibited categories above.
-- A real fork in approach with no clearly-better default (e.g. "which
-  messaging platform's connector first" if the roadmap didn't already
-  decide it).
-- A change big/hard-to-undo enough that showing the plan first is cheaper
-  than unwinding it later (a real architectural refactor, not a routine
-  fix).
-- Genuinely stuck after real debugging effort — not "first sign of
-  friction," matching how flakes vs. real bugs got told apart this week.
-- A natural roadmap-item boundary, batched rather than mid-task — finishing
-  Q2's audit is worth a ping; every intermediate grep isn't.
+1. Turn Phase A's status-report fallback into a real checkpoint: at a
+   natural pause point, state exactly what can/can't be done and wait
+   for a decision, rather than guessing past it or dying quietly.
+2. Fix the approval-signature exact-match flake (the LLM doesn't always
+   regenerate byte-identical params on retry, so a resend can fail to
+   match the pending approval) — deferred for weeks, real contributor to
+   "not reliable."
 
-Just proceed for: routine implementation within an already-agreed roadmap
-item, fixing something the way this week's bugs got fixed (find it, fix
-it, verify it, commit to a branch), anything squarely inside the boundaries
-above.
+## Phase C — UI overhaul (only after A + B hold)
 
-### How it actually runs (mechanism)
+Bring Phase A's step-by-step visibility and honest status/error states
+into the cockpit. Deliberately not started until the engine underneath
+is trustworthy — no UI polish on top of a loop that can still silently
+stall.
 
-- A recurring scheduled agent (not the session-bound, 7-day-capped cron
-  primitive — a durable scheduled routine) resumes work at a regular
-  cadence, reads this roadmap plus a running status log to know exactly
-  where things stand, and works the next item.
-- The status log (`PROGRESS.md`, to be created alongside this file) is
-  what makes each wake-up not have to re-derive context — same principle
-  as Graphify for code structure, but for "what's done, what's in flight,
-  what's blocked."
-- Graphify's already-installed knowledge graph gets used (and kept current
-  via `graphify update .`) instead of the agent re-reading the whole
-  codebase from scratch each session.
+## Phase D — Voice & Calls
 
-**Not yet built — needs Sam's go-ahead before it goes live**, same as
-Task Scheduler did this week: the actual recurring-schedule wiring. This
-document is the design; making it real is a separate, explicit step.
+Split architecture: calls get a fast, short-response path (tight
+turn/token budget, no 20-step chains live on a call); heavy or
+long-running work is handed to a background job that reports back when
+done instead of making the call wait. Separately: debug why audio isn't
+playing at all right now — a concrete, live-testable bug, not designed
+around yet.
+
+## Phase E — Phase 4
+
+Voice autonomy (openWakeWord, continuous conversation mode,
+SOUL.md-driven personality switching), visual perception, then the
+hardware layer (Home Assistant, Twilio, LilyGo watch) — unchanged in
+substance from the original plan, picked up with whatever time remains
+after Phases A-D actually hold. Hardware lead time is still real: order
+anything Phase 4 needs as soon as this phase is reachable, not the week
+it starts.
 
 ---
 
-## Explicitly not in this roadmap
+## The autonomy system — on hold, lessons learned
 
-- Phase 5 (dropped per Sam's decision above).
-- Q4 (multi-tenancy) — not a goal unless Sam says otherwise.
-- Anything not already in Phase 1-4 of the manifesto — no scope creep
-  invented mid-roadmap without it being written here first.
+The cloud routine is disabled (`PROGRESS.md` 2026-09-09 has the full
+account). Two real, load-bearing findings from running it this week,
+whichever way it gets resumed later:
+
+1. **A fresh session has no memory of prior firings' work or their own
+   stand-down requests** unless that's written into `PROGRESS.md` itself
+   — a request left only in an unmerged PR body is invisible to the next
+   firing, which will just redo the work. Whatever resumes this needs a
+   real in-progress/claimed marker the next firing actually reads, not an
+   honor-system PR comment.
+2. **Disabling the scheduled trigger does not stop already-running
+   sessions that subscribed to a PR's activity webhooks** from reacting
+   to new comments/closes indefinitely. Found live: closing PRs today
+   caused two more PRs from sessions that had subscribed to them, well
+   after the trigger was off. A real kill-switch needs to account for
+   this, not just the cron schedule.
+
+Not resumed until Sam decides how to address both, or decides not to
+resume it at all.
+
+---
+
+## Explicitly not in this roadmap right now
+
+- Tool Forge (the LLM-writes-and-registers-code pipeline) — real
+  security gap found, needs a dedicated hardening pass as its own
+  scoped piece of work, not folded into Phase A-E.
+- Q4 (multi-tenancy), Q5/Q7/Q9 (business/positioning) — unchanged,
+  non-blocking, revisit after Phase A-D land.
+- Anything not already listed above — no scope creep invented mid-roadmap
+  without it being written here first.
