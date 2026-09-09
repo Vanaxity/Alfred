@@ -7,7 +7,7 @@ don't rewrite history — newest entries at the top.
 
 ---
 
-## 📍 Phase 1 engineering: closed (2026-09-05). Currently in: Phase 2
+## 📍 Phase 1 + Phase 2 engineering: closed. Currently in: Phase 3
 
 Phase 1's active-catch-up mode (was here, see git history if needed) is
 over — Q2 and Q8 both closed same-day via local-session work, on top of
@@ -20,12 +20,90 @@ Phase 1 items (Strix pentest gate, Q4/Q5/Q7/Q9 business questions) are
 explicitly manual/non-blocking per `ROADMAP.md` — not something a
 session should pick up and start working unprompted.
 
-**Now in Phase 2** (rescoped 2026-09-05, see `ROADMAP.md`): MCP client +
-one connector this week, proactive surfacing and further connectors
-pushed to Phase 3. See the dated entry below for what's actually shipped
-so far.
+Phase 2 (MCP client + filesystem connector + find/install_mcp_server) is
+done and live-tested, per the 2026-09-08 entry below.
+
+**Now in Phase 3** (see `ROADMAP.md`). **Read the 2026-09-09 entry below
+before picking up Tool Forge specifically** — three independent cloud
+runs each attempted the LLM-generates-code half of it in the same ~24h
+window (PRs #25/#27/#28), all closed after a security review found every
+one of them shared the same exploitable gap. It is NOT an unclaimed,
+pick-up-and-implement roadmap item right now — it needs a deliberately-
+scoped hardening pass, not another naive attempt. `PR #16` (skill
+validation/versioning — the prerequisite slice, no code-gen) is unaffected
+and still open.
 
 ---
+
+## 2026-09-09 — Tool Forge (code-gen half): 3 independent attempts, all closed on a shared security finding
+
+Not new work — logging the outcome of a coordination + security problem
+so the next run doesn't repeat it. This session opened PR #25 (Tool Forge:
+skill-to-code pipeline) on 2026-09-08, per the roadmap's "finish Tool
+Forge" bullet. Unknown to this session at the time, at least two *other*
+autonomous runs picked the exact same roadmap item independently within
+the same ~24h window and each built their own full implementation:
+PR #27 (`auto/tool-forge-2026-09-09`) and PR #28
+(`auto/tool-forge-20260909`). All three (mine included) took materially
+different approaches to the same spec — different sandboxing strategies,
+different persistence fixes for the `success_count` tracking gap, different
+forge-threshold logic — but converged on the same core design shape: an
+LLM generates a `run(params)`-shaped function, a static AST check screens
+it, a subprocess runs it once to validate, then it's registered as a live
+tool.
+
+**All three were closed without merging on 2026-09-09**, per a single
+review comment posted across all three PRs, after "an independent code
+review (not just the description) of this PR alongside #27 and #28"
+found a security gap **shared by all three independent implementations**:
+
+- **No approval gate on a forged tool's first execution.** Every design's
+  `require_approval=True` only guards *subsequent* calls to an
+  already-registered tool — the validation run that decides whether the
+  generated code is even safe enough to register runs before any human
+  ever sees it. That validation run *is* an unapproved execution of
+  LLM-generated code.
+- **The AST safety checker (independently written 3 times) shares one
+  blind spot**: none of the three catch string-based dunder access, e.g.
+  `"{0.__class__.__mro__...}".format(x)` — it never appears as an
+  `ast.Attribute`/`ast.Call` node, so a denylist keyed on those node types
+  never sees it. If that bypass clears the AST check, the subprocess
+  sandbox in every version is a bare interpreter with a timeout, not a
+  restricted-builtins namespace — meaning unrestricted code execution
+  with the real user's privileges once the string-based trick lands.
+- My PR (#25) specifically also had an incomplete fix relative to #27/#28:
+  `Skill.from_markdown()` was never updated to parse `success_count` back
+  out of the `**Success Rate:** N/M` line, so the counter this whole
+  feature depends on would still reset to 0 on every reload (server
+  restart, or a fresh `SkillManager()`) — #27 and #28 both caught and
+  fixed this; my version didn't.
+
+**Verdict, in the closing comment's own words**: *"this needs a
+deliberately-scoped hardening pass — approval gating before first
+execution, an AST checker that catches string-based introspection, and
+generated code running out-of-process even at call time — not a quick
+patch inside a cleanup pass."* **PR #16** (skill validation + SemVer
+versioning — the prerequisite slice with no code-gen at all) is
+explicitly unaffected and still open/mergeable on its own.
+
+**For the next run that reaches this item on the roadmap**: don't treat
+"Tool Forge" as an open, pick-up-able roadmap line item and re-attempt
+the LLM-codegen-and-sandbox design from scratch — that's the 4th
+independent attempt at something already shown, three times over, to
+share the same real vulnerability. If picking this up again, it needs to
+start from the specific hardening requirements above (pre-execution
+approval, a string-introspection-aware checker, true out-of-process
+isolation even at call time — not just at forge time), ideally as one
+deliberately-scoped task rather than another parallel "build the whole
+pipeline" attempt, and ideally checking first whether another run is
+already mid-flight on it (no mechanism currently exists to detect that
+in advance — this triplicate-attempt outcome is itself the evidence such
+a mechanism is missing, worth Sam's attention separately from the
+security question).
+
+No code changes in this entry — PROGRESS.md only, so the next wake-up
+(cloud routine or local session) has accurate state instead of three
+stale "pending review" PRs that no longer exist.
 
 ## 2026-09-08 — Live-tested all of Phase 2's MCP work, fixed 2 real bugs, resumed the cloud routine
 
