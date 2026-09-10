@@ -937,255 +937,292 @@ class Alfred:
         timings["pre_loop_total_ms"] = (time.perf_counter() - pre_loop_start) * 1000.0
         memory_drop_logged = False
 
-        for turn in range(self.MAX_TURNS):
-            # --- Build prompt ---
-            _t0 = time.perf_counter()
-            system, dropped_sections = self._build_system_prompt(memory_snippets, matched_skill)
-            timings["prompt_build_ms"] = timings.get("prompt_build_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
-            if "memory" in dropped_sections and not memory_drop_logged:
-                thinking.append(
-                    "  Memory dropped from prompt (token budget too tight to fit it)"
+        loop_error: Optional[str] = None
+        try:
+            for turn in range(self.MAX_TURNS):
+                # --- Build prompt ---
+                _t0 = time.perf_counter()
+                system, dropped_sections = self._build_system_prompt(memory_snippets, matched_skill)
+                timings["prompt_build_ms"] = timings.get("prompt_build_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
+                if "memory" in dropped_sections and not memory_drop_logged:
+                    thinking.append(
+                        "  Memory dropped from prompt (token budget too tight to fit it)"
+                    )
+                    memory_drop_logged = True
+
+                # Convert conversation to LLM format
+                llm_messages = conv.to_llm_messages()
+
+                # --- Call LLM ---
+                # 1200 -- confirmed live 2026-08-31 as too small: a "research
+                # from 5-6 sources" reply hit this cap mid-generation, which
+                # either truncated the visible answer mid-sentence or (worse)
+                # cut the JSON envelope off mid-string, surfacing as "malformed
+                # response, ask again" instead of the real (if incomplete)
+                # content. This is the shared budget for every turn, not just
+                # the final reply, so it has to cover the JSON wrapper overhead
+                # too -- 3000 gives real headroom for verbose synthesis without
+                # a large latency/cost jump (this is a ceiling, not a floor;
+                # short replies don't suddenly cost more).
+                _t0 = time.perf_counter()
+                resp = await self._router.call(
+                    system_prompt=system,
+                    user_message=task,
+                    messages=llm_messages,
+                    max_tokens=3000,
+                    temperature=0.1,
                 )
-                memory_drop_logged = True
+                timings["llm_call_ms"] = timings.get("llm_call_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
+                if resp.provider:
+                    note = f"[LLM provider={resp.provider}"
+                    if resp.fallback_used:
+                        note += f", fallback={resp.fallback_reason or 'unknown'}"
+                    thinking.append(note + "]")
+                raw = (resp.text or "").strip()
 
-            # Convert conversation to LLM format
-            llm_messages = conv.to_llm_messages()
+                # The router signals "every provider is down" by returning
+                # text=None with .error set -- it does NOT raise. Without this
+                # check the loop treats it as an empty reply, nudges, and
+                # burns every remaining turn before blaming a "step limit" --
+                # when the truth is the LLM backend was unreachable. Stop now
+                # and say that.
+                router_error = getattr(resp, "error", None)
+                if resp.text is None and router_error:
+                    reason = resp.fallback_reason or router_error
+                    thinking.append(f"[Turn {turn + 1}] LLM router failed: {reason}")
+                    final_reply = (
+                        f"I couldn't reach the language model to work on this "
+                        f"({reason}). Nothing ran -- give it a moment and try "
+                        "again; if it keeps happening, the provider keys or "
+                        "network connection are where to look."
+                    )
+                    break
 
-            # --- Call LLM ---
-            # 1200 -- confirmed live 2026-08-31 as too small: a "research
-            # from 5-6 sources" reply hit this cap mid-generation, which
-            # either truncated the visible answer mid-sentence or (worse)
-            # cut the JSON envelope off mid-string, surfacing as "malformed
-            # response, ask again" instead of the real (if incomplete)
-            # content. This is the shared budget for every turn, not just
-            # the final reply, so it has to cover the JSON wrapper overhead
-            # too -- 3000 gives real headroom for verbose synthesis without
-            # a large latency/cost jump (this is a ceiling, not a floor;
-            # short replies don't suddenly cost more).
-            _t0 = time.perf_counter()
-            resp = await self._router.call(
-                system_prompt=system,
-                user_message=task,
-                messages=llm_messages,
-                max_tokens=3000,
-                temperature=0.1,
-            )
-            timings["llm_call_ms"] = timings.get("llm_call_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
-            if resp.provider:
-                note = f"[LLM provider={resp.provider}"
-                if resp.fallback_used:
-                    note += f", fallback={resp.fallback_reason or 'unknown'}"
-                thinking.append(note + "]")
-            raw = (resp.text or "").strip()
+                # Retry with stripped prompt if empty
+                if not raw:
+                    raw = await self._retry_with_stripped_prompt(task)
 
-            # Retry with stripped prompt if empty
-            if not raw:
-                raw = await self._retry_with_stripped_prompt(task)
+                # --- Parse output ---
+                reply, tool_name, tool_params = self._parse_llm_output(raw)
 
-            # --- Parse output ---
-            reply, tool_name, tool_params = self._parse_llm_output(raw)
+                # Record the LLM's own output into history. Message.is_tool_call is
+                # computed from content (does it parse as JSON with a "tool" key?),
+                # so recording raw here — before branching on what it turned out to
+                # be — makes ConversationHistory._find_last_tool_pair_start() able
+                # to recognize a tool-call turn automatically. Without this, the
+                # ASSISTANT message a TOOL result depends on never existed, so
+                # compression could never identify a pair to preserve.
+                if raw:
+                    conv.add_assistant(raw)
 
-            # Record the LLM's own output into history. Message.is_tool_call is
-            # computed from content (does it parse as JSON with a "tool" key?),
-            # so recording raw here — before branching on what it turned out to
-            # be — makes ConversationHistory._find_last_tool_pair_start() able
-            # to recognize a tool-call turn automatically. Without this, the
-            # ASSISTANT message a TOOL result depends on never existed, so
-            # compression could never identify a pair to preserve.
-            if raw:
-                conv.add_assistant(raw)
-
-            if reply is not None:
-                if reply.strip():
-                    if (
-                        not tools_called
-                        and not completion_claim_nudge_used
-                        and self._is_untooled_completion_claim(reply)
-                    ):
-                        completion_claim_nudge_used = True
-                        thinking.append(
-                            f"[Turn {turn + 1}] Completion-claim reply with no tool call — nudging"
-                        )
-                        conv.add_user(
-                            "You just told me something was done, but you did not call a tool "
-                            f"this turn -- nothing actually happened. Task: {task}. If this "
-                            "needs an action (saving, scheduling, reminding, calculating, etc.), "
-                            "call the matching tool now with a real {\"tool\": ..., \"params\": "
-                            "{...}} call. If you genuinely can't do it, say so plainly instead "
-                            "of claiming it's done."
-                        )
-                        continue
-                    if (
-                        not intent_only_nudge_used
-                        and self._is_untooled_intent_only_reply(reply)
-                    ):
-                        # Deliberately no `not tools_called` guard here -- see
-                        # _INTENT_ONLY_PHRASES' module-level comment. Live-caught
-                        # 2026-09-09: Alfred read several files (turns 1-4 all real
-                        # tool calls), then turn 5's reply was "I'm going to keep
-                        # reading the rest" with no tool call attached, and the
-                        # loop treated that as a finished answer and stopped --
-                        # exactly what a multi-step task must never do.
-                        intent_only_nudge_used = True
-                        thinking.append(
-                            f"[Turn {turn + 1}] Stated intent with no tool call — nudging"
-                        )
-                        conv.add_user(
-                            f"You said what you're about to do, but didn't call a tool this "
-                            f"turn -- Task: {task}. Don't narrate the next step, take it: call "
-                            "the matching tool now with a real {\"tool\": ..., \"params\": "
-                            "{...}} call. If you're actually finished, give the real, complete "
-                            "answer instead of describing what you were going to do."
-                        )
-                        continue
-                    if (
-                        time_tool_output is not None
-                        and not time_mismatch_nudge_used
-                        and not any(cue in reply.lower() for cue in _REFUSAL_CUES)
-                    ):
-                        claimed = _extract_clock_times(reply)
-                        grounded = _extract_clock_times(time_tool_output)
-                        fabricated = claimed - grounded
-                        if fabricated:
-                            time_mismatch_nudge_used = True
+                if reply is not None:
+                    if reply.strip():
+                        if (
+                            not tools_called
+                            and not completion_claim_nudge_used
+                            and self._is_untooled_completion_claim(reply)
+                        ):
+                            completion_claim_nudge_used = True
                             thinking.append(
-                                f"[Turn {turn + 1}] Reply states a time {fabricated} the "
-                                "time tool never returned — nudging"
+                                f"[Turn {turn + 1}] Completion-claim reply with no tool call — nudging"
                             )
                             conv.add_user(
-                                f"The time tool returned: {time_tool_output}. Your reply "
-                                f"states a different time ({', '.join(fabricated)}) that "
-                                "tool never gave you -- that's fabricated, not grounded. "
-                                "This device's clock cannot tell you another city's or "
-                                "timezone's current time. Redo your answer: state only "
-                                "the time the tool actually returned, and say plainly you "
-                                "don't know any other location's local time."
+                                "You just told me something was done, but you did not call a tool "
+                                f"this turn -- nothing actually happened. Task: {task}. If this "
+                                "needs an action (saving, scheduling, reminding, calculating, etc.), "
+                                "call the matching tool now with a real {\"tool\": ..., \"params\": "
+                                "{...}} call. If you genuinely can't do it, say so plainly instead "
+                                "of claiming it's done."
                             )
                             continue
-                    final_reply = reply
-                    thinking.append(f"[Turn {turn + 1}] Reply: {reply[:80]}")
+                        if (
+                            not intent_only_nudge_used
+                            and self._is_untooled_intent_only_reply(reply)
+                        ):
+                            # Deliberately no `not tools_called` guard here -- see
+                            # _INTENT_ONLY_PHRASES' module-level comment. Live-caught
+                            # 2026-09-09: Alfred read several files (turns 1-4 all real
+                            # tool calls), then turn 5's reply was "I'm going to keep
+                            # reading the rest" with no tool call attached, and the
+                            # loop treated that as a finished answer and stopped --
+                            # exactly what a multi-step task must never do.
+                            intent_only_nudge_used = True
+                            thinking.append(
+                                f"[Turn {turn + 1}] Stated intent with no tool call — nudging"
+                            )
+                            conv.add_user(
+                                f"You said what you're about to do, but didn't call a tool this "
+                                f"turn -- Task: {task}. Don't narrate the next step, take it: call "
+                                "the matching tool now with a real {\"tool\": ..., \"params\": "
+                                "{...}} call. If you're actually finished, give the real, complete "
+                                "answer instead of describing what you were going to do."
+                            )
+                            continue
+                        if (
+                            time_tool_output is not None
+                            and not time_mismatch_nudge_used
+                            and not any(cue in reply.lower() for cue in _REFUSAL_CUES)
+                        ):
+                            claimed = _extract_clock_times(reply)
+                            grounded = _extract_clock_times(time_tool_output)
+                            fabricated = claimed - grounded
+                            if fabricated:
+                                time_mismatch_nudge_used = True
+                                thinking.append(
+                                    f"[Turn {turn + 1}] Reply states a time {fabricated} the "
+                                    "time tool never returned — nudging"
+                                )
+                                conv.add_user(
+                                    f"The time tool returned: {time_tool_output}. Your reply "
+                                    f"states a different time ({', '.join(fabricated)}) that "
+                                    "tool never gave you -- that's fabricated, not grounded. "
+                                    "This device's clock cannot tell you another city's or "
+                                    "timezone's current time. Redo your answer: state only "
+                                    "the time the tool actually returned, and say plainly you "
+                                    "don't know any other location's local time."
+                                )
+                                continue
+                        final_reply = reply
+                        thinking.append(f"[Turn {turn + 1}] Reply: {reply[:80]}")
+                        break
+                    # Empty reply — nudge LLM
+                    thinking.append(f"[Turn {turn + 1}] Empty reply, retrying")
+                    conv.add_user(f"You replied with an empty message. Task: {task}. Respond properly.")
+                    continue
+
+                if tool_name is None:
+                    final_reply = "I'm not sure how to handle that."
+                    thinking.append(f"[Turn {turn + 1}] Unparseable: {raw[:60]}")
                     break
-                # Empty reply — nudge LLM
-                thinking.append(f"[Turn {turn + 1}] Empty reply, retrying")
-                conv.add_user(f"You replied with an empty message. Task: {task}. Respond properly.")
-                continue
 
-            if tool_name is None:
-                final_reply = "I'm not sure how to handle that."
-                thinking.append(f"[Turn {turn + 1}] Unparseable: {raw[:60]}")
-                break
-
-            # --- Break out of repeat loops ---
-            # Seen live: five identical memory_search calls in a row, burning
-            # every turn and ending in the MAX_TURNS fallback. Re-running the
-            # exact same call cannot produce a different result, so tell the
-            # model plainly instead of letting it spin.
-            call_sig = f"{tool_name}:{json.dumps(tool_params, sort_keys=True, default=str)}"
-            repeats[call_sig] = repeats.get(call_sig, 0) + 1
-            if repeats[call_sig] > 2:
-                thinking.append(f"[Turn {turn + 1}] Aborting repeat of {tool_name}")
-                conv.add_user(
-                    f"You have already called {tool_name} with those exact arguments "
-                    f"{repeats[call_sig] - 1} times and got the same result. Do not call "
-                    "it again. Either answer with what you have, or say what specific "
-                    "information you are missing."
-                )
-                continue
-
-            # --- Don't let a successful weather call get second-guessed ---
-            # Live-observed (weather_rain_before_evening_run): the model calls
-            # weather, gets a real forecast back, then calls web_search and
-            # web_fetch anyway for the same question -- redundant cross-checks
-            # of a tool that already answered authoritatively. Strengthening
-            # the tool description alone didn't stop it, so refuse the call
-            # outright instead of just asking nicely.
-            if tool_name in ("web_search", "web_fetch") and weather_tool_output is not None:
-                thinking.append(
-                    f"[Turn {turn + 1}] Blocking redundant {tool_name} after weather succeeded"
-                )
-                conv.add_user(
-                    f"The weather tool already returned: {weather_tool_output}. "
-                    f"Don't call {tool_name} to cross-check it -- answer the "
-                    "user's question directly from that result now."
-                )
-                continue
-
-            # --- Execute tool ---
-            thinking.append(f"[Turn {turn + 1}] Tool: {tool_name}")
-            _t0 = time.perf_counter()
-            result = await self._tool_executor.execute(tool_name, tool_params, tool_ctx)
-            timings["tool_execution_ms"] = timings.get("tool_execution_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
-
-            output = result.output if result.success else result.error or ""
-            is_error = not result.success
-
-            tools_called.append(tool_name)
-            tool_results.append({
-                "tool": tool_name,
-                "output": str(output)[:500],
-                "success": result.success,
-                "params": tool_params,
-            })
-            if tool_name == "time" and result.success:
-                time_tool_output = str(output)
-            if tool_name == "weather" and result.success:
-                weather_tool_output = str(output)
-
-            if is_error:
-                thinking.append(f"  X {tool_name}: {str(output)[:100]}")
-            else:
-                thinking.append(f"  OK ({len(str(output))} chars)")
-
-            # --- Add tool result to conversation ---
-            result_dict = result.to_dict()
-            conv.add_tool_result(tool_name, result_dict)
-
-            # --- Stop immediately if the tool needs approval ---
-            # Don't burn the remaining turns retrying a call that's blocked on a
-            # human decision, not a fixable error — the LLM has no params
-            # correction that gets past "a human hasn't said yes yet." The
-            # attempt is already recorded above (add_assistant + add_tool_result),
-            # so a resend with approved_actions set will have full context.
-            if result.metadata.get("awaiting_approval"):
-                awaiting_approval = {
-                    "tool": result.metadata.get("tool", tool_name),
-                    "params": result.metadata.get("params"),
-                    "signature": result.metadata.get("signature"),
-                }
-                final_reply = (
-                    f"I need your approval before running {tool_name}. "
-                    "Confirm and I'll proceed."
-                )
-                thinking.append(f"  Awaiting approval: {tool_name}")
-                break
-
-            # --- Mutation verification ---
-            # is_mutation() is action-aware: a calendar "agenda" read is not a
-            # mutation even though "calendar" is in MUTATION_TOOLS.
-            if result.success and self._tool_executor.is_mutation(tool_name, tool_params):
-                _t0 = time.perf_counter()
-                verify_result = await self._tool_executor.verify_mutation(
-                    tool_name, tool_ctx, tool_params
-                )
-                timings["mutation_verify_ms"] = timings.get("mutation_verify_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
-                if verify_result:
-                    verify_output = verify_result.output if verify_result.success else verify_result.error
-                    conv.add_tool_result(
-                        f"{tool_name}_verify",
-                        {"verification": str(verify_output)[:500]},
+                # --- Break out of repeat loops ---
+                # Seen live: five identical memory_search calls in a row, burning
+                # every turn and ending in the MAX_TURNS fallback. Re-running the
+                # exact same call cannot produce a different result, so tell the
+                # model plainly instead of letting it spin.
+                call_sig = f"{tool_name}:{json.dumps(tool_params, sort_keys=True, default=str)}"
+                repeats[call_sig] = repeats.get(call_sig, 0) + 1
+                if repeats[call_sig] > 2:
+                    thinking.append(f"[Turn {turn + 1}] Aborting repeat of {tool_name}")
+                    conv.add_user(
+                        f"You have already called {tool_name} with those exact arguments "
+                        f"{repeats[call_sig] - 1} times and got the same result. Do not call "
+                        "it again. Either answer with what you have, or say what specific "
+                        "information you are missing."
                     )
-                    thinking.append(f"  Verified: {tool_name}")
+                    continue
 
-            # --- Compress if needed ---
-            _t0 = time.perf_counter()
-            compressed = conv.compress_if_needed()
-            timings["compression_ms"] = timings.get("compression_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
-            if compressed:
-                thinking.append(f"  Compressed {compressed} old messages")
+                # --- Don't let a successful weather call get second-guessed ---
+                # Live-observed (weather_rain_before_evening_run): the model calls
+                # weather, gets a real forecast back, then calls web_search and
+                # web_fetch anyway for the same question -- redundant cross-checks
+                # of a tool that already answered authoritatively. Strengthening
+                # the tool description alone didn't stop it, so refuse the call
+                # outright instead of just asking nicely.
+                if tool_name in ("web_search", "web_fetch") and weather_tool_output is not None:
+                    thinking.append(
+                        f"[Turn {turn + 1}] Blocking redundant {tool_name} after weather succeeded"
+                    )
+                    conv.add_user(
+                        f"The weather tool already returned: {weather_tool_output}. "
+                        f"Don't call {tool_name} to cross-check it -- answer the "
+                        "user's question directly from that result now."
+                    )
+                    continue
 
-            # --- Next turn context ---
-            # The conversation history already has the tool result,
-            # so the next LLM call will see it naturally.
+                # --- Execute tool ---
+                thinking.append(f"[Turn {turn + 1}] Tool: {tool_name}")
+                _t0 = time.perf_counter()
+                result = await self._tool_executor.execute(tool_name, tool_params, tool_ctx)
+                timings["tool_execution_ms"] = timings.get("tool_execution_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
+
+                output = result.output if result.success else result.error or ""
+                is_error = not result.success
+
+                tools_called.append(tool_name)
+                tool_results.append({
+                    "tool": tool_name,
+                    "output": str(output)[:500],
+                    "success": result.success,
+                    "params": tool_params,
+                })
+                if tool_name == "time" and result.success:
+                    time_tool_output = str(output)
+                if tool_name == "weather" and result.success:
+                    weather_tool_output = str(output)
+
+                if is_error:
+                    thinking.append(f"  X {tool_name}: {str(output)[:300]}")
+                else:
+                    thinking.append(f"  OK ({len(str(output))} chars)")
+
+                # --- Add tool result to conversation ---
+                result_dict = result.to_dict()
+                conv.add_tool_result(tool_name, result_dict)
+
+                # --- Stop immediately if the tool needs approval ---
+                # Don't burn the remaining turns retrying a call that's blocked on a
+                # human decision, not a fixable error — the LLM has no params
+                # correction that gets past "a human hasn't said yes yet." The
+                # attempt is already recorded above (add_assistant + add_tool_result),
+                # so a resend with approved_actions set will have full context.
+                if result.metadata.get("awaiting_approval"):
+                    awaiting_approval = {
+                        "tool": result.metadata.get("tool", tool_name),
+                        "params": result.metadata.get("params"),
+                        "signature": result.metadata.get("signature"),
+                    }
+                    final_reply = (
+                        f"I need your approval before running {tool_name}. "
+                        "Confirm and I'll proceed."
+                    )
+                    thinking.append(f"  Awaiting approval: {tool_name}")
+                    break
+
+                # --- Mutation verification ---
+                # is_mutation() is action-aware: a calendar "agenda" read is not a
+                # mutation even though "calendar" is in MUTATION_TOOLS.
+                if result.success and self._tool_executor.is_mutation(tool_name, tool_params):
+                    _t0 = time.perf_counter()
+                    verify_result = await self._tool_executor.verify_mutation(
+                        tool_name, tool_ctx, tool_params
+                    )
+                    timings["mutation_verify_ms"] = timings.get("mutation_verify_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
+                    if verify_result:
+                        verify_output = verify_result.output if verify_result.success else verify_result.error
+                        conv.add_tool_result(
+                            f"{tool_name}_verify",
+                            {"verification": str(verify_output)[:500]},
+                        )
+                        thinking.append(f"  Verified: {tool_name}")
+
+                # --- Compress if needed ---
+                _t0 = time.perf_counter()
+                compressed = conv.compress_if_needed()
+                timings["compression_ms"] = timings.get("compression_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
+                if compressed:
+                    thinking.append(f"  Compressed {compressed} old messages")
+
+                # --- Next turn context ---
+                # The conversation history already has the tool result,
+                # so the next LLM call will see it naturally.
+
+        except Exception as _loop_exc:
+            # Anything the per-turn work can raise -- the LLM router with
+            # every provider down, prompt build, compression, a tool that
+            # raised instead of returning success=False -- used to escape
+            # execute() entirely: an unhandled traceback in the terminal,
+            # and via the API a bare "I encountered an error" with the
+            # whole `thinking` trace discarded. Catch it, keep the trace,
+            # and let the fallback below turn it into a real message.
+            import traceback as _tb
+            loop_error = f"{type(_loop_exc).__name__}: {_loop_exc}"
+            thinking.append(f"[Loop aborted turn {turn + 1}] {loop_error}")
+            _frames = _tb.extract_tb(_loop_exc.__traceback__)
+            if _frames:
+                _f = _frames[-1]
+                _fname = _f.filename.replace("\\", "/").rsplit("/", 1)[-1]
+                thinking.append(f"  at {_fname}:{_f.lineno} in {_f.name}()")
 
         # --- Fallback if no reply ---
         # The loop ran out of turns without the model producing an answer. The
@@ -1202,7 +1239,20 @@ class Alfred:
         # answer is a real status report -- what was actually done, in plain
         # terms, and an explicit offer to keep going -- not a shrug.
         if not final_reply:
-            if tools_called:
+            if loop_error:
+                # The loop was aborted by the try/except above, not by
+                # running out of turns. Say what broke, in plain terms, and
+                # point at the trace -- never a bare "I encountered an error".
+                ran = (
+                    f" Before it stopped I ran: {', '.join(tools_called)}."
+                    if tools_called else ""
+                )
+                final_reply = (
+                    f"I ran into an error partway through and had to stop: "
+                    f"{loop_error}.{ran} The step-by-step trace above shows how "
+                    "far I got -- nothing after that point ran."
+                )
+            elif tools_called:
                 unique_counts: Dict[str, int] = {}
                 for t in tools_called:
                     unique_counts[t] = unique_counts.get(t, 0) + 1
@@ -1214,6 +1264,15 @@ class Alfred:
                 last_bit = ""
                 if last and last.get("success") and last.get("output"):
                     last_bit = f"\n\nMost recent result:\n{str(last['output'])[:400]}"
+                elif last and last.get("success") is False:
+                    # A run that ends on a failed tool call must not list that
+                    # call as if it worked -- the error that blocked it is the
+                    # one thing worth reporting.
+                    err = last.get("output") or last.get("error") or "no detail given"
+                    last_bit = (
+                        f"\n\nThe last step failed: {last.get('tool')} -- "
+                        f"{str(err)[:400]}"
+                    )
                 final_reply = (
                     f"I hit my step limit ({self.MAX_TURNS} steps) before finishing "
                     f"this. So far I actually did: {done_summary}.{last_bit}\n\n"
