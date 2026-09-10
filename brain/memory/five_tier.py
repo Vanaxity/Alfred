@@ -474,7 +474,13 @@ class FiveTierMemory:
     def t3_save_episode(self, title: str, content: str, metadata: Dict = None, session_id: str = "") -> str:
         """Save an episodic memory (past event) with vector embedding."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{title[:50].replace(' ', '-')}_{timestamp}.md"
+        # The title comes straight from the user's task text, so it can
+        # contain '/', '\\', ':', '?', '*' etc. Left raw, a '/' turns the
+        # filename into a path into a non-existent subdir and write_text
+        # raises -- which execute() silently swallows, losing the episode.
+        # Collapse every run of non-word chars to a single dash.
+        safe_title = re.sub(r"[^\w.-]+", "-", title[:50]).strip("-. ") or "episode"
+        filename = f"{safe_title}_{timestamp}.md"
         filepath = T3_EPISODIC_DIR / filename
 
         meta = metadata or {}
