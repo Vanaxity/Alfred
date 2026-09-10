@@ -101,6 +101,22 @@ _REFUSAL_CUES = (
 )
 
 
+# A broad "what do you know about me" turn. Self-referential -- it adds no
+# new durable fact, and saving its answer as a T3 episode lets a weak or
+# invented answer resurface as "memory" the next time the same thing is
+# asked (traced live 2026-09-10: the vault already had `ok-tell-me-about-me`
+# and `nothing-in-my-profile-says-that` episodes from a frustrated session,
+# scoring 0.5+ against every re-ask). These turns skip the T3 episode save.
+_SELF_SUMMARY_CUES = (
+    "tell me about myself", "tell me about me", "about myself",
+    "what do you know about me", "what do you have on me",
+    "what have you got on me", "what've you got on me",
+    "who am i", "describe me", "everything you know about me",
+    "everything about me", "summarize what you know about me",
+    "summarise what you know about me", "my profile",
+)
+
+
 # ---------------------------------------------------------------------------
 # Tool-output-vs-reply consistency (model-agnostic — no city/location
 # matching, just: does the final reply state a clock time the `time` tool
@@ -318,7 +334,8 @@ class Alfred:
 
         # Rules
         rules = [
-            "For personal questions about Master Sam that you can answer directly from the profile below (e.g. 'what's my favorite food'), answer from it and do NOT call memory_search. But if Master Sam explicitly asks what you know, remember, or have saved about something (e.g. 'what do you know about X', 'what have you got saved', 'search your memory for X'), call memory_search so the answer comes from an actual lookup rather than just reciting the prompt.",
+            "Personal questions about Master Sam -- his preferences, schedule, identity, family, goals -- are answered from the Profile below. This INCLUDES broad ones: 'tell me about myself', 'tell me about yourself' (meaning him), 'what do you know about me', 'who am I' -- the Profile IS your record of him, so summarize it directly and do NOT call memory_search for those. Only call memory_search when he asks about something SPECIFIC that may not be in the Profile ('what do you know about my chemistry teacher', 'the TKS thing') or explicitly tells you to search your memory.",
+            "Never invent facts about Master Sam. Everything you tell him about himself must come from the Profile below or a memory_search result you actually got back. If neither has it, say plainly you don't have it saved -- a plausible-sounding guess about his life is worse than admitting the gap.",
             "For live data (time, weather, calendar, web), call the appropriate tool.",
             "Output ONE JSON per message: {\"tool\": \"name\", \"params\": {...}} or {\"reply\": \"answer\"}",
             "After a tool runs you will see the result. Call another tool or reply.",
@@ -661,6 +678,15 @@ class Alfred:
         if len(text) > _INTENT_ONLY_MAX_CHARS:
             return False  # long enough to plausibly be a real answer too
         return any(phrase in text for phrase in _INTENT_ONLY_PHRASES)
+
+    @staticmethod
+    def _is_self_summary_query(task: str) -> bool:
+        """True for a broad "tell me about myself" / "what do you know
+        about me" request -- see _SELF_SUMMARY_CUES. Used to skip the T3
+        episode save so a weak self-summary answer can't resurface as
+        retrieved "memory" next time."""
+        t = task.strip().lower()
+        return any(cue in t for cue in _SELF_SUMMARY_CUES)
 
     def _parse_llm_output(self, content: str) -> tuple:
         """
@@ -1239,8 +1265,10 @@ class Alfred:
         PERISHABLE_ONLY_TOOLS = {"time", "weather"}
         episodes_saved = 0
         episode_path: Optional[str] = None
-        if any(t != "chat" for t in tools_called) and not set(tools_called) <= (
-            PERISHABLE_ONLY_TOOLS | {"chat"}
+        if (
+            any(t != "chat" for t in tools_called)
+            and not set(tools_called) <= (PERISHABLE_ONLY_TOOLS | {"chat"})
+            and not self._is_self_summary_query(task)
         ):
             try:
                 tools_used = ", ".join(tools_called)
