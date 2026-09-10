@@ -318,6 +318,38 @@ def test_untooled_approval_narration_detection_does_not_flag_questions_or_refusa
     assert not is_claim("I can't get your approval right now since the approval system isn't connected.")
 
 
+def test_intent_only_reply_with_no_tool_call_is_caught():
+    """Live-caught 2026-09-09: asked to reverse-engineer the codebase,
+    Alfred read a few files then replied "I'm going to keep reading the
+    rest" with no tool call attached -- the loop treated that as a
+    finished answer and stopped. This is a third, distinct shape from
+    the completion-claim and approval-narration cases: not a claim about
+    the past, a statement of future intent with nothing behind it."""
+    from brain.v2.conversation import Alfred
+    is_intent_only = Alfred.__dict__["_is_untooled_intent_only_reply"].__func__
+    assert is_intent_only("I'm going to read the files.")
+    assert is_intent_only("I'll now check the calendar.")
+    assert is_intent_only("Let me start by looking at the config.")
+    assert is_intent_only("Next, I'll dig into the auth module.")
+
+
+def test_intent_only_detection_ignores_long_replies_questions_and_refusals():
+    """Three false-positive guards this must respect: a long reply that
+    happens to open with intent language but then actually answers must
+    not be nudged into a needless retry loop; genuine questions and
+    honest refusals are never stalls either."""
+    from brain.v2.conversation import Alfred
+    is_intent_only = Alfred.__dict__["_is_untooled_intent_only_reply"].__func__
+    long_real_answer = (
+        "I'm going to explain how caching works here: a cache stores the result "
+        "of an expensive computation so a later request with the same input can "
+        "reuse it instead of recomputing from scratch, trading memory for time."
+    )
+    assert not is_intent_only(long_real_answer), "a long reply with real content must not be nudged"
+    assert not is_intent_only("Should I go ahead and read the config file?")
+    assert not is_intent_only("I can't read that file, it doesn't exist.")
+
+
 def test_public_api_exported():
     assert ConversationHistory is not None
     assert Message is not None
