@@ -4,6 +4,12 @@
 
 **Status**: Phase 1 (Sovereign Core) — In Development
 
+> **This is the one real, current repo.** Any other `alfred`/`project-alfred`
+> copy you find elsewhere on this machine (e.g. under `Ai-terminal-stuff` or
+> `_archive`) is stale — archived, not deleted, and not to be edited. This
+> exact confusion caused a real bug once already (the auto-start script
+> pointed at a stale duplicate and would have booted the wrong Alfred).
+
 ## 🚀 Quick Links
 
 - **[Quick Start Guide](SETUP.md)** — Get Alfred running in 5 minutes

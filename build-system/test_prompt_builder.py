@@ -95,8 +95,11 @@ def test_assemble_orders_sections_by_priority():
         assert text.index("ID-CORE") < text.index("RULE-ONE"), "identity precedes rules"
         assert text.index("RULE-ONE") < text.index("PROFILE-DATA"), "rules precede profile"
         assert text.index("PROFILE-DATA") < text.index("TOOL-CALC"), "profile precedes tools"
-        assert text.index("TOOL-CALC") < text.index("SKILL-TITLE"), "tools precede skills"
-        assert text.index("SKILL-TITLE") < text.index("MEMORY-SNIPPET"), "skills precede memory"
+        assert text.index("TOOL-CALC") < text.index("MEMORY-SNIPPET"), "tools precede memory"
+        assert text.index("MEMORY-SNIPPET") < text.index("SKILL-TITLE"), (
+            "memory precedes skills -- T3 episodic injection is a core Phase 1 "
+            "ask and ranks above the single-skill guidance section"
+        )
         assert isinstance(result, AssembledPrompt)
         assert result.tool_schemas == [ToolSchema(name="TOOL-CALC", description="d", parameters={"type": "object"})]
         assert result.memory_snippets == ["MEMORY-SNIPPET"]
@@ -125,6 +128,17 @@ def test_section_dropped_when_remaining_budget_too_small():
         )
         assert "I" * 200 in result.system
         assert "M" not in result.system, "memory dropped when truncation isn't worthwhile"
+        assert "memory" in result.dropped_sections, (
+            "a full drop must be reported, not just silently absent from "
+            "the text -- this is what lets a caller log that it happened"
+        )
+
+
+def test_dropped_sections_empty_when_everything_fits():
+    with no_tiktoken():
+        builder = PromptBuilder(token_budget=100_000)
+        result = builder.assemble(identity="I", memory=["M"])
+        assert result.dropped_sections == []
 
 
 def test_public_api_exported():
@@ -133,7 +147,7 @@ def test_public_api_exported():
     assert ToolSchema is not None
     assert AssembledPrompt is not None
     assert PRIO_IDENTITY == 1 and PRIO_RULES == 2 and PRIO_PROFILE == 3
-    assert PRIO_TOOLS == 4 and PRIO_SKILLS == 5 and PRIO_MEMORY == 6
+    assert PRIO_TOOLS == 4 and PRIO_MEMORY == 5 and PRIO_SKILLS == 6
 
 
 # ---------------------------------------------------------------------------

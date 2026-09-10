@@ -25,9 +25,34 @@ VALID_TOOLS: set = {
     "chat", "calculator", "calendar", "email", "web_search", "web_fetch",
     "shell", "read_file", "write_file", "list_directory", "glob",
     "screenshot", "gws", "open_app", "time", "remember",
-    "set_reminder", "list_reminders", "delete_reminder",
     "memory_save", "memory_search", "weather", "run_code",
 }
+
+def _parse_params(raw: Any) -> dict:
+    """Parse a step's params from markdown (a raw string) or an already-dict value.
+
+    Was a dead SkillManager staticmethod with zero callers — Skill.from_markdown()
+    stored params as an unparsed string instead of calling it, so any skill
+    reloaded from disk had unusable step params for direct execution. Module-level
+    since both Skill (a dataclass, no SkillManager access) and SkillManager need it.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        import ast
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
 
 STOP_WORDS: set = {
     "the", "a", "an", "is", "are", "do", "my", "for", "to",
@@ -124,8 +149,8 @@ class Skill:
                 elif ":" in line:
                     current_step["tool"] = line.split(":", 1)[1].strip()
             elif "**Params:**" in line or "Params:" in line:
-                params = line.split("`")[1] if "`" in line else "{}"
-                current_step["params"] = params
+                raw_params = line.split("`")[1] if "`" in line else "{}"
+                current_step["params"] = _parse_params(raw_params)
 
         if current_step:
             steps.append(current_step)
@@ -256,22 +281,7 @@ class SkillManager:
 
     @staticmethod
     def _parse_params(raw: Any) -> dict:
-        if isinstance(raw, dict):
-            return raw
-        if not isinstance(raw, str) or not raw.strip():
-            return {}
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        try:
-            import ast
-            parsed = ast.literal_eval(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-        return {}
+        return _parse_params(raw)
 
     def _is_low_quality_skill(self, skill: Skill) -> bool:
         if not skill.steps:
@@ -520,9 +530,23 @@ class SkillManager:
     def improve_skill(
         self, skill_id: str, improvement_note: str, new_steps: List[Dict] = None
     ) -> bool:
+        """Patch a skill's steps and persist the change to both disk and the
+        in-memory cache.
+
+        Previously wrote the improvement note to disk as a trailing log
+        section but never updated `skill.steps` or `self._skills_cache` --
+        the next time this same skill got matched and injected into a
+        prompt (`_build_system_prompt`), it still showed the old, wrong
+        steps, because the cached object was never touched. new_steps now
+        actually replaces the object's steps before regenerating markdown
+        from it, so disk and cache agree.
+        """
         skill = self._skills_cache.get(skill_id)
         if not skill:
             return False
+
+        if new_steps:
+            skill.steps = new_steps
 
         improvement_section = f"""
 
@@ -530,13 +554,9 @@ class SkillManager:
 **Updated:** {datetime.now().strftime("%Y-%m-%d %H:%M")}
 **Note:** {improvement_note}
 """
-        if new_steps:
-            improvement_section += "\n### Updated Steps:\n"
-            for step in new_steps:
-                improvement_section += f"- {step}\n"
-
         updated_content = skill.to_markdown() + improvement_section
         Path(skill.path).write_text(updated_content, encoding="utf-8")
+        self._skills_cache[skill_id] = skill
         return True
 
     def get_all_skills(self) -> List[Skill]:

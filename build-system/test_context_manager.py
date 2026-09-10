@@ -153,6 +153,171 @@ def test_compress_noop_under_budget():
         assert len(ch.messages) == 2
 
 
+def test_reply_shaped_tool_call_is_treated_as_a_reply():
+    """A reply the model dressed up as a tool call must not be dispatched.
+
+    There is no `reply` tool. Seen live: the model emitted
+    {"tool": "reply", "params": {...}}, the executor was handed a nonexistent
+    tool, the turn was wasted, and the loop spun to MAX_TURNS.
+    """
+    from brain.v2.conversation import Alfred
+    f = Alfred.__dict__["_reply_shaped_tool"].__func__
+
+    assert f({"tool": "reply", "params": {"message": "42"}}) == "42"
+    assert f({"tool": "respond", "params": {"text": "hi"}}) == "hi"
+    assert f({"tool": "final_answer", "params": "plain string"}) == "plain string"
+    assert f({"tool": "reply", "message": "top level"}) == "top level"
+
+    # Real tool calls must pass straight through untouched.
+    assert f({"tool": "calculator", "params": {"expression": "2+2"}}) is None
+    assert f({"tool": "time", "params": {}}) is None
+
+
+def test_tool_call_wins_over_narration_reply():
+    """A tool call must beat a reply when the model emits both.
+
+    The parser used to "prefer reply over tool call", which is backwards:
+    models narrate before acting ({"reply": "Let me calculate that"} then
+    {"tool": "calculator"}), and taking the narration meant the tool never ran
+    and the narration became the answer -- a direct path to a confident
+    ungrounded number.
+    """
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+    })
+    s = Stub()
+
+    both = '{"reply": "Let me work that out."} {"tool": "calculator", "params": {"expression": "47*tan(radians(35))"}}'
+    reply, tool, params = s._parse_llm_output(both)
+    assert tool == "calculator", f"tool must win over narration, got reply={reply!r}"
+    assert params == {"expression": "47*tan(radians(35))"}
+
+    # Order in the text must not matter.
+    reversed_order = '{"tool": "time", "params": {}} {"reply": "Checking the clock."}'
+    reply, tool, params = s._parse_llm_output(reversed_order)
+    assert tool == "time", f"tool must win regardless of order, got reply={reply!r}"
+
+    # A lone reply is still a reply.
+    reply, tool, params = s._parse_llm_output('{"reply": "The answer is 42."}')
+    assert reply == "The answer is 42." and tool is None
+
+
+def test_reply_is_not_truncated_at_500_chars():
+    """Long explanations must survive. A hard [:500] cut silently amputated
+    homework working mid-sentence."""
+    from brain.v2.conversation import Alfred
+    import json as _json
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+    })
+    long_answer = "Step one. " * 120  # ~1200 chars
+    raw = _json.dumps({"reply": long_answer})
+    reply, tool, params = Stub()._parse_llm_output(raw)
+    assert reply is not None
+    assert len(reply) > 500, f"reply was truncated to {len(reply)} chars"
+
+
+def test_truncated_json_salvages_partial_reply_instead_of_apologizing():
+    """Confirmed live 2026-08-31: a max_tokens cutoff mid-generation left an
+    unclosed {"reply": "..." with no closing quote/brace -- every real parse
+    path above fails on that, and it used to fall straight to a generic
+    "malformed response, ask again" that threw away real, if incomplete,
+    content the user could still read."""
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+        "_salvage_truncated_reply": Alfred.__dict__["_salvage_truncated_reply"],
+    })
+    truncated = '{"reply": "He chose chess as the test domain because it has an objective, measurable rating system'
+    reply, tool, params = Stub()._parse_llm_output(truncated)
+    assert tool is None
+    assert reply is not None
+    assert "chess as the test domain" in reply, f"real content was discarded: {reply!r}"
+    assert "malformed response" not in reply.lower()
+
+
+def test_truncated_json_too_short_to_salvage_still_apologizes():
+    """A cutoff with no real content yet (or none at all) has nothing worth
+    salvaging -- must still fall back to the honest apology, not a blank or
+    near-blank "answer"."""
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+        "_salvage_truncated_reply": Alfred.__dict__["_salvage_truncated_reply"],
+    })
+    reply, tool, params = Stub()._parse_llm_output('{"reply": "Sure')
+    assert tool is None
+    assert reply is not None
+    assert "malformed response" in reply.lower()
+
+
+def test_plain_prose_reply_with_no_json_wrapper_is_not_truncated_at_500():
+    """Confirmed live 2026-08-31: a long multi-tool research task's final
+    turn came back as plain markdown prose (no {"reply": ...} wrapper at
+    all), and the old hard text[:500] fallback slice cut a complete,
+    correct answer off mid-sentence -- unrelated to max_tokens, this was a
+    second, independent source of truncation on the exact same bug report."""
+    from brain.v2.conversation import Alfred
+    Stub = type("S", (), {
+        "_loads_lenient": Alfred.__dict__["_loads_lenient"],
+        "_parse_llm_output": Alfred.__dict__["_parse_llm_output"],
+        "_reply_shaped_tool": Alfred.__dict__["_reply_shaped_tool"],
+        "_extract_params": Alfred.__dict__["_extract_params"],
+        "_salvage_truncated_reply": Alfred.__dict__["_salvage_truncated_reply"],
+    })
+    long_prose = "Here's what I found. " * 60  # ~1300 chars, well past the old 500-char cut
+    reply, tool, params = Stub()._parse_llm_output(long_prose)
+    assert tool is None
+    assert reply is not None
+    assert len(reply) > 500, f"plain-prose reply was truncated to {len(reply)} chars"
+    assert reply.rstrip().endswith("found."), "should end where the source text ends, not mid-sentence"
+
+
+def test_untooled_approval_narration_is_caught_as_a_claim():
+    """Live-caught 2026-09-08 testing the MCP approval flow: a multi-turn
+    conversation (incomplete tool request -> Alfred asks a clarifying
+    question -> user answers) sometimes produced a reply narrating "I need
+    your approval before running X. Confirm and I'll proceed." WITHOUT
+    actually calling the tool -- so no real approval gate (awaiting_approval
+    + signature) ever fired. The user is left approving a request that
+    doesn't exist. This is the same defect class as the claims-done case
+    (_is_untooled_completion_claim already covers "has been saved" etc.)
+    just phrased as "about to act" instead of "already acted" -- must be
+    caught by the same detector so the existing nudge-and-retry fires."""
+    from brain.v2.conversation import Alfred
+    is_claim = Alfred.__dict__["_is_untooled_completion_claim"].__func__
+    assert is_claim("I need your approval before running memory__create_entities. Confirm and I'll proceed.")
+    assert is_claim("This requires your approval before I can continue.")
+    assert is_claim("Waiting for your confirmation to proceed.")
+    # A second live-caught paraphrase (trial 3 of the same 2026-09-08 repro
+    # run) that dodged the first phrase list entirely -- confirms this is
+    # genuinely open-ended paraphrasing, not a one-off wording.
+    assert is_claim("I still need your approval to create the entity. Confirm, and I'll create Trial3 as type \"test\".")
+
+
+def test_untooled_approval_narration_detection_does_not_flag_questions_or_refusals():
+    """The new approval-claim phrases must respect the same guards as the
+    existing completion-claim ones: a genuine clarifying question, or an
+    honest refusal, must never be nudged."""
+    from brain.v2.conversation import Alfred
+    is_claim = Alfred.__dict__["_is_untooled_completion_claim"].__func__
+    assert not is_claim("Do you want me to ask for your approval before running this?")
+    assert not is_claim("I can't get your approval right now since the approval system isn't connected.")
+
+
 def test_public_api_exported():
     assert ConversationHistory is not None
     assert Message is not None

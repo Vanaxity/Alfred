@@ -82,6 +82,9 @@ sessions/
 *.json.bak
 *.csv.bak
 
+# Test-run artifacts (regenerated on every run, not source)
+/phase1_results.json
+
 # Audio Files (voice pipeline)
 *.wav
 *.mp3
@@ -136,3 +139,12 @@ config.local.json
 
 # Generated documentation (if any)
 /site/
+
+# Live-suite run artifact (regenerated every run)
+/build-system/live_results.json
+
+# Isolated test vault for the live suite (regenerated every run, not source)
+/build-system/.test_vault/
+
+# Graphify codebase knowledge graph (regenerated via `graphify update .`, not source)
+/graphify-out/

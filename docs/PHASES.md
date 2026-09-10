@@ -78,71 +78,99 @@ These 4 gaps alone prevent true sovereignty. Phase 1 closes them.
 
 ### In Progress (Days 4-10) 🚀
 
-#### Day 4: ToolExecutor — Core Dispatch & Guardrails (STARTING NOW)
+#### Day 4/5: ToolExecutor — Guardrails, Self-Correcting Retry, Verification ✅
 
-**Objectives**:
-- [ ] Implement ToolResult dataclass (success, output, error, tool_name, metadata)
-- [ ] Build ToolExecutor class with:
-  - [ ] `register(name, handler, guardrails, validator, schema)`
-  - [ ] `register_legacy(name, tool_dict, handler)` for gradual migration
-  - [ ] `execute(tool_name, params, context)` → ToolResult
-  - [ ] Guardrail checks (allowed/deny patterns)
-  - [ ] Validation on result (custom validator or success check)
-  - [ ] One-retry on mutation-tool failure
-  - [ ] Mutation verification via `verify_mutation(tool_name)`
-- [ ] Define MUTATION_TOOLS set and VERIFY_MAP
-- [ ] Write unit tests (3-5 covering dispatch, guardrails, validation, verify)
-- [ ] Export ToolExecutor, ToolResult, Guardrails, create_tool_executor()
-- [ ] Add __main__ demo
+- [x] DONE (2026-08-17) — merged Day 4 and Day 5 into one unit.
 
-**Acceptance Criteria**:
-- All new tests pass (RED→GREEN)
-- Import from brain.v2 works cleanly
-- Guardrails block dangerous patterns
-- Verification workflow sketched (full wiring in Day 6)
+**What was actually found.** `brain/v2/tool_executor.py` was *not* a stub. It already
+contained a complete 976-line port of `alfred.py`'s dispatcher: all 23 tools
+implemented as `async def handle_*(params, ctx) -> ToolResult`, registered via
+`create_tool_executor()`, and already wired into `conversation.py`. Same pattern as
+Days 2-3 (module pre-existed but was unfinished). So the Day 5 "write thin async
+wrappers" work was already done, and the real work was closing the gaps between
+what existed and the requirements.
 
-**Deliverables**:
-- `brain/v2/tool_executor.py` (core implementation)
-- `build-system/test_tool_executor.py` (3-5 tests)
-- Updated `brain/v2/__init__.py` (new exports)
+**Gaps closed:**
+- [x] Guardrails were dead config — `Guardrails.require_approval`, `deny_patterns`,
+      and `allowed_patterns` existed on the dataclass but `execute()` only checked
+      `.allowed`. Now fully enforced via `check_guardrails()`.
+- [x] Populated `TOOL_GUARDRAILS` — `shell`, `run_code`, `open_app` require explicit
+      approval (granted via `context["approved_tools"]`), plus `_DESTRUCTIVE_PATTERNS`
+      as a deny-list backstop that holds *even when approval is granted*.
+- [x] Retry was a pointless same-params repeat. Replaced with LLM-driven param
+      correction: the tool's error is fed back to the router, which proposes corrected
+      params, up to `MAX_TOOL_ATTEMPTS` (3). Every attempt is recorded in
+      `metadata["attempts"]` so a final failure reports what was actually tried.
+      Corrected params are re-checked against guardrails so the LLM cannot talk its
+      way past a deny pattern across a retry.
+- [x] `VERIFY_MAP` covered only 4 of 8 mutation tools. Added `delete_reminder`,
+      `write_file`, `memory_save`; `run_code` is an explicit `NO_READBACK` exception
+      (re-running it to verify would repeat its side effects).
+- [x] Added a `carry` mechanism to `VERIFY_MAP` so read-back targets what was actually
+      written (`write_file` → `read_file` on the same path). This also fixed a silent
+      bug: `remember`'s verification called `memory_search` with no `query`, which that
+      handler rejects outright — so that verification had never once worked.
+- [x] Mutation detection was coarse — `calendar`/`email` counted as mutations even for
+      read actions (`agenda`, `triage`). Now action-aware via `is_mutation()`.
+- [x] `_run_once()` guards against a handler returning a non-`ToolResult`.
+- [x] Exported the ToolExecutor API from `brain/v2/__init__.py` (was unreachable except
+      by direct submodule import).
+- [x] `build-system/test_tool_executor.py` — **33/33 passing**, verified non-vacuous
+      against the pre-fix implementations.
+- [x] Added `__main__` demo block.
 
----
+**Suite results after this work:**
 
-#### Day 5: ToolExecutor — Wire in Tool Handlers
+| Suite | Before | After |
+|---|---|---|
+| test_prompt_builder | 6/6 | 6/6 |
+| test_context_manager | 10/10 | 10/10 |
+| test_llm_router | 7/7 | 7/7 |
+| test_tool_executor | *(did not exist)* | **33/33** |
+| phase1_d1d2 | 10/13 | **10/11 (91%)** |
+| phase1_cockpit | 13/20 + 1 ERROR | **19/20 (84%, Grade B)** |
 
-**Objectives**:
-For each tool needed by test suite (time, calculator, calendar, email, web_search, shell, read_file, write_file, memory_save, memory_search, set_reminder, list_reminders, delete_reminder):
-- [ ] Write thin async wrapper calling existing implementation
-- [ ] Register via `create_tool_executor()` with guardrails
-- [ ] Add schema and description
+Remaining failures are both pre-existing data gaps, not code defects: d1d2 B11 needs a
+populated neural-memory index (`neural_memories.json` is absent from both the old and
+new repo), and cockpit T07 needs Master Sam's own email address in the T4 profile —
+Alfred currently asks for it rather than guessing, which is arguably correct.
 
-**Key Tools**:
-1. `time` — Get current date/time
-2. `calculator` — Safe math expressions
-3. `calendar` — Query/create Google Calendar events
-4. `email` — Send/read/triage Gmail
-5. `web_search` — Query web
-6. `web_fetch` — Read URL content
-7. `shell` — Run PowerShell commands
-8. `read_file` — Read file content
-9. `write_file` — Write to file
-10. `list_directory` — List directory
-11. `memory_save` — Save to T3/T4/T5
-12. `memory_search` — Query memory
-13. `set_reminder` — Create reminder
-14. `list_reminders` — List pending
-15. `delete_reminder` — Delete reminder
+⚠️ `shell`, `run_code`, and `open_app` now require approval via
+`context["approved_tools"]`, and nothing grants it yet — so those three are effectively
+unusable until Day 6 wires the approval prompt. Neither test suite exercises them, so
+this is invisible to the suites but would be visible to a user.
 
-**Acceptance Criteria**:
-- All handlers registered in create_tool_executor()
-- Sanity tests for time, calculator pass
-- No import errors
-- Existing tool implementations wrapped correctly
+**Security fixes** (found while reading the code, scoped to the active v2 path only):
+- [x] `glob` had *zero* path-safety gating while its sibling file tools all had it —
+      `C:/Windows/**/*` was enumerable. Now gated, with results filtered too (relative
+      patterns and symlinks can escape even a safe-looking pattern).
+- [x] `open_app` shell-injected: `subprocess.Popen([exe], shell=True)` with `exe`
+      falling back to the raw user string, so `"notepad & del *.*"` reached `cmd.exe`
+      verbatim. Now resolves via `shutil.which()` with `shell=False` and refuses
+      metacharacters.
+- [x] `_is_safe_path` used `str.startswith()` with no separator boundary, so
+      `C:\Users\<u>_evil\secret.txt` passed as inside the home directory. Confirmed
+      exploitable against the old code, now uses `Path.is_relative_to()`.
 
-**Deliverables**:
-- `brain/v2/tool_executor.py` (updated with all handlers)
-- `build-system/test_tool_executor.py` (sanity tests)
-- Updated `brain/v2/conversation.py` (_get_tool_descriptions uses executor)
+**Bonus fix — the entire LLM provider chain was dead:**
+- [x] Groq (priority 1, *primary*): `llama-3.1-8b-instant` → `model_not_found`.
+      Replaced with `openai/gpt-oss-120b` + `reasoning_effort="low"`. The flag is
+      load-bearing: without it the model burns its whole budget on reasoning and
+      returns empty content, or attempts native tool-calling and 400s.
+      Benchmarked 0.65s avg, 10/10 correct on Alfred's JSON protocol.
+- [x] Gemini (priority 3): `gemini-2.0-flash` absent from the model list.
+      Replaced with `gemini-2.5-flash`.
+- [x] OpenRouter (priority 2): alive but leaked `<think>` reasoning into `content`.
+      Added `strip_reasoning()` applied to all provider return paths.
+- [x] Latent bug: `_probe_provider` used `max_tokens=1`, which always yields empty
+      content on a reasoning model — so once the Groq breaker opened it could never
+      recover. Probe now tolerates an empty completion as proof of reachability.
+
+**Deferred:** `handle_calendar` dropped the duplicate-time-slot ambiguity detection
+that `alfred.py:1748-1760` has. UX regression, not a correctness bug — revisit in Day 6.
+
+**Deliverables**: `brain/v2/tool_executor.py`, `brain/llm_router.py`,
+`brain/v2/__init__.py`, `brain/v2/conversation.py`, `build-system/test_tool_executor.py`
 
 ---
 

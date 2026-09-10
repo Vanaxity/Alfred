@@ -4,12 +4,13 @@ Thread-safe singleton wrapper around google-api-python-client.
 Replaces brittle gws CLI with native Python API calls.
 """
 
+import json
 import logging
 import threading
 import base64
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Set
 from email.message import EmailMessage
 
 from google.auth.transport.requests import Request
@@ -65,7 +66,19 @@ def save_token(creds: Credentials):
 
 
 def get_auth_url(scopes: List[str] = None) -> str:
-    """Get OAuth authorization URL for headless auth flow."""
+    """Get OAuth authorization URL for headless auth flow.
+
+    BROKEN as of 2026-08: Google now rejects the out-of-band redirect_uri
+    ("urn:ietf:wg:oauth:2.0:oob") with "OOB flow has been blocked" -
+    confirmed live this session. Re-auth was completed instead via
+    InstalledAppFlow.run_local_server(), which needs no registered
+    redirect_uri and does the full flow in one blocking call, so it doesn't
+    fit this function's two-step "return a URL, accept a code later" shape.
+    Whatever calls get_auth_url/exchange_code (brain_api/server.py imports
+    both) will hit the same wall. Left as-is rather than redesigned here:
+    a real fix needs a redirect URI registered in Cloud Console and a
+    decision about what the cockpit's reconnect UX should look like.
+    """
     if scopes is None:
         scopes = ALL_SCOPES
     if not CREDS_FILE.exists():
@@ -94,17 +107,49 @@ def exchange_code(authorization_code: str, scopes: List[str] = None) -> dict:
     }
 
 
+def _get_granted_scopes_from_file() -> Optional[Set[str]]:
+    """Read the scopes ACTUALLY granted, straight from the token file's own
+    stored data.
+
+    Credentials.from_authorized_user_file(path, scopes) sets creds.scopes to
+    whatever `scopes` list you pass in, not what the token was really issued
+    with -- confirmed live: a token granted with only calendar access still
+    reported all 5 requested scopes as present via creds.scopes, and the
+    gap only surfaced as a runtime 403 on the first Gmail call. Reading the
+    raw file bypasses that.
+    """
+    if not TOKEN_FILE.exists():
+        return None
+    try:
+        with open(TOKEN_FILE, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    raw = data.get("scopes", data.get("scope"))
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return set(raw.split())
+    return set(raw)
+
+
 def get_token_status() -> dict:
     """Check current token status without triggering auth flow."""
     if not TOKEN_FILE.exists():
         return {"authenticated": False, "reason": "no_token_file"}
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), ALL_SCOPES)
+        # scopes=None -> creds.scopes comes from the file's own "scopes" key
+        # (the real grant), not an echo of whatever we pass in. Passing
+        # ALL_SCOPES here previously masked exactly the drift this function
+        # exists to detect.
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE))
+        granted = _get_granted_scopes_from_file()
         return {
             "authenticated": creds.valid,
             "expired": creds.expired if creds.expired is not None else False,
             "has_refresh_token": bool(creds.refresh_token),
-            "scopes": list(creds.scopes) if creds.scopes else [],
+            "scopes": sorted(granted) if granted is not None else (list(creds.scopes) if creds.scopes else []),
+            "missing_scopes": sorted(set(ALL_SCOPES) - granted) if granted is not None else [],
             "expiry": creds.expiry.isoformat() if creds.expiry else None,
         }
     except Exception as e:
@@ -118,21 +163,34 @@ def _get_credentials(scopes: List[str]) -> Credentials:
 
     if TOKEN_FILE.exists():
         try:
-            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), scopes)
+            # scopes=None (not the caller's `scopes` arg) -- see comment in
+            # get_token_status(). Passing a caller-supplied scope subset here
+            # (e.g. SCOPE_MAP["calendar"], just 2 scopes) made creds.scopes
+            # echo that narrower set; refreshing THIS credential and saving
+            # it then persisted the narrower set back to token.json, silently
+            # downgrading a full 5-scope grant to 2 -- confirmed live: this
+            # exact drift happened during today's session between two
+            # verification passes, dropping gmail/drive access that had
+            # already been granted and tested working.
+            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE))
         except Exception as e:
             logger.warning(f"Failed to load token: {e}")
             creds = None
 
-    # ALSO check if token has the right scopes (not just valid/expired)
+    # ALSO check if token has the right scopes (not just valid/expired).
+    # Reads the raw file rather than creds.scopes -- see
+    # _get_granted_scopes_from_file() for why creds.scopes can't be trusted
+    # for this check.
     missing_scopes = False
-    if creds and creds.scopes:
-        token_scopes = set(creds.scopes)
-        required = set(scopes)
-        if not required.issubset(token_scopes):
-            missing_scopes = True
-            logger.warning(
-                f"Token missing scopes. Has: {token_scopes}, Needs: {required}"
-            )
+    if creds:
+        granted = _get_granted_scopes_from_file()
+        if granted is not None:
+            required = set(scopes)
+            if not required.issubset(granted):
+                missing_scopes = True
+                logger.warning(
+                    f"Token missing scopes. Has: {granted}, Needs: {required}"
+                )
 
     if not creds or not creds.valid or missing_scopes:
         if creds and creds.refresh_token and not missing_scopes:
@@ -146,8 +204,11 @@ def _get_credentials(scopes: List[str]) -> Credentials:
                 logger.error(f"Unexpected refresh error: {e}")
                 creds = None
 
-        if not creds or not creds.valid:
-            # Fresh re-auth with the exact scopes needed
+        if not creds or not creds.valid or missing_scopes:
+            # Fresh re-auth with the exact scopes needed. missing_scopes is
+            # checked here too -- a currently-valid-but-under-scoped token
+            # would otherwise sail past this guard and get returned anyway,
+            # only to 403 on the actual API call.
             auth_url = get_auth_url(scopes)
             raise AuthRequiredError(
                 "GWS authentication required with scopes: " + ", ".join(scopes),
@@ -343,6 +404,54 @@ class GWSClient:
             return f"Event deleted: {event_id}"
         except Exception as e:
             return self._handle_api_error(e, "delete_event")
+
+    def delete_event_by_query(self, query: str, days: int = 14) -> str:
+        """Find an event by summary substring and delete it.
+
+        The model never sees Google's internal event IDs (get_agenda doesn't
+        expose them), so deletion has to go by name. Refuses to guess when
+        the name matches more than one upcoming event rather than deleting
+        all of them.
+        """
+        try:
+            service = self._get_calendar_service()
+            now = datetime.now(timezone.utc).isoformat()
+            later = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+            events_result = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=now,
+                    timeMax=later,
+                    maxResults=50,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            events = events_result.get("items", [])
+            q = query.strip().lower()
+            matches = [e for e in events if q in e.get("summary", "").lower()]
+
+            if not matches:
+                return f"No event found matching '{query}' in the next {days} days."
+
+            if len(matches) > 1:
+                lines = [f"{len(matches)} events match '{query}' — say which one by date instead of the name:"]
+                for e in matches:
+                    start = e.get("start", {})
+                    when = start.get("dateTime", start.get("date", "TBD"))
+                    lines.append(f"  - {e.get('summary', 'No title')} ({when[:16]})")
+                return "\n".join(lines)
+
+            event = matches[0]
+            service.events().delete(calendarId="primary", eventId=event["id"]).execute()
+            start = event.get("start", {})
+            when = start.get("dateTime", start.get("date", "TBD"))
+            return f"Event deleted: {event.get('summary', 'No title')} ({when[:16]})"
+        except Exception as e:
+            return self._handle_api_error(e, "delete_event_by_query")
 
     # ============ GMAIL ============
 

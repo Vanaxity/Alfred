@@ -1,7 +1,8 @@
 import asyncio
+import re
 import time
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
@@ -28,6 +29,9 @@ class Provider:
     timeout: Optional[float] = None
     min_timeout: float = 5.0
     ema_latency_ms: float = 0.0
+    # Provider-specific request params merged into the completion call
+    # (e.g. reasoning_effort, which only Groq's gpt-oss models accept).
+    extra_params: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.timeout is None:
@@ -76,6 +80,33 @@ class LLMResponse:
     error: Optional[str] = None
 
 
+# Reasoning models (qwen, nemotron, deepseek-style) wrap their scratchpad in
+# tags and leave it in `content`. Alfred expects strict JSON, so strip it.
+_REASONING_BLOCK = re.compile(
+    r"<(think|thinking|reasoning|thought)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_REASONING_UNCLOSED = re.compile(
+    r"<(think|thinking|reasoning|thought)\b[^>]*>.*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_reasoning(content: Optional[str]) -> str:
+    """Remove tag-delimited reasoning blocks from an LLM completion.
+
+    Undelimited reasoning prose is left alone — the JSON brace-scanner in
+    conversation.py already skips past leading prose to find the object.
+    """
+    if not content:
+        return ""
+    cleaned = _REASONING_BLOCK.sub("", content)
+    # A truncated completion can leave an opening tag with no closer; anything
+    # after it is reasoning that never reached an answer.
+    cleaned = _REASONING_UNCLOSED.sub("", cleaned)
+    return cleaned.strip()
+
+
 class LLMRouter:
     def __init__(self, groq_key: str, gemini_key: str, openrouter_key: str):
         self.providers: List[Provider] = []
@@ -83,20 +114,34 @@ class LLMRouter:
         self._last_used: Optional[str] = None
 
         if openrouter_key:
+            # openrouter/auto classifies each prompt into a task type and
+            # routes to whatever model the OpenRouter community is currently
+            # spending on for that category (no markup over the selected
+            # model's own price). Primary provider during Phase 1 live
+            # testing for reliability -- Groq's gpt-oss-120b was producing
+            # frequent timeouts and tool_choice conflicts as primary. If
+            # auto-router ever selects a similarly tool-call-eager model,
+            # _is_tool_choice_conflict() below already handles that
+            # generically regardless of which provider triggers it.
             self.providers.append(Provider(
-                "openrouter", "nvidia/nemotron-3-super-120b-a12b:free",
+                "openrouter", "openrouter/auto",
                 OpenAI(api_key=openrouter_key, base_url="https://openrouter.ai/api/v1", timeout=30.0),
-                2, openrouter_key, base_timeout=20.0
+                1, openrouter_key, base_timeout=20.0
             ))
         if groq_key:
+            # gpt-oss is a reasoning model: without reasoning_effort="low" it
+            # spends the whole token budget on reasoning and returns empty
+            # content, or tries native tool-calling and 400s (Alfred's protocol
+            # is JSON-in-text, so no `tools` array is ever sent).
             self.providers.append(Provider(
-                "groq", "llama-3.1-8b-instant",
-                Groq(api_key=groq_key, timeout=15.0), 1, groq_key,
-                base_timeout=10.0
+                "groq", "openai/gpt-oss-120b",
+                Groq(api_key=groq_key, timeout=15.0), 2, groq_key,
+                base_timeout=10.0,
+                extra_params={"reasoning_effort": "low"},
             ))
         if gemini_key:
             self.providers.append(Provider(
-                "gemini", "gemini-2.0-flash",
+                "gemini", "gemini-2.5-flash",
                 genai.Client(api_key=gemini_key), 3, gemini_key,
                 base_timeout=20.0
             ))
@@ -108,6 +153,20 @@ class LLMRouter:
     def _is_rate_limit(self, error: Exception) -> bool:
         s = str(error).lower()
         return any(x in s for x in ["429", "rate limit", "too many requests"])
+
+    def _is_tool_choice_conflict(self, error: Exception) -> bool:
+        """Groq's gpt-oss-120b is natively tool-call-trained; Alfred's protocol
+        is JSON-in-text and never sends a `tools` array, but the model
+        sometimes attempts a native tool call anyway. Groq's serving layer
+        400s that as 'Tool choice is none, but model called a tool' (error
+        code tool_use_failed) -- a per-request quirk of this one model's
+        decoding, not a malformed request. Must be checked before
+        _is_terminal(), which matches "400" as a substring and would
+        otherwise set stop_all and skip OpenRouter/Gemini entirely even
+        though neither of them can hit this Groq/gpt-oss-specific failure.
+        """
+        s = str(error).lower()
+        return "tool choice is none" in s or "tool_use_failed" in s
 
     def _is_terminal(self, error: Exception) -> bool:
         s = str(error).lower()
@@ -210,6 +269,13 @@ class LLMRouter:
                         if not fallback_used:
                             fallback_used, fallback_reason = True, reason
                         break
+                    if self._is_tool_choice_conflict(e):
+                        reason = f"tool_choice conflict: {str(e)[:80]}"
+                        breaker.record_failure(reason)
+                        print(f"[LLMRouter] {provider.name} failed: {reason}, trying next...", flush=True)
+                        if not fallback_used:
+                            fallback_used, fallback_reason = True, reason
+                        break
                     if self._is_terminal(e):
                         reason = f"terminal error: {str(e)[:100]}"
                         print(f"[LLMRouter] {provider.name} terminal error: {str(e)[:100]}", flush=True)
@@ -249,10 +315,17 @@ class LLMRouter:
         """Cheap connectivity check used only when a breaker is HALF_OPEN."""
         try:
             await self._execute_provider(
-                provider, "ping", "ping", None, 1, 0.0,
+                provider, "ping", "ping", None, 16, 0.0,
                 timeout=3.0, record_latency=False,
             )
             return True
+        except ValueError as e:
+            # An empty completion still proves the endpoint is reachable, which
+            # is all a connectivity probe needs to know. Reasoning models often
+            # return empty content at a tiny max_tokens because the reasoning
+            # pass consumes the whole budget — that must not wedge the breaker
+            # permanently in HALF_OPEN.
+            return "empty response" in str(e).lower()
         except Exception:
             return False
 
@@ -283,7 +356,10 @@ class LLMRouter:
             for msg in messages:
                 role = "user" if msg["role"] == "user" else "model"
                 contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
-            contents.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
+            # Deliberately NOT re-appending user_message here — see the note in
+            # _call_openai_compatible. `messages` already ends with the latest
+            # turn; repeating the original question after a tool result buries
+            # the result and biases the model toward answering from scratch.
             response = provider.client.models.generate_content(
                 model=provider.model, contents=contents,
                 config=types.GenerateContentConfig(
@@ -299,9 +375,10 @@ class LLMRouter:
                     max_output_tokens=max_tokens, temperature=temperature,
                 ),
             )
-        if not response.text or not response.text.strip():
+        text = strip_reasoning(response.text)
+        if not text:
             raise ValueError("Gemini returned empty response")
-        return response.text
+        return text
 
     def _call_openai_compatible(
         self, provider: Provider, system_prompt: str, user_message: str,
@@ -311,13 +388,22 @@ class LLMRouter:
         if messages:
             for msg in messages:
                 msg_list.append({"role": msg["role"], "content": msg["content"]})
-        msg_list.append({"role": "user", "content": user_message})
+        else:
+            # Only when there's no history. `messages` already ends with the
+            # latest turn (a tool result, mid-loop), and appending the original
+            # question after it made the LAST thing the model saw on every
+            # single turn be "answer this question" rather than "here is the
+            # result you asked for" -- pushing it to answer directly instead of
+            # using what the tool just returned.
+            msg_list.append({"role": "user", "content": user_message})
 
         response = provider.client.chat.completions.create(
             model=provider.model, messages=msg_list,
             max_tokens=max_tokens, temperature=temperature,
+            **provider.extra_params,
         )
         content = response.choices[0].message.content
+        content = strip_reasoning(content)
         if not content or not content.strip():
             raise ValueError("LLM returned empty response")
         return content
@@ -327,7 +413,7 @@ async def test_router():
     import os
     router = LLMRouter(
         groq_key=os.getenv("GROQ_API_KEY", ""),
-        gemini_key=os.getenv("GEMINI_API_KEY", ""),
+        gemini_key=os.getenv("GOOGLE_API_KEY", ""),
         openrouter_key=os.getenv("OPENROUTER_API_KEY", ""),
     )
     response = await router.call(
