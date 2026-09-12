@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 # Add parent to path
@@ -332,6 +332,119 @@ async def api_command(data: Dict):
     }
 
 
+@app.post("/api/command/stream")
+async def api_command_stream(data: Dict):
+    """SSE variant of /api/command -- Phase A item 3 (ROADMAP.md): the
+    turn-by-turn trace used to only reach a caller as one blob at the very
+    end. This streams each `thinking` line the moment Alfred.execute()
+    produces it, then a final event carrying the same payload /api/command
+    returns. Same request shape as /api/command; POST (not a native
+    EventSource, which is GET-only) so a plain `fetch()` or terminal client
+    can consume it -- the cockpit's own GET/EventSource wiring is Phase C
+    work, not this."""
+    message = data.get("command", data.get("message", ""))
+    session_id = data.get("session_id")
+    approved_actions = data.get("approved_actions")
+    return StreamingResponse(
+        stream_chat(message, session_id, approved_actions),
+        media_type="text/event-stream",
+    )
+
+
+def _persist_turn_result(db, session_id: Optional[str], user_message: str, response_text: str) -> None:
+    """Everything process_chat used to do inline after a turn finished:
+    persist the assistant reply, roll the session summary forward, and
+    name a freshly-created session from its first message. Pulled out so
+    process_chat and stream_chat (Phase A item 3) can't drift apart on
+    what "after a turn" means -- both call this with the same arguments."""
+    if not session_id:
+        return
+    db.add_message(session_id, "assistant", response_text)
+    try:
+        session = db.get_session(session_id)
+        if session:
+            prev_summary = session.get("summary", "")
+            new_entry = f"User: {user_message[:200]}\nAlfred: {response_text[:500]}"
+            updated = f"{prev_summary}\n\n{new_entry}" if prev_summary else new_entry
+            if len(updated) > 2000:
+                updated = updated[-2000:]
+            db.update_session(session_id, summary=updated)
+
+            # Name the session after the FIRST thing the user said, set
+            # once and then left alone -- a title that keeps changing to
+            # the latest message makes the sidebar useless for finding
+            # an old conversation.
+            if not (session.get("session_name") or "").strip():
+                title = " ".join(user_message.split())[:60]
+                if len(" ".join(user_message.split())) > 60:
+                    title = title.rstrip() + "..."
+                if title:
+                    db.update_session(session_id, session_name=title)
+
+            db.touch_session(session_id)
+    except Exception:
+        pass
+
+
+async def stream_chat(
+    user_message: str,
+    session_id: Optional[str] = None,
+    approved_actions: Optional[List[str]] = None,
+):
+    """Async generator behind /api/command/stream. Yields SSE lines
+    (`data: <json>\\n\\n`) as Alfred.execute()'s on_event fires -- one per
+    `thinking` line, then one `{"type": "final", ...}` carrying exactly
+    what /api/command returns in its body today. `{"type": "error", ...}`
+    only fires if execute() raises before ever reaching its own final
+    event -- item 4's try/except around the turn loop means that should be
+    rare, but a streaming response can't fall back to a normal exception
+    handler the way process_chat's try/except does, so this is the
+    equivalent safety net for this path specifically.
+
+    Bridges Alfred.execute()'s callback-style on_event onto an async
+    generator via an asyncio.Queue: execute() runs as a background task
+    pushing events into the queue; this generator drains the queue and
+    yields as each one arrives, so a slow turn's early events reach the
+    client immediately instead of waiting for the whole request to finish.
+    """
+    alfred = get_alfred()
+    db = get_local_db()
+
+    history = db.get_recent_context(session_id, count=20) if session_id else []
+    if session_id:
+        db.add_message(session_id, "user", user_message)
+    context = {"session_id": session_id, "conversation_history": history} if session_id else {"conversation_history": []}
+    if approved_actions:
+        context["approved_actions"] = approved_actions
+
+    queue: asyncio.Queue = asyncio.Queue()
+    _SENTINEL = object()
+
+    async def on_event(evt: Dict) -> None:
+        await queue.put(evt)
+
+    async def run_turn() -> None:
+        try:
+            await alfred.execute(user_message, context, on_event=on_event)
+        except Exception as e:
+            await queue.put({"type": "error", "message": str(e)})
+        finally:
+            await queue.put(_SENTINEL)
+
+    task = asyncio.create_task(run_turn())
+    try:
+        while True:
+            evt = await queue.get()
+            if evt is _SENTINEL:
+                break
+            yield f"data: {json.dumps(evt)}\n\n"
+            if evt.get("type") == "final":
+                _persist_turn_result(db, session_id, user_message, evt.get("response", "Done."))
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 async def process_chat(
     user_message: str,
     session_id: Optional[str] = None,
@@ -353,39 +466,7 @@ async def process_chat(
         result = await alfred.execute(user_message, context)
         response_text = result.get("response", "Done.")
 
-        # Persist assistant response
-        if session_id:
-            db.add_message(session_id, "assistant", response_text)
-
-        # Auto-update session summary
-        if session_id:
-            try:
-                session = db.get_session(session_id)
-                if session:
-                    prev_summary = session.get("summary", "")
-                    new_entry = f"User: {user_message[:200]}\nAlfred: {response_text[:500]}"
-                    if prev_summary:
-                        updated = f"{prev_summary}\n\n{new_entry}"
-                    else:
-                        updated = new_entry
-                    if len(updated) > 2000:
-                        updated = updated[-2000:]
-                    db.update_session(session_id, summary=updated)
-
-                    # Name the session after the FIRST thing the user said, set
-                    # once and then left alone -- a title that keeps changing to
-                    # the latest message makes the sidebar useless for finding
-                    # an old conversation.
-                    if not (session.get("session_name") or "").strip():
-                        title = " ".join(user_message.split())[:60]
-                        if len(" ".join(user_message.split())) > 60:
-                            title = title.rstrip() + "..."
-                        if title:
-                            db.update_session(session_id, session_name=title)
-
-                    db.touch_session(session_id)
-            except Exception:
-                pass
+        _persist_turn_result(db, session_id, user_message, response_text)
 
         return ChatResponse(
             response=response_text,

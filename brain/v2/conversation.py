@@ -19,7 +19,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -858,7 +858,12 @@ class Alfred:
     # Main execute loop
     # ------------------------------------------------------------------
 
-    async def execute(self, task: str, context: Optional[Dict] = None) -> Dict[str, Any]:
+    async def execute(
+        self,
+        task: str,
+        context: Optional[Dict] = None,
+        on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
         """
         Execute a task through the Hermes-inspired conversation loop.
 
@@ -869,10 +874,24 @@ class Alfred:
             4. If tool call → execute → add result → compress if needed.
             5. If reply → return.
             6. Max turns = 10.
+
+        `on_event`, if given, is awaited with `{"type": "thinking", "text":
+        line}` for every line as it's added to `thinking` -- Phase A item 3
+        (ROADMAP.md): the trace used to only reach a caller as one blob at
+        the very end. One more call, `{"type": "final", **result}`, fires
+        right before returning. Every existing caller passes no on_event at
+        all, so `_emit` degrades to a plain `thinking.append` and behavior
+        is unchanged -- this is purely additive.
         """
         overall_start = time.perf_counter()
         timings: Dict[str, float] = {}
         thinking: List[str] = []
+
+        async def _emit(line: str) -> None:
+            thinking.append(line)
+            if on_event is not None:
+                await on_event({"type": "thinking", "text": line})
+
         history = context.get("conversation_history", []) if context else []
 
         # Build context for tool handlers
@@ -971,7 +990,7 @@ class Alfred:
                 system, dropped_sections = self._build_system_prompt(memory_snippets, matched_skill)
                 timings["prompt_build_ms"] = timings.get("prompt_build_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
                 if "memory" in dropped_sections and not memory_drop_logged:
-                    thinking.append(
+                    await _emit(
                         "  Memory dropped from prompt (token budget too tight to fit it)"
                     )
                     memory_drop_logged = True
@@ -1003,7 +1022,7 @@ class Alfred:
                     note = f"[LLM provider={resp.provider}"
                     if resp.fallback_used:
                         note += f", fallback={resp.fallback_reason or 'unknown'}"
-                    thinking.append(note + "]")
+                    await _emit(note + "]")
                 raw = (resp.text or "").strip()
 
                 # The router signals "every provider is down" by returning
@@ -1015,7 +1034,7 @@ class Alfred:
                 router_error = getattr(resp, "error", None)
                 if resp.text is None and router_error:
                     reason = resp.fallback_reason or router_error
-                    thinking.append(f"[Turn {turn + 1}] LLM router failed: {reason}")
+                    await _emit(f"[Turn {turn + 1}] LLM router failed: {reason}")
                     final_reply = (
                         f"I couldn't reach the language model to work on this "
                         f"({reason}). Nothing ran -- give it a moment and try "
@@ -1049,7 +1068,7 @@ class Alfred:
                             and self._is_untooled_completion_claim(reply)
                         ):
                             completion_claim_nudge_used = True
-                            thinking.append(
+                            await _emit(
                                 f"[Turn {turn + 1}] Completion-claim reply with no tool call — nudging"
                             )
                             conv.add_user(
@@ -1073,7 +1092,7 @@ class Alfred:
                             # loop treated that as a finished answer and stopped --
                             # exactly what a multi-step task must never do.
                             intent_only_nudge_used = True
-                            thinking.append(
+                            await _emit(
                                 f"[Turn {turn + 1}] Stated intent with no tool call — nudging"
                             )
                             conv.add_user(
@@ -1094,7 +1113,7 @@ class Alfred:
                             fabricated = claimed - grounded
                             if fabricated:
                                 time_mismatch_nudge_used = True
-                                thinking.append(
+                                await _emit(
                                     f"[Turn {turn + 1}] Reply states a time {fabricated} the "
                                     "time tool never returned — nudging"
                                 )
@@ -1109,16 +1128,16 @@ class Alfred:
                                 )
                                 continue
                         final_reply = reply
-                        thinking.append(f"[Turn {turn + 1}] Reply: {reply[:80]}")
+                        await _emit(f"[Turn {turn + 1}] Reply: {reply[:80]}")
                         break
                     # Empty reply — nudge LLM
-                    thinking.append(f"[Turn {turn + 1}] Empty reply, retrying")
+                    await _emit(f"[Turn {turn + 1}] Empty reply, retrying")
                     conv.add_user(f"You replied with an empty message. Task: {task}. Respond properly.")
                     continue
 
                 if tool_name is None:
                     final_reply = "I'm not sure how to handle that."
-                    thinking.append(f"[Turn {turn + 1}] Unparseable: {raw[:60]}")
+                    await _emit(f"[Turn {turn + 1}] Unparseable: {raw[:60]}")
                     break
 
                 # --- Break out of repeat loops ---
@@ -1129,7 +1148,7 @@ class Alfred:
                 call_sig = f"{tool_name}:{json.dumps(tool_params, sort_keys=True, default=str)}"
                 repeats[call_sig] = repeats.get(call_sig, 0) + 1
                 if repeats[call_sig] > 2:
-                    thinking.append(f"[Turn {turn + 1}] Aborting repeat of {tool_name}")
+                    await _emit(f"[Turn {turn + 1}] Aborting repeat of {tool_name}")
                     conv.add_user(
                         f"You have already called {tool_name} with those exact arguments "
                         f"{repeats[call_sig] - 1} times and got the same result. Do not call "
@@ -1146,7 +1165,7 @@ class Alfred:
                 # the tool description alone didn't stop it, so refuse the call
                 # outright instead of just asking nicely.
                 if tool_name in ("web_search", "web_fetch") and weather_tool_output is not None:
-                    thinking.append(
+                    await _emit(
                         f"[Turn {turn + 1}] Blocking redundant {tool_name} after weather succeeded"
                     )
                     conv.add_user(
@@ -1157,7 +1176,7 @@ class Alfred:
                     continue
 
                 # --- Execute tool ---
-                thinking.append(f"[Turn {turn + 1}] Tool: {tool_name}")
+                await _emit(f"[Turn {turn + 1}] Tool: {tool_name}")
                 _t0 = time.perf_counter()
                 result = await self._tool_executor.execute(tool_name, tool_params, tool_ctx)
                 timings["tool_execution_ms"] = timings.get("tool_execution_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
@@ -1178,9 +1197,9 @@ class Alfred:
                     weather_tool_output = str(output)
 
                 if is_error:
-                    thinking.append(f"  X {tool_name}: {str(output)[:300]}")
+                    await _emit(f"  X {tool_name}: {str(output)[:300]}")
                 else:
-                    thinking.append(f"  OK ({len(str(output))} chars)")
+                    await _emit(f"  OK ({len(str(output))} chars)")
 
                 # --- Add tool result to conversation ---
                 result_dict = result.to_dict()
@@ -1202,7 +1221,7 @@ class Alfred:
                         f"I need your approval before running {tool_name}. "
                         "Confirm and I'll proceed."
                     )
-                    thinking.append(f"  Awaiting approval: {tool_name}")
+                    await _emit(f"  Awaiting approval: {tool_name}")
                     break
 
                 # --- Mutation verification ---
@@ -1220,14 +1239,14 @@ class Alfred:
                             f"{tool_name}_verify",
                             {"verification": str(verify_output)[:500]},
                         )
-                        thinking.append(f"  Verified: {tool_name}")
+                        await _emit(f"  Verified: {tool_name}")
 
                 # --- Compress if needed ---
                 _t0 = time.perf_counter()
                 compressed = conv.compress_if_needed()
                 timings["compression_ms"] = timings.get("compression_ms", 0.0) + (time.perf_counter() - _t0) * 1000.0
                 if compressed:
-                    thinking.append(f"  Compressed {compressed} old messages")
+                    await _emit(f"  Compressed {compressed} old messages")
 
                 # --- Next turn context ---
                 # The conversation history already has the tool result,
@@ -1243,12 +1262,12 @@ class Alfred:
             # and let the fallback below turn it into a real message.
             import traceback as _tb
             loop_error = f"{type(_loop_exc).__name__}: {_loop_exc}"
-            thinking.append(f"[Loop aborted turn {turn + 1}] {loop_error}")
+            await _emit(f"[Loop aborted turn {turn + 1}] {loop_error}")
             _frames = _tb.extract_tb(_loop_exc.__traceback__)
             if _frames:
                 _f = _frames[-1]
                 _fname = _f.filename.replace("\\", "/").rsplit("/", 1)[-1]
-                thinking.append(f"  at {_fname}:{_f.lineno} in {_f.name}()")
+                await _emit(f"  at {_fname}:{_f.lineno} in {_f.name}()")
 
         # --- Fallback if no reply ---
         # The loop ran out of turns without the model producing an answer. The
@@ -1337,7 +1356,7 @@ class Alfred:
                     f"## Alfred Response\n{final_reply}"
                 )
                 episode_path = self.memory.t3_save_episode(title=task[:80], content=summary[:2000])
-                thinking.append("Saved to T3 episodic memory")
+                await _emit("Saved to T3 episodic memory")
                 episodes_saved = 1
             except Exception:
                 pass
@@ -1350,7 +1369,7 @@ class Alfred:
             try:
                 skill_generated = self._maybe_generate_skill(task, tool_results)
             except Exception as e:
-                thinking.append(f"  Skill generation failed: {e}")
+                await _emit(f"  Skill generation failed: {e}")
 
         # --- Maybe improve skill ---
         # A matched skill was used to shape this turn and something in it
@@ -1366,9 +1385,9 @@ class Alfred:
             note = f"Used for '{task[:80]}' and a step failed: {str(failure_detail)[:150]}"
             try:
                 self.skill_manager.improve_skill(matched_skill.skill_id, note)
-                thinking.append(f"  Flagged skill '{matched_skill.title}' for improvement")
+                await _emit(f"  Flagged skill '{matched_skill.title}' for improvement")
             except Exception as e:
-                thinking.append(f"  Skill improvement failed: {e}")
+                await _emit(f"  Skill improvement failed: {e}")
 
         # --- Post-turn memory curation (fire-and-forget) ---
         # A second, independent look at this exchange, restricted to
@@ -1390,7 +1409,7 @@ class Alfred:
         # deliberately excluded -- it adds zero latency to this response.
         timings["total_ms"] = (time.perf_counter() - overall_start) * 1000.0
         timings["turns_used"] = turn + 1
-        thinking.append(
+        await _emit(
             "[Timing] total={total_ms:.0f}ms | pre_loop={pre_loop_total_ms:.0f}ms "
             "(goal_expansion={goal_expansion_ms:.0f}ms skill_matching={skill_matching_ms:.0f}ms "
             "memory_snippets_wait={memory_snippets_wait_ms:.0f}ms) | "
@@ -1411,7 +1430,7 @@ class Alfred:
             )
         )
 
-        return {
+        result = {
             "response": final_reply,
             "thinking": thinking,
             "tools_called": tools_called,
@@ -1423,6 +1442,9 @@ class Alfred:
             "awaiting_approval": awaiting_approval,
             "timings": timings,
         }
+        if on_event is not None:
+            await on_event({"type": "final", **result})
+        return result
 
     # ------------------------------------------------------------------
     # Helpers
