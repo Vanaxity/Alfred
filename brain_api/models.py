@@ -24,13 +24,17 @@ class ChatMessage(BaseModel):
     message: str = Field(..., description="The user's message")
     session_id: Optional[str] = Field(None, description="Session ID for context")
     mode: Optional[str] = Field("FOUNDER", description="Operational mode")
-    approved_actions: Optional[List[str]] = Field(
+    approved_actions: Optional[List[Dict[str, Any]]] = Field(
         None,
         description=(
-            "Action signatures the user has just approved, echoed back verbatim "
-            "from a prior response's awaiting_approval.signature. Approval is "
-            "per exact tool+params — a different call to the same tool still "
-            "needs its own approval."
+            "The full awaiting_approval object(s) from a prior response, "
+            "echoed back verbatim ({\"tool\", \"params\", \"signature\"} each) "
+            "-- not just the bare signature string. The server recomputes "
+            "each signature from its own params before trusting it and never "
+            "asks the LLM to reproduce the call; a bare-signature list from "
+            "before Phase B item 2 can never match anything and is silently "
+            "ignored. Approval is per exact tool+params — a different call "
+            "to the same tool still needs its own approval."
         ),
     )
 
