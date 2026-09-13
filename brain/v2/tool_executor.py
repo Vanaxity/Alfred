@@ -1228,6 +1228,33 @@ async def handle_memory_search(params: Dict, ctx: Dict) -> ToolResult:
     return ToolResult(success=True, output="\n".join(out))
 
 
+async def handle_checkpoint(params: Dict, ctx: Dict) -> ToolResult:
+    """Voluntary mid-task pause at a genuine decision point (Phase B item 1,
+    ROADMAP.md) -- not an action, just a structured way to hand control
+    back before guessing past a fork only Master Sam can resolve. Never
+    gated behind approval (see TOOL_GUARDRAILS): it can't do anything, so
+    there's nothing to authorize. conversation.py reads .metadata to break
+    the loop immediately and surface done_summary/question/options
+    distinctly from both a normal finished reply and the approval gate."""
+    question = str(params.get("question", "")).strip()
+    if not question:
+        return ToolResult(success=False, error="question required -- say what you need decided")
+    done_summary = str(params.get("done_summary", "")).strip()
+    options = params.get("options")
+    if options is not None and not isinstance(options, list):
+        options = None
+    return ToolResult(
+        success=True,
+        output=f"Checkpoint raised: {question}",
+        metadata={
+            "checkpoint": True,
+            "done_summary": done_summary,
+            "question": question,
+            "options": options,
+        },
+    )
+
+
 async def handle_forget(params: Dict, ctx: Dict) -> ToolResult:
     """Delete a fact from the long-term profile (T4)."""
     memory = ctx.get("memory")
@@ -1487,6 +1514,7 @@ def create_tool_executor() -> ToolExecutor:
         "screenshot": handle_screenshot,
         "open_app": handle_open_app,
         "gws": handle_gws,
+        "checkpoint": handle_checkpoint,
         "remember": handle_remember,
         "memory_save": handle_memory_save,
         "memory_search": handle_memory_search,
