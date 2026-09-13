@@ -336,6 +336,7 @@ class Alfred:
         rules = [
             "Personal questions about Master Sam -- his preferences, schedule, identity, family, goals -- are answered from the Profile below. This INCLUDES broad ones: 'tell me about myself', 'tell me about yourself' (meaning him), 'what do you know about me', 'who am I' -- the Profile IS your record of him, so summarize it directly and do NOT call memory_search for those. Only call memory_search when he asks about something SPECIFIC that may not be in the Profile ('what do you know about my chemistry teacher', 'the TKS thing') or explicitly tells you to search your memory.",
             "Never invent facts about Master Sam. Everything you tell him about himself must come from the Profile below or a memory_search result you actually got back. If neither has it, say plainly you don't have it saved -- a plausible-sounding guess about his life is worse than admitting the gap.",
+            "When you recall or summarize past episodes -- especially combining more than one -- only state what's actually written in them. Never add a connective detail, value, or motivation that sounds plausible but wasn't in the retrieved content itself; a real but incomplete memory is worth more than a smoothed-over one with invented parts mixed in.",
             "For live data (time, weather, calendar, web), call the appropriate tool.",
             "Output ONE JSON per message: {\"tool\": \"name\", \"params\": {...}} or {\"reply\": \"answer\"}",
             "After a tool runs you will see the result. Call another tool or reply.",
@@ -1399,12 +1400,31 @@ class Alfred:
         # PM" time answer got reused a day later instead of a fresh call.
         # Combined turns (e.g. calendar + time) still save normally since
         # tools_called won't be a subset of PERISHABLE_ONLY_TOOLS | {chat}.
+        #
+        # `real_tool_used` alone used to be the WHOLE gate -- confirmed live
+        # 2026-09-13 as a real bug, not a design choice anyone actually
+        # wanted: 18 of 18 fake life/advice scenarios (career, stress,
+        # procrastination, sadness...) used zero tools and saved NOTHING,
+        # and a 7-turn deep conversation about a real career decision only
+        # saved the one turn that happened to trigger `remember` -- the
+        # other 6, the actual depth, left no trace. A pure-conversation
+        # exchange -- the "talk to Alfred for advice" use case -- can never
+        # satisfy a tools_called check, no matter how meaningful it is.
+        # `substantive_conversation` is the fallback: word-count is a crude
+        # proxy for "meaningful," but the prior all-or-nothing state (never,
+        # unless a tool fired) was far worse than this (usually, unless
+        # clearly trivial filler like "thanks!").
         PERISHABLE_ONLY_TOOLS = {"time", "weather"}
+        _TRIVIAL_TASK_MAX_WORDS = 6
         episodes_saved = 0
         episode_path: Optional[str] = None
-        if (
+        real_tool_used = (
             any(t != "chat" for t in tools_called)
             and not set(tools_called) <= (PERISHABLE_ONLY_TOOLS | {"chat"})
+        )
+        substantive_conversation = len(task.split()) > _TRIVIAL_TASK_MAX_WORDS
+        if (
+            (real_tool_used or substantive_conversation)
             and not self._is_self_summary_query(task)
         ):
             try:
