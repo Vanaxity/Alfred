@@ -35,6 +35,21 @@ class LocalDB:
             self._conn.execute("PRAGMA busy_timeout=3000")
         return self._conn
 
+    def close(self) -> None:
+        """Release the underlying sqlite3 connection. The real singleton
+        (get_local_db()) lives for the process's lifetime and never needs
+        this, but a short-lived LocalDB(db_path=...) instance -- every
+        test that points at a tempfile -- does: on Windows, an open
+        connection keeps a file handle on the db file, so
+        tempfile.TemporaryDirectory's cleanup fails with WinError 32
+        (works on Linux, where unlinking an open file is allowed, which is
+        why this only ever surfaced running tests on a real Windows target).
+        """
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
     def _init_db(self):
         """Create tables if they don't exist."""
         conn = self._get_conn()
@@ -88,6 +103,35 @@ class LocalDB:
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+            CREATE TABLE IF NOT EXISTS execution_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT DEFAULT '',
+                task_summary TEXT DEFAULT '',
+                turns_used INTEGER DEFAULT 0,
+                total_ms REAL DEFAULT 0,
+                llm_call_ms REAL DEFAULT 0,
+                tool_execution_ms REAL DEFAULT 0,
+                tools_called TEXT DEFAULT '[]',
+                tool_error_count INTEGER DEFAULT 0,
+                completion_claim_nudge INTEGER DEFAULT 0,
+                time_mismatch_nudge INTEGER DEFAULT 0,
+                awaiting_approval INTEGER DEFAULT 0,
+                max_turns_hit INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_execution_log_created ON execution_log(created_at);
+
+            CREATE TABLE IF NOT EXISTS self_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                days INTEGER DEFAULT 7,
+                summary_json TEXT DEFAULT '{}',
+                proposal TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_self_audit_log_created ON self_audit_log(created_at);
 
             INSERT OR IGNORE INTO user_state (id, mode) VALUES ('default', 'FOUNDER');
         """)
@@ -357,6 +401,90 @@ class LocalDB:
         with self._lock:
             conn.execute("UPDATE scheduled_tasks SET last_run = datetime('now') WHERE id = ?", (task_id,))
             conn.commit()
+
+    # ============ EXECUTION LOG (self-audit loop, ROADMAP.md Phase 3) ============
+
+    def log_execution(
+        self,
+        session_id: str,
+        task_summary: str,
+        turns_used: int,
+        total_ms: float,
+        llm_call_ms: float,
+        tool_execution_ms: float,
+        tools_called: List[str],
+        tool_error_count: int,
+        completion_claim_nudge: bool,
+        time_mismatch_nudge: bool,
+        awaiting_approval: bool,
+        max_turns_hit: bool,
+    ) -> int:
+        """Record one turn's execution stats for the weekly self-audit to read back.
+
+        Best-effort by design: the caller (Alfred.execute()) wraps this in a
+        try/except so a logging failure never breaks a real user-facing turn.
+        """
+        conn = self._get_conn()
+        with self._lock:
+            cur = conn.execute(
+                """
+                INSERT INTO execution_log (
+                    session_id, task_summary, turns_used, total_ms, llm_call_ms,
+                    tool_execution_ms, tools_called, tool_error_count,
+                    completion_claim_nudge, time_mismatch_nudge, awaiting_approval,
+                    max_turns_hit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id, task_summary[:200], turns_used, total_ms, llm_call_ms,
+                    tool_execution_ms, json.dumps(tools_called), tool_error_count,
+                    1 if completion_claim_nudge else 0, 1 if time_mismatch_nudge else 0,
+                    1 if awaiting_approval else 0, 1 if max_turns_hit else 0,
+                ),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def get_recent_executions(self, days: int = 7, limit: int = 1000) -> List[Dict]:
+        conn = self._get_conn()
+        # Every other method on this connection (including plain reads) goes
+        # through self._lock -- that's the real serialization mechanism for
+        # the shared check_same_thread=False connection, despite this file's
+        # own "no locks needed" docstring. Missing it here let a live turn's
+        # log_execution() write race this read on the same connection; the
+        # single-threaded mocked suite never exercised real concurrency so
+        # it never caught this. Confirmed live 2026-09-09 during PR review.
+        with self._lock:
+            rows = conn.execute(
+                """
+                SELECT * FROM execution_log
+                WHERE created_at >= datetime('now', ?)
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (f"-{int(days)} days", limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ============ SELF-AUDIT LOG ============
+
+    def log_self_audit(self, days: int, summary_json: str, proposal: str) -> int:
+        conn = self._get_conn()
+        with self._lock:
+            cur = conn.execute(
+                "INSERT INTO self_audit_log (days, summary_json, proposal) VALUES (?, ?, ?)",
+                (days, summary_json, proposal),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def get_recent_self_audits(self, limit: int = 5) -> List[Dict]:
+        conn = self._get_conn()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM self_audit_log ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # Singleton

@@ -1458,6 +1458,32 @@ def _is_safe_path(path: str) -> bool:
     return False
 
 
+async def handle_self_audit(params: Dict, ctx: Dict) -> ToolResult:
+    """Review Alfred's own recent execution log and propose one concrete
+    optimization -- ROADMAP.md Phase 3's Self-Audit Loop. Read-only: reads
+    execution_log rows via ctx["db"] and makes one LLM call via ctx["router"];
+    never edits Alfred's own code or config itself."""
+    db = ctx.get("db")
+    router = ctx.get("router")
+    if db is None or router is None:
+        return ToolResult(success=False, error="self_audit requires db and router in context")
+
+    days_raw = params.get("days", 7)
+    try:
+        days = max(1, int(days_raw))
+    except (TypeError, ValueError):
+        days = 7
+
+    from ..self_audit import run_self_audit
+
+    try:
+        result = await run_self_audit(db, router, days=days)
+    except Exception as e:
+        return ToolResult(success=False, error=f"Self-audit failed: {e}")
+
+    return ToolResult(success=True, output=result["proposal"], metadata={"summary": result["summary"]})
+
+
 # ---------------------------------------------------------------------------
 # Factory: create a fully-registered ToolExecutor
 # ---------------------------------------------------------------------------
@@ -1495,6 +1521,7 @@ def create_tool_executor() -> ToolExecutor:
         "run_code": handle_run_code,
         "find_mcp_server": handle_find_mcp_server,
         "install_mcp_server": handle_install_mcp_server,
+        "self_audit": handle_self_audit,
     }
 
     for name, handler in builtin_tools.items():
