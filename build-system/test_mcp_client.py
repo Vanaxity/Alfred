@@ -48,9 +48,11 @@ class _FakeSession:
         self._result = result
         self._raise = raise_exc
         self.last_call: Optional[tuple] = None
+        self.call_tool_ran_on_task: Optional[asyncio.Task] = None
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]):
         self.last_call = (name, arguments)
+        self.call_tool_ran_on_task = asyncio.current_task()
         if self._raise:
             raise self._raise
         return self._result
@@ -101,6 +103,45 @@ def test_handler_catches_exceptions_from_call_tool():
     result = run(handler({}, {}))
     assert result.success is False
     assert "server crashed" in result.error
+
+
+def test_handler_runs_call_tool_on_the_manager_worker_task():
+    """Live-found bug: MCPClientManager.__init__'s own comment documents
+    that entering/exiting an MCP session from a per-HTTP-request task
+    (rather than the manager's one persistent worker task) breaks anyio's
+    cancel-scope ownership -- already fixed for connect/disconnect by
+    routing them through _run_on_worker. make_handler()'s actual
+    session.call_tool() was never given the same treatment, so every real
+    tool call ran on whatever task happened to be executing Alfred.execute()
+    at the time -- a fresh task per request on a live server. Confirmed
+    live against a real Nuclear (streamable-HTTP) MCP session: connect +
+    list_tools at boot succeeded (same task), then the next real request's
+    tool call failed with "Session terminated" -- exactly the cross-task
+    failure this class of bug already has one fix pattern for in this file.
+    """
+    async def _run_test():
+        manager = MCPClientManager()
+        manager._ensure_worker()  # must happen inside a running loop, like real usage
+        worker_task = manager._worker_task
+        assert asyncio.current_task() is not worker_task, (
+            "sanity check: the test's own task must differ from the worker task, "
+            "or this test can't actually distinguish the two"
+        )
+
+        session = _FakeSession(_FakeCallToolResult(text="ok"))
+        manager._sessions["nuclear"] = session
+        handler = manager.make_handler("nuclear", "call")
+
+        result = await handler({"method": "Playback.play"}, {})
+
+        assert result.success is True
+        assert session.call_tool_ran_on_task is worker_task, (
+            f"call_tool ran on {session.call_tool_ran_on_task!r}, not the "
+            f"manager's worker task {worker_task!r} -- this is the same "
+            "cross-task cancel-scope bug already fixed for connect/disconnect"
+        )
+
+    run(_run_test())
 
 
 def test_handler_for_unconnected_server_fails_cleanly():

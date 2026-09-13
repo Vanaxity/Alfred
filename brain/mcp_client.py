@@ -249,7 +249,17 @@ class MCPClientManager:
                     error=f"MCP server '{server_name}' is not connected",
                 )
             try:
-                result = await session.call_tool(tool_name, params or {})
+                # Route the actual call through the same persistent worker
+                # task the session was opened on -- the exact cross-task
+                # anyio cancel-scope hazard __init__'s comment documents for
+                # connect/disconnect applies identically to a live call:
+                # confirmed live against Nuclear's streamable-HTTP session,
+                # which tolerated connect+list_tools from the worker task at
+                # boot but broke with "Session terminated" on the very next
+                # call from a fresh per-request task.
+                result = await self._run_on_worker(
+                    lambda: session.call_tool(tool_name, params or {})
+                )
             except Exception as e:
                 return ToolResult(success=False, error=f"MCP call failed: {e}")
 
