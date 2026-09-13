@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from brain.mcp_client import MCPClientManager  # noqa: E402
 from brain.v2.conversation import Alfred  # noqa: E402
+from brain.v2.tool_executor import create_tool_executor  # noqa: E402
 
 
 def run(coro):
@@ -192,6 +193,60 @@ def test_discovered_tools_reach_get_tool_descriptions():
     assert "filesystem__read_file" in descriptions
     assert "chat" in descriptions, "built-in tools must still be present alongside MCP ones"
     assert "Requires approval" in descriptions["filesystem__read_file"]["description"]
+
+
+def test_register_mcp_tool_defaults_to_requiring_approval():
+    """The fail-safe default: an MCP tool nobody's explicitly reviewed
+    stays gated, no matter how harmless its name sounds."""
+    a = Alfred.__new__(Alfred)
+    a._tool_executor = create_tool_executor()
+    a._mcp_tool_schemas = {}
+    full_name = a._register_mcp_tool(
+        "some_new_server", "get_status", _FakeTool("get_status", description="Reads status.")
+    )
+    assert full_name == "some_new_server__get_status"
+    assert a._tool_executor._guardrails[full_name].require_approval is True
+    assert "Requires approval" in a._mcp_tool_schemas[full_name]["description"]
+
+
+def test_register_mcp_tool_exempts_reviewed_read_only_overrides():
+    """Live-found friction: Nuclear's own discovery calls (list_methods /
+    method_details / describe_type) are genuinely read-only, but were
+    gated like every other MCP tool -- meaning "play a song" interrupted
+    for approval on calls that can't do anything. These three, and only
+    these three, are explicitly reviewed and exempted; the tool that
+    actually acts (nuclear__call) is deliberately NOT on this list."""
+    from brain.v2.tool_executor import MCP_READ_ONLY_OVERRIDES
+
+    assert "nuclear__list_methods" in MCP_READ_ONLY_OVERRIDES
+    assert "nuclear__method_details" in MCP_READ_ONLY_OVERRIDES
+    assert "nuclear__describe_type" in MCP_READ_ONLY_OVERRIDES
+    assert "nuclear__call" not in MCP_READ_ONLY_OVERRIDES, (
+        "the tool that actually invokes an arbitrary Nuclear method must stay gated"
+    )
+
+    a = Alfred.__new__(Alfred)
+    a._tool_executor = create_tool_executor()
+    a._mcp_tool_schemas = {}
+    full_name = a._register_mcp_tool(
+        "nuclear", "list_methods", _FakeTool("list_methods", description="Lists Nuclear methods.")
+    )
+    assert a._tool_executor._guardrails[full_name].require_approval is False
+    assert "Requires approval" not in a._mcp_tool_schemas[full_name]["description"]
+
+
+def test_register_mcp_tool_override_is_keyed_by_full_name_not_bare_tool_name():
+    """A different server exposing a same-named 'list_methods' tool is a
+    separate trust decision -- the override list is keyed by
+    "<server>__<tool>", not by the bare tool name, so it can't
+    accidentally exempt an unrelated, unreviewed server."""
+    a = Alfred.__new__(Alfred)
+    a._tool_executor = create_tool_executor()
+    a._mcp_tool_schemas = {}
+    full_name = a._register_mcp_tool(
+        "some_other_server", "list_methods", _FakeTool("list_methods")
+    )
+    assert a._tool_executor._guardrails[full_name].require_approval is True
 
 
 def test_no_mcp_tools_leaves_builtin_descriptions_unchanged():

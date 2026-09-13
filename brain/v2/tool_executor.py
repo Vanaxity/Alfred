@@ -170,6 +170,11 @@ _DESTRUCTIVE_PATTERNS: List[str] = [
 # process requires explicit approval; approval is granted per exact tool+params
 # call by putting that action's signature (see _action_signature) into
 # context["approved_actions"].
+#
+# Deliberately narrow (Sam's call, 2026-09-13): approval is reserved for
+# things that can actually create or destroy something -- arbitrary code
+# execution, spawning a new MCP server's process. open_app was gated here
+# before and isn't anymore -- launching an application can't do either.
 TOOL_GUARDRAILS: Dict[str, Guardrails] = {
     "shell": Guardrails(
         require_approval=True,
@@ -179,11 +184,32 @@ TOOL_GUARDRAILS: Dict[str, Guardrails] = {
         require_approval=True,
         deny_patterns=list(_DESTRUCTIVE_PATTERNS),
     ),
-    "open_app": Guardrails(require_approval=True),
     # Spawns arbitrary third-party code via npx -- same trust tier as
     # shell/run_code, not the read-only find_mcp_server that proposes it.
     "install_mcp_server": Guardrails(require_approval=True),
 }
+
+# MCP tools default to require_approval=True at registration time (see
+# Alfred._register_mcp_tool in conversation.py) -- an arbitrary third-party
+# server is untrusted until proven otherwise, and there's no way to know a
+# server's own semantics in general. This is the one deliberate escape
+# hatch: individually reviewed, read-only tools, exempted one at a time,
+# never as a blanket "servers I trust" or "tools whose name looks safe"
+# rule. Keyed by "<server>__<tool>" (the exact registered name), not the
+# bare tool name -- two different servers exposing the same generic verb
+# are two separate trust decisions.
+#
+# Live-found 2026-09-13: Nuclear (music player) makes its whole tool
+# surface discoverable through list_methods/method_details/describe_type,
+# which are read-only introspection and cannot act on anything -- gating
+# them meant "play a song" interrupted for approval before Alfred could
+# even find out how to play anything. The tool that actually invokes an
+# arbitrary Nuclear method (nuclear__call) is deliberately NOT here.
+MCP_READ_ONLY_OVERRIDES: frozenset = frozenset({
+    "nuclear__list_methods",
+    "nuclear__method_details",
+    "nuclear__describe_type",
+})
 
 # Handler type: async function(params, context) -> ToolResult
 ToolHandler = Callable[[Dict[str, Any], Dict[str, Any]], Coroutine[Any, Any, ToolResult]]

@@ -243,7 +243,7 @@ class Alfred:
         install_mcp_server() (live, one new server). Returns the
         registered tool's full name."""
         from ..mcp_client import get_mcp_client
-        from .tool_executor import Guardrails
+        from .tool_executor import Guardrails, MCP_READ_ONLY_OVERRIDES
 
         full_name = f"{server_name}__{tool_name}"
         handler = get_mcp_client().make_handler(server_name, tool_name)
@@ -251,13 +251,20 @@ class Alfred:
         # server is closer to shell/run_code in trust level than a
         # built-in tool, at least until it's been used long enough to
         # trust -- not something to skip past a human decision for a
-        # server nobody's vetted yet.
+        # server nobody's vetted yet. MCP_READ_ONLY_OVERRIDES is the one
+        # deliberate, individually-reviewed exception -- see its own
+        # comment in tool_executor.py.
+        is_reviewed_read_only = full_name in MCP_READ_ONLY_OVERRIDES
         self._tool_executor.register(
-            full_name, handler, guardrails=Guardrails(require_approval=True),
+            full_name, handler,
+            guardrails=Guardrails(require_approval=not is_reviewed_read_only),
+        )
+        approval_note = (
+            "" if is_reviewed_read_only
+            else " (Requires approval before running -- third-party MCP server.)"
         )
         self._mcp_tool_schemas[full_name] = {
-            "description": (tool.description or f"MCP tool from '{server_name}'.")
-            + " (Requires approval before running -- third-party MCP server.)",
+            "description": (tool.description or f"MCP tool from '{server_name}'.") + approval_note,
             "params": tool.input_schema or {},
         }
         return full_name
