@@ -184,6 +184,7 @@ class Alfred:
     def __init__(self) -> None:
         from ..memory.five_tier import get_memory
         from ..memory.skill_manager import get_skill_manager
+        from ..memory.entity_graph import get_entity_graph
         from ..local_db import get_local_db
         from ..llm_router import LLMRouter
         from ..goal_inference import get_goal_expander
@@ -192,6 +193,7 @@ class Alfred:
         self.skill_manager = get_skill_manager()
         self.goal_expander = get_goal_expander()
         self.db = get_local_db()
+        self.entity_graph = get_entity_graph()
 
         # LLM router (3-provider fallback)
         groq_key = os.environ.get("GROQ_API_KEY", "")
@@ -569,6 +571,46 @@ class Alfred:
                 "params": {"key_or_query": "Exact key, or a natural-language "
                                             "description of the fact to remove"},
             },
+            "entity_note": {
+                "description": (
+                    "Record a mention of a named entity — a person, project, "
+                    "organization, or place the user brings up (e.g. 'Priya', "
+                    "'the robotics club', 'Acme Corp'). Unlike `remember`, this "
+                    "accumulates every mention of the same entity instead of "
+                    "overwriting the last one — use it for people/projects/orgs "
+                    "that come up repeatedly, not one-off facts (those are "
+                    "`remember`)."
+                ),
+                "params": {
+                    "name": "Entity name, e.g. 'Priya'",
+                    "entity_type": "person/project/organization/place/other",
+                    "note": "Optional short note about this mention",
+                },
+            },
+            "entity_relate": {
+                "description": (
+                    "Record a relation between two named entities, e.g. "
+                    "entity_a='Priya', relation='works on', entity_b='the "
+                    "robotics club'. Creates either entity if it doesn't exist "
+                    "yet."
+                ),
+                "params": {
+                    "entity_a": "First entity name",
+                    "relation": "Short verb phrase, e.g. 'works on', 'manages'",
+                    "entity_b": "Second entity name",
+                },
+            },
+            "entity_lookup": {
+                "description": (
+                    "Look up everything the entity graph knows about one named "
+                    "entity — every note recorded across past mentions plus its "
+                    "relations to other entities, synthesized into one answer. "
+                    "Use for 'who is X' / 'what do you know about X' when X is a "
+                    "person, project, or organization that's come up before. "
+                    "Read-only, no approval needed."
+                ),
+                "params": {"name": "Entity name to look up"},
+            },
             "weather": {
                 "description": (
                     "Get real, current weather conditions for a location — the "
@@ -924,6 +966,12 @@ class Alfred:
         tool_ctx = {
             "memory": self.memory,
             "db": self.db,
+            # getattr, not self.entity_graph directly: several existing tests
+            # build a bare Alfred via Alfred.__new__() to test execute() with
+            # every heavy singleton faked out, without setting every new
+            # attribute this class ever grows (see _get_tool_descriptions'
+            # identical getattr for _mcp_tool_schemas, same reasoning).
+            "entity_graph": getattr(self, "entity_graph", None),
             "router": self._router,
             "bootstrap": self._bootstrap,
             "install_mcp_server": self.install_mcp_server,
@@ -1586,9 +1634,10 @@ class Alfred:
         tool_results: List[Dict[str, Any]],
     ) -> None:
         """Second, independent look at a finished turn, restricted to
-        remember/forget/memory_search, deciding whether anything belongs in
-        the durable profile (T4) regardless of what the live turn's own tool
-        choice did or missed.
+        remember/forget/memory_search/entity_note/entity_relate, deciding
+        whether anything belongs in the durable profile (T4) or the entity
+        graph, regardless of what the live turn's own tool choice did or
+        missed.
 
         Modeled on Hermes Agent's background_review.py, adapted to Alfred's
         actually-async loop (a fire-and-forget asyncio task, not a forked
@@ -1600,7 +1649,10 @@ class Alfred:
         `thinking` (the turn that spawned this has already returned).
         """
         try:
-            allowed = {"remember", "forget", "memory_search"}
+            allowed = {
+                "remember", "forget", "memory_search",
+                "entity_note", "entity_relate",
+            }
             descriptions = self._get_tool_descriptions()
             tool_blocks = "\n\n".join(
                 ToolSchema(
@@ -1614,16 +1666,23 @@ class Alfred:
             system = (
                 "You are Alfred's memory curator. You do not talk to the "
                 "user -- you only decide whether the exchange below is worth "
-                "persisting to the user's long-term profile. Call `remember` "
-                "if it contains a durable fact worth keeping (preferences, "
-                "standing facts, recurring commitments -- not one-off task "
-                "details, those are saved automatically) AND it was not "
-                "already saved this turn (see below). Call `forget` if it "
-                "invalidates or corrects a previously stored fact. If "
-                "there is nothing left worth persisting, reply with "
-                '{"reply": "nothing to save"} and make no tool call. Do not '
-                "re-save a fact under a new key just because you'd phrase "
-                "the key differently -- if it's already saved, leave it.\n\n"
+                "persisting, either to the user's long-term profile or to "
+                "the entity graph. Call `remember` if it contains a durable "
+                "fact worth keeping (preferences, standing facts, recurring "
+                "commitments -- not one-off task details, those are saved "
+                "automatically) AND it was not already saved this turn (see "
+                "below). Call `forget` if it invalidates or corrects a "
+                "previously stored fact. Call `entity_note` if the exchange "
+                "mentions a named person, project, or organization worth "
+                "tracking across future turns (not a one-off task detail); "
+                "call `entity_relate` if it also states how two such "
+                "entities connect. If there is nothing left worth "
+                "persisting, reply with {\"reply\": \"nothing to save\"} and "
+                "make no tool call. Do not re-save a fact under a new key "
+                "just because you'd phrase the key differently -- if it's "
+                "already saved, leave it. You may only make ONE tool call "
+                "per pass -- pick the single most important thing worth "
+                "persisting from this exchange.\n\n"
                 f"Available tools:\n\n{tool_blocks}\n\n"
                 'Respond with exactly one JSON object: either '
                 '{"tool": "<name>", "params": {...}} or {"reply": "..."}.'
@@ -1651,7 +1710,12 @@ class Alfred:
             _reply, tool_name, tool_params = self._parse_llm_output(raw)
             if tool_name is None or tool_name not in allowed:
                 return
-            tool_ctx = {"memory": self.memory, "db": self.db, "router": self._router}
+            tool_ctx = {
+                "memory": self.memory,
+                "db": self.db,
+                "entity_graph": getattr(self, "entity_graph", None),
+                "router": self._router,
+            }
             await self._tool_executor.execute(
                 tool_name, tool_params or {}, tool_ctx, allowed_tools=allowed,
             )
