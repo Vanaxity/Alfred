@@ -70,6 +70,15 @@ class ChatResponse(BaseModel):
             "approved_actions to proceed."
         ),
     )
+    awaiting_checkpoint: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Present when Alfred voluntarily paused a multi-step task at a genuine "
+            "decision point (Phase B item 1) rather than an approval gate. Contains "
+            "done_summary/question/options — just reply normally (same session) to "
+            "continue; no signature or special resend format needed."
+        ),
+    )
 
 
 class StatusResponse(BaseModel):

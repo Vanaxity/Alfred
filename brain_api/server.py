@@ -328,6 +328,7 @@ async def api_command(data: Dict):
         "session_id": result.session_id,
         "thinking": result.thinking if hasattr(result, 'thinking') else [],
         "awaiting_approval": result.awaiting_approval if hasattr(result, 'awaiting_approval') else None,
+        "awaiting_checkpoint": result.awaiting_checkpoint if hasattr(result, 'awaiting_checkpoint') else None,
         "episode_path": result.episode_path,
     }
 
@@ -480,6 +481,7 @@ async def process_chat(
             skill_used=result.get("skill_used", False),
             skill_generated=result.get("skill_generated", False),
             awaiting_approval=result.get("awaiting_approval"),
+            awaiting_checkpoint=result.get("awaiting_checkpoint"),
         )
 
     except Exception as e:

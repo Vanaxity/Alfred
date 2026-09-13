@@ -649,7 +649,7 @@ def test_factory_registers_all_tools():
     expected = {
         "time", "chat", "calculator", "calendar", "email", "web_search",
         "web_fetch", "shell", "read_file", "write_file", "list_directory",
-        "glob", "screenshot", "open_app", "gws", "remember",
+        "glob", "screenshot", "open_app", "gws", "checkpoint", "remember",
         "memory_save", "memory_search", "weather", "run_code",
     }
     missing = expected - set(ex.tool_names)

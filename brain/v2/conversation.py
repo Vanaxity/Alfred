@@ -349,6 +349,7 @@ class Alfred:
             "If a required detail is genuinely missing (a time, a name, a value), ASK for it. Never invent it and never quietly assume a default.",
             "When find_mcp_server returns a candidate with required or secret environment variables, ASK Master Sam for the actual values before calling install_mcp_server — never invent a placeholder credential.",
             "Before you reply that something is done, check you finished EVERY part of it. If a request had two parts and you did one, say exactly which part is still outstanding — never describe a half-finished action as complete.",
+            "For a genuinely long multi-step task, if you hit a real fork only Master Sam can resolve — not a trivial yes/no, not something you can just decide yourself — call `checkpoint` with what's done and the specific decision needed. Don't call it for minor confirmations, and don't silently guess past a real fork either.",
             "Prefer calculator over run_code for anything calculator supports; run_code needs approval and is slower.",
             "Translate raw tool output into natural language — never dump JSON, IDs, or technical errors.",
             "NEVER use LaTeX or backslash commands in your reply. Write math in plain text: 'x^2' not '\\(x^2\\)', '1/2' not '\\frac{1}{2}', 'theta' not '\\theta'. Backslashes corrupt the JSON envelope and the UI shows plain text anyway.",
@@ -529,6 +530,21 @@ class Alfred:
                     "than presenting this value as theirs."
                 ),
                 "params": {},
+            },
+            "checkpoint": {
+                "description": (
+                    "Pause a multi-step task at a genuine decision point only Master "
+                    "Sam can resolve — not a trivial confirmation, and not a substitute "
+                    "for just taking the obvious next step. Say what's done so far and "
+                    "exactly what you need decided; the task resumes when he replies, "
+                    "and everything already done stays in context. Never requires "
+                    "approval — it can't do anything, it only asks."
+                ),
+                "params": {
+                    "done_summary": "Plain-language summary of what's been completed so far",
+                    "question": "The specific decision you need Master Sam to make",
+                    "options": "Optional list of concrete choices, if there's a fixed set",
+                },
             },
             "remember": {
                 "description": (
@@ -942,6 +958,7 @@ class Alfred:
         tools_called: List[str] = []
         tool_results: List[Dict[str, Any]] = []
         awaiting_approval: Optional[Dict[str, Any]] = None
+        awaiting_checkpoint: Optional[Dict[str, Any]] = None
         repeats: Dict[str, int] = {}
         completion_claim_nudge_used = False
         intent_only_nudge_used = False
@@ -1283,6 +1300,33 @@ class Alfred:
                     await _emit(f"  Awaiting approval: {tool_name}")
                     break
 
+                # --- Stop immediately on a voluntary checkpoint ---
+                # Phase B item 1 (ROADMAP.md): a 20-step chain must either
+                # finish or cleanly pause asking a real question -- not
+                # silently guess past a genuine decision point. Unlike the
+                # approval gate above (a security backstop the LLM can't
+                # bypass), this is the model choosing to pause on its own;
+                # checkpoint always succeeds (it's a communication act, not
+                # an action), so this checks metadata, not result.success.
+                # No signature/replay machinery needed to resume, unlike
+                # approval -- nothing dangerous is being re-authorized, so a
+                # plain next turn with the session's existing history (which
+                # already has this call and its done_summary recorded) is
+                # enough to continue.
+                if result.metadata.get("checkpoint"):
+                    cp_done = result.metadata.get("done_summary", "")
+                    cp_question = result.metadata.get("question", "")
+                    cp_options = result.metadata.get("options")
+                    awaiting_checkpoint = {
+                        "done_summary": cp_done,
+                        "question": cp_question,
+                        "options": cp_options,
+                    }
+                    options_bit = f" Options: {', '.join(cp_options)}." if cp_options else ""
+                    final_reply = f"Checkpoint -- so far: {cp_done}\n\n{cp_question}{options_bit}"
+                    await _emit(f"  Checkpoint: {cp_question}")
+                    break
+
                 # --- Mutation verification ---
                 # is_mutation() is action-aware: a calendar "agenda" read is not a
                 # mutation even though "calendar" is in MUTATION_TOOLS.
@@ -1499,6 +1543,7 @@ class Alfred:
             "skill_used": matched_skill is not None,
             "skill_generated": skill_generated,
             "awaiting_approval": awaiting_approval,
+            "awaiting_checkpoint": awaiting_checkpoint,
             "timings": timings,
         }
         if on_event is not None:
