@@ -83,6 +83,25 @@ asking permission with a genuine yes/no status — never a silent stall.
    regenerate byte-identical params on retry, so a resend can fail to
    match the pending approval) — deferred for weeks, real contributor to
    "not reliable."
+3. **Verify Phase B actually holds before Phase C starts** (added
+   2026-09-14, after a live code-grounded audit surfaced these as
+   real but untested) — live-test against an isolated Obsidian vault
+   (`OBSIDIAN_VAULT_PATH` override), never Sam's real one:
+   - Guardrail enforcement: a destructive shell command is actually
+     denied (not just approval-gated), a benign one actually produces
+     `awaiting_approval`, a file-write path-traversal attempt outside
+     `_safe_roots()` is actually rejected, `open_app` is actually
+     approval-gated.
+   - Skill-learning loop end-to-end: the same 2-tool task run twice in
+     separate sessions actually writes a new T2 `.md` file to disk
+     after the first run (checked on disk, not just Alfred's self
+     -report) and gets matched/reused the second time.
+   - Cron execution: a scheduled task is actually picked up and run by
+     the 30s heartbeat poll (`_check_scheduled_tasks()` /
+     `get_due_scheduled_tasks()`) — confirmed live, not just read in
+     code.
+   - Error recovery: a forced tool failure is surfaced honestly to the
+     user, not confabulated into a false success.
 
 ## Phase C — UI overhaul (only after A + B hold)
 
@@ -109,6 +128,26 @@ substance from the original plan, picked up with whatever time remains
 after Phases A-D actually hold. Hardware lead time is still real: order
 anything Phase 4 needs as soon as this phase is reachable, not the week
 it starts.
+
+---
+
+## Capability gaps found, not yet scoped (2026-09-14)
+
+Surfaced by comparing Alfred's actual code against Sam's HERMES/OpenClaw
+research notes — real differences, not committed to any phase yet, per
+this roadmap's own no-scope-creep rule below:
+
+- **No multi-channel gateway** — Alfred is reachable only via its own
+  HTTP API + the cockpit; no Telegram/Discord/Slack/WhatsApp/Signal
+  (confirmed zero code, not just an unimplemented doc mention).
+- **No sub-agent/parallel delegation** — can't spawn isolated
+  workstreams the way HERMES/Claude Code can; confirmed zero code
+  outside the manifesto's aspirational text.
+- **Cron sophistication unverified** — the scheduler itself is real and
+  live (`local_db.py`'s `scheduled_tasks` table + the 30s heartbeat
+  poll in `_check_scheduled_tasks()`), but whether natural language like
+  "every morning at 8" reliably becomes a correct cron expression hasn't
+  been tested — folded into the Phase B verification pass above.
 
 ---
 
