@@ -46,6 +46,24 @@ deliberately NOT in this — separate, security-sensitive, its own pass.
 
 ---
 
+## 2026-09-12 — Phase 3: entity graph & synthesis merged
+
+Cloud routine's entity-graph slice (originally filed 2026-09-08 as #20),
+rebased onto main and merged after the Phase A/B reliability work landed.
+`brain/memory/entity_graph.py` -- a new, self-contained SQLite store
+(`brain/data/entity_graph.db`, no Obsidian vault dependency, same pattern
+as `LocalDB`/T5's `archive.db`) for named entities (people, projects,
+orgs, places) and relations between them. T4 (`remember`) is one key ->
+one value, latest write wins; this accumulates every mention of the same
+entity so a later `entity_lookup` synthesizes across all of them plus
+one-hop relations. Three new tools (`entity_note`, `entity_relate`,
+`entity_lookup`), wired into the existing post-turn memory-curation pass
+rather than a new LLM call. 26 mocked tests in
+`build-system/test_entity_graph.py`. Full suite green on the rebased
+branch.
+
+---
+
 ## 2026-09-09 — Triaged and fixed the Phase 3 PR pileup; cloud routine disabled
 
 The cloud routine fired continuously through the night and produced a

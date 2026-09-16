@@ -89,7 +89,7 @@ class Guardrails:
 # Tools that mutate external state (need verification after execution)
 MUTATION_TOOLS: Set[str] = {
     "calendar", "email", "remember", "write_file", "memory_save", "run_code",
-    "forget",
+    "forget", "entity_note", "entity_relate",
 }
 
 # calendar and email dispatch both reads and writes through a single tool, so
@@ -144,6 +144,20 @@ VERIFY_MAP: Dict[str, Dict[str, Any]] = {
         "read_params": {"tier": "t4"},
         "carry": {"key_or_query": "query"},
         "description": "memory search T4 (should now come up empty)",
+    },
+    "entity_note": {
+        "read_tool": "entity_lookup",
+        "read_params": {},
+        "carry": {"name": "name"},
+        "description": "entity graph lookup",
+    },
+    "entity_relate": {
+        "read_tool": "entity_lookup",
+        "read_params": {},
+        # entity_a's synthesis includes every relation it's on either side
+        # of, this one included -- no need to also read back entity_b.
+        "carry": {"entity_a": "name"},
+        "description": "entity graph lookup (entity_a side)",
     },
 }
 
@@ -1246,6 +1260,59 @@ async def handle_forget(params: Dict, ctx: Dict) -> ToolResult:
     return ToolResult(success=True, output=out)
 
 
+async def handle_entity_note(params: Dict, ctx: Dict) -> ToolResult:
+    """Record a mention of a named entity (person, project, org, place) in
+    the entity graph -- the T4 profile has one slot per key and the latest
+    write wins; this instead accumulates every mention of the same entity
+    so `entity_lookup` can synthesize across all of them."""
+    graph = ctx.get("entity_graph")
+    if not graph:
+        return ToolResult(success=False, error="Entity graph unavailable")
+    name = params.get("name", "")
+    if not name:
+        return ToolResult(success=False, error="name required")
+    entity_type = params.get("entity_type") or "unknown"
+    note = params.get("note") or None
+    try:
+        graph.upsert_entity(name.strip(), entity_type.strip(), note)
+        return ToolResult(success=True, output=f"Noted entity: {name}")
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+
+
+async def handle_entity_relate(params: Dict, ctx: Dict) -> ToolResult:
+    """Record a relation between two named entities in the entity graph."""
+    graph = ctx.get("entity_graph")
+    if not graph:
+        return ToolResult(success=False, error="Entity graph unavailable")
+    entity_a = params.get("entity_a", "")
+    relation = params.get("relation", "")
+    entity_b = params.get("entity_b", "")
+    if not entity_a or not relation or not entity_b:
+        return ToolResult(success=False, error="entity_a, relation, and entity_b required")
+    try:
+        graph.add_relation(entity_a.strip(), relation.strip(), entity_b.strip())
+        return ToolResult(success=True, output=f"Noted: {entity_a} {relation} {entity_b}")
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+
+
+async def handle_entity_lookup(params: Dict, ctx: Dict) -> ToolResult:
+    """Read-only synthesis of everything the entity graph has on one named
+    entity -- notes from every mention plus one-hop relations, not just
+    whatever was said about it most recently."""
+    graph = ctx.get("entity_graph")
+    if not graph:
+        return ToolResult(success=False, error="Entity graph unavailable")
+    name = params.get("name", "")
+    if not name:
+        return ToolResult(success=False, error="name required")
+    try:
+        return ToolResult(success=True, output=graph.synthesize(name.strip()))
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+
+
 async def handle_weather(params: Dict, ctx: Dict) -> ToolResult:
     """Get weather for a location."""
     loc = params.get("location", "auto")
@@ -1491,6 +1558,9 @@ def create_tool_executor() -> ToolExecutor:
         "memory_save": handle_memory_save,
         "memory_search": handle_memory_search,
         "forget": handle_forget,
+        "entity_note": handle_entity_note,
+        "entity_relate": handle_entity_relate,
+        "entity_lookup": handle_entity_lookup,
         "weather": handle_weather,
         "run_code": handle_run_code,
         "find_mcp_server": handle_find_mcp_server,
