@@ -631,9 +631,17 @@ def test_open_app_requires_name():
 # ---------------------------------------------------------------------------
 
 def test_dangerous_tools_are_guardrailed():
-    for name in ("shell", "run_code", "open_app"):
+    for name in ("shell", "run_code", "install_mcp_server"):
         assert name in TOOL_GUARDRAILS, f"{name} must have guardrails configured"
         assert TOOL_GUARDRAILS[name].require_approval, f"{name} must require approval"
+
+
+def test_open_app_does_not_require_approval():
+    """Deliberate narrowing (Sam's call): opening an application can't
+    destroy or create anything, so it shouldn't interrupt for approval
+    the way shell/run_code/install_mcp_server do. Approval stays reserved
+    for genuinely consequential actions."""
+    assert TOOL_GUARDRAILS.get("open_app") is None or not TOOL_GUARDRAILS["open_app"].require_approval
 
 
 def test_factory_attaches_guardrails():
