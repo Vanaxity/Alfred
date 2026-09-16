@@ -171,13 +171,34 @@ _DESTRUCTIVE_PATTERNS: List[str] = [
     r"\brm\s+-[a-z]*[rf]",           # rm -rf / rm -fr / rm -r
     r"\bdel\s+/[sq]",                 # del /s, del /q
     r"\bformat\s+[a-z]:",             # format c:
-    r"\bRemove-Item\b[^\"]*-Recurse", # PowerShell recursive delete
+    # Was `[^\"]*` between the two keywords -- excluded quote characters,
+    # so any command quoting its path (the normal case, e.g.
+    # `Remove-Item -LiteralPath "C:\...\x" -Recurse`) had a `"` sitting
+    # between "Remove-Item" and "-Recurse" that the pattern couldn't
+    # cross, silently downgrading a real recursive delete from denied to
+    # merely approval-gated. Confirmed live 2026-09-16 (Phase B
+    # verification): a natural "delete this folder" request produced
+    # exactly that quoted form and only got an approval prompt, not a
+    # denial. `.` matches everything `[^\"]*` did plus quotes.
+    r"\bRemove-Item\b.*-Recurse", # PowerShell recursive delete
     r"\bmkfs(\.\w+)?\b",
     r"\bdd\s+if=",
     r":\s*\(\s*\)\s*\{.*\};\s*:",     # shell fork bomb
     r"\b(shutdown|Stop-Computer|Restart-Computer)\b",
     r"\bReset-ComputerMachinePassword\b",
     r">\s*/dev/sd[a-z]",
+    # `run_code` shares this same list, but every pattern above is
+    # shell/PowerShell syntax -- confirmed live 2026-09-16 (Phase B
+    # verification): asking for the identical delete a second time made
+    # Alfred reach for `run_code`'s `shutil.rmtree(...)` instead of
+    # `shell`'s `Remove-Item`, and none of the patterns above recognize
+    # Python. Same backstop philosophy as the rest of this list (common
+    # phrasings, not exhaustive AST analysis) extended to Python's most
+    # common single-call destructive-delete idioms.
+    r"shutil\.rmtree",
+    r"\bos\.remove\(",
+    r"\bos\.unlink\(",
+    r"\.rmdir\(",
 ]
 
 # Per-tool guardrails. Anything that can execute arbitrary code or launch a
