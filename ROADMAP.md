@@ -83,25 +83,41 @@ asking permission with a genuine yes/no status — never a silent stall.
    regenerate byte-identical params on retry, so a resend can fail to
    match the pending approval) — deferred for weeks, real contributor to
    "not reliable."
-3. **Verify Phase B actually holds before Phase C starts** (added
-   2026-09-14, after a live code-grounded audit surfaced these as
-   real but untested) — live-test against an isolated Obsidian vault
-   (`OBSIDIAN_VAULT_PATH` override), never Sam's real one:
-   - Guardrail enforcement: a destructive shell command is actually
-     denied (not just approval-gated), a benign one actually produces
-     `awaiting_approval`, a file-write path-traversal attempt outside
-     `_safe_roots()` is actually rejected, `open_app` is actually
-     approval-gated.
-   - Skill-learning loop end-to-end: the same 2-tool task run twice in
-     separate sessions actually writes a new T2 `.md` file to disk
-     after the first run (checked on disk, not just Alfred's self
-     -report) and gets matched/reused the second time.
-   - Cron execution: a scheduled task is actually picked up and run by
-     the 30s heartbeat poll (`_check_scheduled_tasks()` /
-     `get_due_scheduled_tasks()`) — confirmed live, not just read in
-     code.
-   - Error recovery: a forced tool failure is surfaced honestly to the
-     user, not confabulated into a false success.
+3. **Verify Phase B actually holds before Phase C starts** — DONE
+   2026-09-16, live-tested against an isolated Obsidian vault, never
+   Sam's real one. Found and fixed 5 real bugs in the process rather
+   than just reporting them (see PR #49):
+   - Guardrail enforcement: a destructive shell command was only
+     approval-gated, not denied — the `Remove-Item...-Recurse` deny
+     pattern excluded quote characters, so any command quoting its
+     path (the normal case) slipped past it entirely. Fixed. The same
+     deny-pattern list is shared by `run_code`, but every pattern was
+     shell syntax — asking again made Alfred reach for Python's
+     `shutil.rmtree(...)` instead, bypassing everything. Fixed.
+     `open_app` correctly has **no** approval gate (matches #45,
+     already merged) — the original wording above was stale, written
+     before that merge. Path-traversal rejection and benign-shell
+     approval-gating both already worked correctly.
+   - Skill-learning loop: generation worked (a real `.md` appears on
+     disk after a 3-tool, zero-failure task), but reuse didn't —
+     generation was missing the inverse of its own improvement gate
+     (`matched_skill is None`), so repeating an already-learned task
+     wrote a redundant near-duplicate every time instead of reusing
+     it. Fixed.
+   - Cron execution: was completely dead, not just untested.
+     `get_due_scheduled_tasks()` was called every 30s but never
+     defined anywhere, and even fixing that wouldn't have mattered —
+     the heartbeat loop that calls it was never started in
+     `brain_api/server.py`'s actual entrypoint at all. Ported and
+     wired in. A real, pre-existing "check my calendar" task (created
+     2026-07-05) had been silently inert this whole time and will
+     start actually running now.
+   - Error recovery: already worked correctly — a nonexistent-file
+     request was surfaced honestly, not confabulated.
+   - Separately found, not fixed (out of scope for this pass): the
+     `nuclear` MCP server (`mcp_servers.json`) hangs server startup
+     indefinitely with no timeout when its backing service isn't
+     running — real risk, needs its own look.
 
 ## Phase C — UI overhaul (only after A + B hold)
 

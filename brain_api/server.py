@@ -104,6 +104,10 @@ async def lifespan(app: FastAPI):
     # if the file doesn't exist -- MCP is additive, not required to boot.
     await alfred.connect_mcp_servers()
 
+    # Cron/scheduled-task polling -- was never actually started anywhere
+    # in this entrypoint (confirmed live 2026-09-16, Phase B verification).
+    alfred.start_heartbeat()
+
     print("  Alfred Brain initialized successfully")
     print("=" * 50)
 

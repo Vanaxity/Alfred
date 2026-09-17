@@ -402,6 +402,34 @@ class LocalDB:
             conn.execute("UPDATE scheduled_tasks SET last_run = datetime('now') WHERE id = ?", (task_id,))
             conn.commit()
 
+    def get_due_scheduled_tasks(self) -> List[Dict]:
+        """Active scheduled tasks whose cron schedule has fired since they
+        last ran (or since creation, if never run).
+
+        Was called from alfred.py/alfred_v2.py's heartbeat every 30s but
+        never actually defined -- every tick raised AttributeError, caught
+        by the caller's own try/except, so cron tasks silently never ran.
+        Confirmed live 2026-09-16 (Phase B verification, ROADMAP.md).
+        """
+        from croniter import croniter
+        conn = self._get_conn()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT id, task, cron_expr, created_at, last_run FROM scheduled_tasks WHERE active = 1"
+            ).fetchall()
+        due = []
+        now = datetime.now()
+        for row in rows:
+            base_str = row["last_run"] or row["created_at"]
+            try:
+                base = datetime.fromisoformat(base_str)
+                nxt = croniter(row["cron_expr"], base).get_next(datetime)
+            except Exception:
+                continue
+            if nxt <= now:
+                due.append(dict(row))
+        return due
+
     # ============ EXECUTION LOG (self-audit loop, ROADMAP.md Phase 3) ============
 
     def log_execution(

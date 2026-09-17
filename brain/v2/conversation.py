@@ -223,6 +223,47 @@ class Alfred:
         # startup lifespan handler.
         self._mcp_tool_schemas: Dict[str, Dict[str, Any]] = {}
 
+    def start_heartbeat(self) -> None:
+        """Start the 30s background poll for due cron tasks. Called once
+        from brain_api/server.py's startup lifespan, same pattern as
+        connect_mcp_servers() -- __init__ is sync and can't own a
+        long-running asyncio task itself.
+
+        This entire subsystem was previously dead: brain/v2/alfred_v2.py
+        had a heartbeat loop calling local_db.get_due_scheduled_tasks(),
+        but neither that method nor this call existed anywhere in this
+        file -- the actual Alfred class brain_api/server.py imports
+        (brain/v2/__init__.py: `from .conversation import Alfred`).
+        Confirmed live 2026-09-16 (Phase B verification, ROADMAP.md):
+        zero heartbeat/cron output ever appeared no matter how long a
+        real server ran. Reminders are deliberately not ported here --
+        no tool exists yet to create one, so there's nothing to poll for.
+        """
+        self._heartbeat_task = asyncio.get_event_loop().create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                due = self.db.get_due_scheduled_tasks()
+            except Exception as e:
+                print(f"[Alfred] Scheduled task check failed: {e}")
+                continue
+            for t in due:
+                # Each task's own try/except: one task raising (e.g. a
+                # calendar task with no auth configured) must not skip
+                # update_last_run for it -- confirmed live 2026-09-16,
+                # without this a single failing task re-fired every 30s
+                # forever instead of waiting for its next scheduled slot,
+                # since last_run never advanced past its original base time.
+                print(f"[Alfred] Cron task due: {t['task']}")
+                try:
+                    await self.execute(t["task"])
+                except Exception as e:
+                    print(f"[Alfred] Cron task '{t['task']}' failed: {e}")
+                finally:
+                    self.db.update_last_run(t["id"])
+
     async def connect_mcp_servers(self) -> None:
         """Spawn every MCP server in mcp_servers.json, discover its tools,
         and register each one through the same ToolExecutor.register()
@@ -1552,8 +1593,14 @@ class Alfred:
                 pass
 
         # --- Maybe generate skill ---
+        # matched_skill is None is the missing inverse of the improvement
+        # gate below (that one requires a matched skill; this one must
+        # require the absence of one) -- confirmed live 2026-09-16, Phase
+        # B verification: without it, repeating a task that already has a
+        # matching skill generates a redundant near-duplicate .md every
+        # time instead of reusing/reinforcing the existing one.
         skill_generated = False
-        if len(tools_called) >= 3 and not any(
+        if matched_skill is None and len(tools_called) >= 3 and not any(
             tr.get("success") is False for tr in tool_results
         ):
             try:
